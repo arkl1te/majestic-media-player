@@ -5,19 +5,58 @@
 A dark-themed video player built on [libmpv](https://mpv.io) with a
 [Silky](https://github.com/treeform/silky) immediate-mode UI, written in Nim.
 
-## Build (CachyOS / Arch)
+## Install
+
+```sh
+git clone https://github.com/arkl1te/majestic-media-player.git
+cd majestic-media-player
+./install.sh
+```
+
+That's it. The script installs any missing packages with `pacman` (on
+CachyOS / Arch), builds the player and installs it for your user. Open the
+application launcher and search for **Majestic Media Player**, or right-click a
+video in Dolphin → Open With → Majestic Media Player.
+
+| Command | What it does |
+|---|---|
+| `./install.sh` | Build and install for the current user (`~/.local`, no root needed) |
+| `./install.sh --system` | Build, then install for all users under `/usr/local` (uses `sudo`) |
+| `./install.sh --uninstall` | Remove the per-user install (add `--system` for the system-wide one) |
+
+To update, `git pull` and run `./install.sh` again.
+
+What gets installed (`PREFIX` is `~/.local` or `/usr/local`):
+
+- `PREFIX/bin/majestic-media-player`: the player (a single self-contained binary)
+- `PREFIX/share/applications/majestic-media-player.desktop`: the launcher entry,
+  which also registers the player in "Open With" for common video and audio types
+- `PREFIX/share/icons/hicolor/scalable/apps/majestic-media-player.svg`: the icon
+
+The launcher entry points to the binary by its full path, so it starts even if
+`~/.local/bin` isn't on your `PATH`. Afterwards the installer refreshes the
+desktop and KDE menu caches so the entry shows up without logging out.
+
+Files can also be passed on the command line (`majestic-media-player a.mkv`),
+but that's optional. Without them it opens empty and you use File ▸ Open.
+
+### Building manually
 
 ```sh
 sudo pacman -S --needed nim git base-devel mpv libx11 libxrandr kdialog
-make            # fetches pinned deps into ./vendor, then compiles
-make install    # per-user: ~/.local/bin, app launcher entry, "Open With" for media
+make                                   # fetches pinned deps into ./vendor, then compiles
+make run                               # run from the source tree
+make install                           # per-user install, same as ./install.sh
+sudo make install PREFIX=/usr/local    # system-wide (run `make` as yourself first)
+make install DESTDIR=pkgdir PREFIX=/usr  # staged install for packaging
 ```
 
-After `make install`, start it from the application launcher like any other
-player, or right-click a video in Dolphin → Open With → Majestic Media Player.
-Files can also be passed on the command line (`majestic-media-player a.mkv`),
-but that's optional — without them it opens empty and you use File ▸ Open.
-`make uninstall` removes it again.
+`make uninstall` (with the same `PREFIX`) removes it again.
+
+In a terminal, `make` shows a progress bar for the current step (each
+dependency being cloned, then Nim's module checking, C compilation and
+linking) and an overall bar underneath. When the output is piped or logged,
+it prints plain status lines instead.
 
 `kdialog` provides the native file dialogs (`zenity` works as a fallback).
 Dependencies are pinned in `deps.lock` and cloned by `tools/fetch_deps.sh`, so
