@@ -9,7 +9,7 @@ source tools/progress.sh
 source tools/fetch_deps.sh
 
 STAGE_LO=0 STAGE_HI=100
-if [[ ! -f vendor/.stamp || deps.lock -nt vendor/.stamp || tools/fetch_deps.sh -nt vendor/.stamp ]]; then
+if [[ ! -f vendor/.stamp || deps.lock -nt vendor/.stamp || tools/fetch_deps.sh -nt vendor/.stamp || -n $(find patches -newer vendor/.stamp 2>/dev/null) ]]; then
   STAGE_HI=40
   fetch_deps
   touch vendor/.stamp

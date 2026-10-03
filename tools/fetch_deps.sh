@@ -49,7 +49,14 @@ fetch_deps() {
     fi
     if [[ "$(git -C "$dir" rev-parse HEAD)" != "$rev" ]]; then
       git_progress "$i" "$n" "$name" git -C "$dir" fetch --progress origin
+      git -C "$dir" checkout --quiet -- .
       git -C "$dir" checkout --quiet "$rev"
+    fi
+    # Local fixes to a dependency live in patches/NAME.patch; applied once.
+    if [[ -f "patches/$name.patch" ]] &&
+       ! git -C "$dir" apply --reverse --check "../../patches/$name.patch" 2>/dev/null; then
+      git -C "$dir" checkout --quiet -- .
+      git -C "$dir" apply "../../patches/$name.patch"
     fi
     pb_task "$name" 100
     (( PB_TTY )) || pb_log "ok  $name @ ${rev:0:10}"

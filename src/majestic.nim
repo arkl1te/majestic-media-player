@@ -72,6 +72,7 @@ type
     videoRect: Rect
     script: Script
     shotPath: string
+    dropped: seq[string]      ## paths/URLs from a drag and drop, one per file
 
 proc setlocale(category: cint, locale: cstring): cstring {.importc, header: "<locale.h>".}
 var LC_NUMERIC {.importc, header: "<locale.h>".}: cint
@@ -1459,6 +1460,11 @@ proc main() =
     touch()
     a.inputPending = true
   a.window.onResize = proc () = touch()
+  # Windy reports a drop one file at a time; gather them so the whole drop
+  # becomes one playlist.
+  a.window.onFileDrop = proc (path: string, data: string) =
+    touch()
+    a.dropped.add path
   a.window.onFocusChange = proc () =
     touch()
     # Popups take no focus, so focus moving elsewhere means a click outside
@@ -1475,6 +1481,9 @@ proc main() =
   var lastFrame = 0.0
   while not a.window.closeRequested:
     pollEvents()
+    if a.dropped.len > 0:
+      a.openPaths(a.dropped)
+      a.dropped.setLen 0
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true

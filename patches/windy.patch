@@ -1,0 +1,39 @@
+diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
+index 5b29e3c..6b8d36a 100644
+--- a/src/windy/platforms/linux/x11.nim
++++ b/src/windy/platforms/linux/x11.nim
+@@ -814,8 +814,11 @@ proc newWindow*(
+   result.applyCursor()
+ 
+   # Enable XDnD awareness (version 5)
+-  const xdndVersion = 5'u32
+-  result.handle.setProperty(xaXdndAware, xaCardinal, 32, @[xdndVersion].asString)
++  # The spec (and KWin's Wayland-to-XWayland drag bridge) requires type ATOM;
++  # Xlib reads format-32 data as C longs.
++  const xdndVersion = 5.clong
++  display.XChangeProperty(result.handle, xaXdndAware, xaAtom, 32, pmReplace,
++    @[xdndVersion].asString, 1)
+ 
+   makeContextCurrent result
+ 
+@@ -1128,12 +1131,14 @@ proc pollEvents(window: Window) =
+           # Parse URI list (files separated by newlines).
+           let uriList = prop.data
+           for line in uriList.splitLines():
+-            if line.len > 0 and line.startsWith("file://"):
+-              # Convert URI to local path and decode percent-encoding.
+-              var filePath = decodeUrl(line[7..^1])
+-              if window.onFileDrop != nil:
+-                let fileContent = readFile(filePath)
+-                window.onFileDrop(filePath, fileContent)
++            if line.len > 0 and not line.startsWith("#") and window.onFileDrop != nil:
++              # Convert file URIs to local paths; other URIs (http, ...) pass
++              # through. The contents are not read: drops can be huge media
++              # files or directories, so fileData is always empty.
++              let filePath =
++                if line.startsWith("file://"): decodeUrl(line[7..^1], decodePlus = false)
++                else: line
++              window.onFileDrop(filePath, "")
+ 
+         # Clean up the property.
+         window.handle.delProperty(xaWindyXdndTargetProperty)
