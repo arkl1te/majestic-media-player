@@ -66,6 +66,7 @@ type
     dirtyUntil: float
     focusLostAt: float        ## when the window lost focus, else 0
     menuOpenedAt: float       ## when the menus opened, else 0
+    fakeMods: string          ## debug scripting: "ctrl", "alt+shift", ...
     inputPending: bool        ## button/key/scroll this iteration; Windy clears
                               ## those per pollEvents, so draw before the next
     videoRect: Rect
@@ -988,9 +989,79 @@ proc controls(a: App, r: Rect) =
   let pw = ui.textSize(pct, FontSmall).x
   ui.textIn(pct, rect(vb.x - pw - 6, r.y, pw + 2, r.h), colTextDim, FontSmall)
 
+type KeyHint = tuple[key, label: string]
+
+proc modifierHints(a: App): seq[seq[KeyHint]] =
+  ## Shortcuts reachable with the modifiers currently held, in groups.
+  let w = a.window
+  var (c, s, al) = (w.ctrl, w.shift, w.alt)
+  if a.fakeMods.len > 0:
+    (c, s, al) = ("ctrl" in a.fakeMods, "shift" in a.fakeMods, "alt" in a.fakeMods)
+  let rot = &"{a.cfg.rotateStep:g}°"
+  if c and s and not al:
+    @[@[("O", "Load Subtitle")]]
+  elif c and not s and not al:
+    @[@[("←", "Previous Chapter"), ("→", "Next Chapter")],
+      @[("M", "Mute")],
+      @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
+        ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")],
+      @[("O", "Open File"), ("C", "Close")],
+      @[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist")]]
+  elif al and not c and not s:
+    @[@[("Enter", "Fullscreen")],
+      @[("I", "Screenshot")],
+      @[("Num4", "Rotate " & rot & " CCW"), ("Num5", "Reset Rotation"),
+        ("Num6", "Rotate " & rot & " CW")],
+      @[("X", "Exit")]]
+  elif s and not c and not al:
+    @[@[(",", "-Rate"), (".", "+Rate")],
+      @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
+      @[("Drag", "Seek Without Snapping")]]
+  else: @[]
+
+proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
+  ## Blender-style row of [key] label pairs; groups split by a divider.
+  ## Groups that don't fit are dropped whole, ending with an ellipsis.
+  let ui = a.ui
+  ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
+  let capH = r.h - 8
+  let cy = r.y + (r.h - capH) / 2
+  proc capW(key: string): float32 = max(capH, ui.textSize(key, FontSmall).x + 10)
+  proc pairW(h: KeyHint): float32 = capW(h.key) + 5 + ui.textSize(h.label, FontSmall).x
+  const PairGap = 14'f32
+  const GroupGap = 25'f32
+  var x = r.x + 10
+  for gi, g in groups:
+    var gw = 0'f32
+    for i, h in g: gw += pairW(h) + (if i > 0: PairGap else: 0)
+    let lead = if gi > 0: GroupGap else: 0
+    let reserve = if gi < groups.high: ui.textSize("…", FontSmall).x + GroupGap else: 0
+    if x + lead + gw + reserve > r.x + r.w - 10:
+      if gi > 0: ui.textIn("…", rect(x + 8, r.y, 20, r.h), colTextDim, FontSmall)
+      break
+    if gi > 0:
+      ui.rect(rect(x + GroupGap / 2, r.y + 6, 1, r.h - 12), colBorder)
+      x += GroupGap
+    for i, h in g:
+      if i > 0: x += PairGap
+      let cap = rect(x, cy, capW(h.key), capH)
+      ui.rect(cap, colPanelRaised)
+      ui.border(cap, colBorder)
+      ui.textIn(h.key, cap, colText, FontSmall, h = CenterAlign)
+      x += cap.w + 5
+      let lw = ui.textSize(h.label, FontSmall).x
+      ui.textIn(h.label, rect(x, r.y, lw + 2, r.h), colTextDim, FontSmall)
+      x += lw
+
 proc status(a: App, r: Rect) =
   let ui = a.ui
   let p = a.player
+  if (a.window.focused or a.fakeMods.len > 0) and a.overlay == ovNone and not a.menus.isOpen:
+    let hints = a.modifierHints()
+    if hints.len > 0:
+      a.keyHintBar(r, hints)
+      return
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
   let fileIcon =
@@ -1301,6 +1372,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "mouse":
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
                      else: vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
+  of "mods": a.fakeMods = if arg == "off": "" else: arg
   of "overlay":
     a.showOverlay(case arg
       of "options": ovOptions
@@ -1324,7 +1396,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
 proc glyphSet(): seq[string] =
   result = AsciiGlyphs
   for cp in 0xA0 .. 0x17F: result.add $Rune(cp)
-  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "×", "°", "·", "▸"]:
+  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸"]:
     result.add s
 
 proc buildAtlas(): (Image, SilkyAtlas) =
