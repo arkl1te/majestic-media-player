@@ -1,5 +1,7 @@
 # Majestic Media Player
 
+![Screenshot](Screenshot_20261003_222359.png)
+
 A dark-themed video player built on [libmpv](https://mpv.io) with a
 [Silky](https://github.com/treeform/silky) immediate-mode UI, written in Nim.
 
