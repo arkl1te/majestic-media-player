@@ -1,0 +1,43 @@
+## Dark theme palette and metrics. Colors are premultiplied (ColorRGBX).
+
+import chroma
+
+proc c(hex: string, alpha = 1.0): ColorRGBX =
+  var col = parseHtmlColor(hex)
+  col.a = alpha
+  col.rgbx
+
+let
+  colBackground* = c("#0f1013")
+  colVideoBg* = c("#000000")
+  colPanel* = c("#17181c")
+  colPanelRaised* = c("#1f2126")
+  colPopup* = c("#202228")
+  colBorder* = c("#2d3038")
+  colHover* = c("#2c2f37")
+  colPressed* = c("#363a44")
+  colText* = c("#e7e9ee")
+  colTextDim* = c("#9aa0ab")
+  colTextDisabled* = c("#5c616b")
+  colAccent* = c("#9d8cff")
+  colAccentHover* = c("#b5a8ff")
+  colAccentDim* = c("#9d8cff", 0.35)
+  colTrack* = c("#30333b")
+  colMarker* = c("#ffc857")
+  colShadow* = c("#000000", 0.45)
+  colScrim* = c("#000000", 0.55)
+  colOverlayBg* = c("#121317", 0.92)
+  colWhite* = c("#ffffff")
+  colOnAccent* = c("#121216")
+
+const
+  MenuBarHeight* = 28'f32
+  SeekBarHeight* = 26'f32
+  ControlsHeight* = 38'f32
+  StatusHeight* = 24'f32
+  PlaylistWidth* = 300'f32
+  MenuRowHeight* = 26'f32
+  MenuSeparatorHeight* = 9'f32
+  FontMain* = "Default"
+  FontSmall* = "Small"
+  FontTitle* = "Title"

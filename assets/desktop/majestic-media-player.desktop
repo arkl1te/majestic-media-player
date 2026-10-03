@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Majestic Media Player
+GenericName=Media Player
+Comment=Play video and audio files
+Exec=majestic-media-player %F
+Icon=majestic-media-player
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=video;movie;audio;music;mpv;player;
+MimeType=video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;video/x-ms-wmv;video/x-flv;video/mpeg;video/mp2t;video/3gpp;video/ogg;video/x-ogm+ogg;video/vnd.rn-realvideo;video/x-m4v;video/x-ms-asf;audio/mpeg;audio/flac;audio/ogg;audio/opus;audio/mp4;audio/aac;audio/x-wav;audio/x-ms-wma;audio/x-matroska;audio/x-aiff;audio/x-ape;audio/x-wavpack;audio/ac3;
