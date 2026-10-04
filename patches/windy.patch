@@ -1,5 +1,5 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..4695b56 100644
+index 5b29e3c..1b33c2c 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -814,8 +814,11 @@ proc newWindow*(
@@ -73,6 +73,21 @@ index 5b29e3c..4695b56 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
+@@ -1348,8 +1360,12 @@ proc `icon=`*(window: Window, icon: Image) =
+   var data: seq[uint64]
+   data.add icon.width.uint64
+   data.add icon.height.uint64
+-  for c in icon.data:
+-    data.add (cast[uint32](c)).uint64
++  # _NET_WM_ICON pixels are straight-alpha 0xAARRGGBB words; pixie stores
++  # premultiplied RGBA bytes.
++  for px in icon.data:
++    let c = px.rgba
++    data.add (c.a.uint64 shl 24) or (c.r.uint64 shl 16) or
++      (c.g.uint64 shl 8) or c.b.uint64
+ 
+   display.XChangeProperty(
+     window.handle,
 diff --git a/src/windy/platforms/linux/x11/xevent.nim b/src/windy/platforms/linux/x11/xevent.nim
 index 1147b56..f88aa59 100644
 --- a/src/windy/platforms/linux/x11/xevent.nim
