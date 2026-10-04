@@ -37,6 +37,9 @@ type
     showControls*: bool = true
     showStatus*: bool = true
     showPlaylist*: bool = false
+    playlistWidth*: float = 300    # pixels, changed by dragging its left edge
+    playlistShowSize*: bool = false
+    playlistShowDimensions*: bool = false
     showOsd*: bool = true
     frameMode*: FrameMode = fmTouchInside
     aspectOverride*: string = ""   # "" = original, else "4:3", "16:9", ...
@@ -53,6 +56,7 @@ type
     rememberWindowPos*: bool = false
     rememberWindowSize*: bool = false
     rememberTransform*: bool = false
+    rememberPlaylist*: bool = false
     titleFullPath*: bool = false
     titleUseMediaTitle*: bool = false
     # Options > Playback
@@ -75,6 +79,8 @@ type
     windowX*, windowY*: int
     windowW*, windowH*: int        # 0 = never saved
     transform*: SavedTransform
+    playlist*: seq[string]         # kept when "Remember playlist" is on
+    playlistIndex*: int = -1
 
 const MaxRecent = 15
 

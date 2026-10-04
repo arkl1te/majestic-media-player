@@ -35,7 +35,7 @@ const
   SeekBarHeight* = 26'f32
   ControlsHeight* = 38'f32
   StatusHeight* = 24'f32
-  PlaylistWidth* = 300'f32
+  PlaylistMinWidth* = 180'f32
   MenuRowHeight* = 26'f32
   MenuSeparatorHeight* = 9'f32
   FontMain* = "Default"

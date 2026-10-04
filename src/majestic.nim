@@ -12,16 +12,27 @@ const
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
   OptionsSize = ivec2(780, 512)
+  PlaylistRowH = 26'f32
+  PlaylistHeaderH = 24'f32  ## column headers
+  PlaylistGripW = 5'f32     ## draggable left edge of the playlist
 
 type
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout
 
   ContextMenu = enum
-    cmVideo, cmTime, cmPlaylist  ## where the right-click menu was opened
+    cmVideo, cmTime, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
 
   PlaylistSort = enum
-    psName, psDuration, psDimension, psSize
+    psName, psDuration, psDimensions, psSize
+
+  PlaylistColumn = object
+    label: string
+    w: float32
+    sort: PlaylistSort
+
+  PointerShape = enum
+    ptArrow, ptHidden, ptResize
 
   VideoTransform = object
     pan: Vec2
@@ -45,7 +56,9 @@ type
     plScroll: float32
     plReveal: bool            ## scroll the selected entry into view
     prober: Prober            ## created on the first sort that needs it
-    mediaInfo: Table[string, MediaInfo]  ## probe results, for sorting
+    mediaInfo: Table[string, MediaInfo]  ## probe results, for columns and sorting
+    fileSizes: Table[string, int64]      ## -1 for streams and unreadable files
+    plResizeFrom: (float32, float32)     ## pointer x and width when the drag began
     xf: VideoTransform
     afterPlayback: AfterPlayback
     overlay: Overlay
@@ -70,7 +83,7 @@ type
     videoPressPos: Vec2
     lastMouse: Vec2
     lastMouseMove: float
-    cursorHidden: bool
+    pointerShape: PointerShape
     # seek bar
     seekDragging: bool
     seekDragT: float
@@ -97,6 +110,8 @@ type
     script: Script
     shotPath: string
     dropped: seq[string]      ## paths/URLs from a drag and drop, one per file
+    dropAt: Vec2              ## pointer position when the drop arrived
+    plListRect: Rect          ## playlist rows area as last drawn (empty if hidden)
 
 proc setlocale(category: cint, locale: cstring): cstring {.importc, header: "<locale.h>".}
 var LC_NUMERIC {.importc, header: "<locale.h>".}: cint
@@ -119,9 +134,12 @@ proc bottomHeight(a: App): float32 =
   (if a.cfg.showControls: ControlsHeight else: 0) +
   (if a.cfg.showStatus: StatusHeight else: 0)
 
+proc playlistWidth(a: App): float32 =
+  max(PlaylistMinWidth, round(a.cfg.playlistWidth).float32)
+
 proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode).
-  ivec2(int32(if a.cfg.showPlaylist: PlaylistWidth else: 0),
+  ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
         int32(MenuBarHeight + a.bottomHeight))
 
 proc naturalSize(a: App): Vec2 =
@@ -257,8 +275,12 @@ proc closeFile(a: App) =
   a.updateTitle()
 
 proc reopenLast(a: App): bool =
-  ## With nothing loaded, Play reopens the most recently opened file.
+  ## With nothing loaded, Play starts the selected playlist entry, or else
+  ## reopens the most recently opened file.
   if a.player.loaded: return false
+  if a.playlist.len > 0:
+    a.playIndex(max(a.plSelected, 0))
+    return true
   for r in a.cfg.recentFiles:
     if fileExists(r) or r.contains("://"):
       a.openPaths(@[r])
@@ -293,15 +315,19 @@ proc navigate(a: App, dir: int) =
 
 # --- playlist editing -------------------------------------------------------
 
-proc addToPlaylist(a: App, paths: seq[string]) =
-  ## Appends to the playlist; starts playing them when nothing is open.
+proc addToPlaylist(a: App, paths: seq[string], at = -1) =
+  ## Inserts at `at` (appends when out of range) without touching playback;
+  ## starts playing them when nothing is open.
   let files = expandPaths(paths)
   if files.len == 0:
     a.osd("Nothing playable found")
     return
-  let first = a.playlist.len
-  a.playlist.add files
+  let first = if at < 0 or at > a.playlist.len: a.playlist.len else: at
+  a.playlist.insert(files, first)
+  if a.plIndex >= first: a.plIndex += files.len
+  if a.plSelected >= first: a.plSelected += files.len
   if not a.player.loaded: a.playIndex(first)
+  else: a.osd(if files.len == 1: "Added to playlist" else: &"Added {files.len} files to playlist")
 
 proc removeSelected(a: App) =
   if a.plSelected < 0 or a.plSelected >= a.playlist.len: return
@@ -338,6 +364,40 @@ proc probeInfo(a: App, path: string): MediaInfo =
     result = a.prober.probe(path)
   a.mediaInfo[path] = result
 
+proc fileSize(a: App, path: string): int64 =
+  ## Size in bytes, read once per file; -1 for streams and unreadable files.
+  if path in a.fileSizes: return a.fileSizes[path]
+  result = -1
+  if not path.contains("://"):
+    try: result = getFileSize(path)
+    except OSError: discard
+  a.fileSizes[path] = result
+
+proc probeNext(a: App, visible: Slice[int]) =
+  ## Starts the background probe of the next file the playlist columns need,
+  ## visible rows first; releases the prober's file once all are known.
+  if a.prober != nil and a.prober.pending.len > 0: return
+  var next = ""
+  for i in visible:
+    let p = a.playlist[i]
+    if not p.contains("://") and p notin a.mediaInfo: next = p; break
+  if next.len == 0:
+    for p in a.playlist:
+      if not p.contains("://") and p notin a.mediaInfo: next = p; break
+  if next.len == 0:
+    a.prober.finish()
+    return
+  if a.prober == nil: a.prober = newProber()
+  if a.prober != nil: a.prober.start(next)
+
+proc pollProbe(a: App) =
+  ## Collects a finished background probe and redraws to show it.
+  if a.prober == nil or a.prober.pending.len == 0: return
+  let path = a.prober.pending
+  if a.prober.poll():
+    a.mediaInfo[path] = a.prober.info
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+
 proc sortPlaylist(a: App, by: PlaylistSort) =
   ## Sorts ascending, or descending when already in ascending order.
   let n = a.playlist.len
@@ -347,13 +407,12 @@ proc sortPlaylist(a: App, by: PlaylistSort) =
     case by
     of psName: discard
     of psDuration: keys[i] = (a.probeInfo(p).duration, 0.0)
-    of psDimension:
+    of psDimensions:
       let m = a.probeInfo(p)
       keys[i] = (float(m.width * m.height), m.width.float)
     of psSize:
-      let size = try: getFileSize(p).float except OSError: -1.0
-      keys[i] = (size, 0.0)
-  if by in {psDuration, psDimension}: a.prober.finish()
+      keys[i] = (a.fileSize(p).float, 0.0)
+  if by in {psDuration, psDimensions}: a.prober.finish()
   let names = a.playlist.mapIt(it.extractFilename)
   let byKey = proc (i, j: int): int =
     if by == psName: naturalCmp(names[i], names[j]) else: cmp(keys[i], keys[j])
@@ -361,6 +420,13 @@ proc sortPlaylist(a: App, by: PlaylistSort) =
   var order = toSeq(0 ..< n)
   order.sort(byKey, if ascending: Descending else: Ascending)
   a.reorderPlaylist(order)
+
+proc clearPlaylist(a: App) =
+  ## Empties the playlist; the open file keeps playing.
+  a.playlist.setLen 0
+  a.plIndex = -1
+  a.plSelected = -1
+  a.plScroll = 0
 
 proc randomizePlaylist(a: App) =
   var order = toSeq(0 ..< a.playlist.len)
@@ -696,7 +762,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showStatus: StatusHeight else: -StatusHeight))))
   view.check("Playlist", "Ctrl+4", cfg.showPlaylist, action = proc () =
     a.cfg.showPlaylist = not a.cfg.showPlaylist
-    a.resizeKeepingVideo(ivec2(int32(if a.cfg.showPlaylist: PlaylistWidth else: -PlaylistWidth), 0)))
+    let w = int32(a.playlistWidth)
+    a.resizeKeepingVideo(ivec2(if a.cfg.showPlaylist: w else: -w, 0)))
   view.sep()
   view.check("Show OSD", "", cfg.showOsd, action = proc () =
     a.cfg.showOsd = not a.cfg.showOsd
@@ -885,7 +952,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     pl.sep()
     let sortBy = proc (by: PlaylistSort) = a.sortPlaylist(by)
     for (label, by) in [("Sort by A-Z", psName), ("Sort by Duration", psDuration),
-                        ("Sort by Dimension", psDimension), ("Sort by Size", psSize)]:
+                        ("Sort by Dimensions", psDimensions), ("Sort by Size", psSize)]:
       pl.item(label, enabled = n > 1, action = bindAct(sortBy, by))
     pl.sep()
     let moveTo = proc (i: int) = a.moveSelected(i)
@@ -895,7 +962,16 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     pl.item("Move to Bottom", enabled = hasSel and sel < n - 1, action = bindAct(moveTo, n - 1))
     pl.sep()
     pl.item("Randomize", enabled = n > 1, action = proc () = a.randomizePlaylist())
+    pl.sep()
+    pl.item("Clear", enabled = n > 0, action = proc () = a.clearPlaylist())
     (root, pl)
+  of cmPlaylistColumns:
+    let cols = newMenuRoot()
+    cols.check("Size", checked = a.cfg.playlistShowSize, action = proc () =
+      a.cfg.playlistShowSize = not a.cfg.playlistShowSize)
+    cols.check("Dimensions", checked = a.cfg.playlistShowDimensions, action = proc () =
+      a.cfg.playlistShowDimensions = not a.cfg.playlistShowDimensions)
+    (root, cols)
 
 # --- keyboard ---------------------------------------------------------------
 
@@ -1343,17 +1419,90 @@ proc status(a: App, r: Rect) =
     a.ctxMenu = cmTime
     a.menus.openContext(ui.mouse)
 
+proc fmtSize(bytes: int64): string =
+  if bytes < 1000: return &"{bytes} B"
+  var v = bytes.float / 1024
+  var unit = 0
+  while v >= 1000 and unit < 3:
+    v /= 1024
+    inc unit
+  &"{v:.1f} " & ["KB", "MB", "GB", "TB"][unit]
+
+proc playlistColumns(a: App): seq[PlaylistColumn] =
+  ## The detail columns right of Filename, each as wide as its widest text.
+  let ui = a.ui
+  let col = proc (label, sample: string, sort: PlaylistSort): PlaylistColumn =
+    PlaylistColumn(label: label, sort: sort,
+      w: max(ui.textSize(label, FontSmall).x, ui.textSize(sample, FontSmall).x) + 18)
+  result.add col("Duration", "00:00:00", psDuration)
+  if a.cfg.playlistShowSize: result.add col("Size", "999.9 MB", psSize)
+  if a.cfg.playlistShowDimensions: result.add col("Dimensions", "3840×2160", psDimensions)
+
+proc cellText(a: App, path: string, by: PlaylistSort): string =
+  case by
+  of psName: path.extractFilename
+  of psDuration:
+    let d = a.mediaInfo.getOrDefault(path).duration
+    if d > 0: fmtTime(d) else: ""
+  of psSize:
+    let b = a.fileSize(path)
+    if b >= 0: fmtSize(b) else: ""
+  of psDimensions:
+    let m = a.mediaInfo.getOrDefault(path)
+    if m.width > 0: &"{m.width}×{m.height}" else: ""
+
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y, 1, r.h), colBorder)
+  # Dragging the left edge resizes the panel; the video frame takes the rest.
+  let grip = rect(r.x, r.y, PlaylistGripW, r.h)
+  if ui.hover(grip) and ui.pressed():
+    ui.activeId = "plresize"
+    a.plResizeFrom = (ui.mouse.x, r.w)
+    ui.consumeClick()
+  if ui.activeId == "plresize":
+    let (x0, w0) = a.plResizeFrom
+    a.cfg.playlistWidth = clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
+      max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
   let header = rect(r.x, r.y, r.w, 30)
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
   ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 40, 30), colText)
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
-  let list = rect(r.x + 1, r.y + 30, r.w - 1, r.h - 30)
-  let rowH = 26'f32
-  if ui.hover(r) and ui.released(MouseRight):
+
+  # Column headers: Filename takes what the detail columns leave.
+  let colHdr = rect(r.x + 1, r.y + 30, r.w - 1, PlaylistHeaderH)
+  var cells: seq[(Rect, PlaylistColumn)]
+  var x = colHdr.x + colHdr.w
+  for c in a.playlistColumns.reversed:
+    x -= c.w
+    cells.insert((rect(x, colHdr.y, c.w, colHdr.h), c), 0)
+  cells.insert((rect(colHdr.x, colHdr.y, max(0'f32, x - colHdr.x), colHdr.h),
+    PlaylistColumn(label: "Filename", sort: psName)), 0)
+  ui.rect(colHdr, colPanelRaised)
+  ui.sk.pushClipRect(colHdr)
+  for i, (cr, c) in cells:
+    if ui.hover(cr) and not ui.hover(grip):
+      ui.rect(cr, colHover)
+      ui.tip(cr, "Sort by " & c.label)
+      if ui.pressed():
+        ui.consumeClick()
+        a.sortPlaylist(c.sort)
+    if i == 0:
+      ui.textIn(c.label, rect(cr.x + 28, cr.y, cr.w - 32, cr.h), colTextDim, FontSmall)
+    else:
+      ui.rect(rect(cr.x, cr.y + 4, 1, cr.h - 8), colBorder)
+      ui.textIn(c.label, rect(cr.x, cr.y, cr.w - 9, cr.h), colTextDim, FontSmall, h = RightAlign)
+  ui.sk.popClipRect()
+  ui.rect(rect(colHdr.x, colHdr.y + colHdr.h - 1, colHdr.w, 1), colBorder)
+
+  let list = rect(r.x + 1, colHdr.y + colHdr.h, r.w - 1, r.h - 30 - colHdr.h)
+  let rowH = PlaylistRowH
+  a.plListRect = list
+  if ui.hover(colHdr) and ui.released(MouseRight):
+    a.ctxMenu = cmPlaylistColumns
+    a.menus.openContext(ui.mouse)
+  elif ui.hover(r) and ui.released(MouseRight):
     # Right-click selects the row under the pointer (none below the last one).
     let i = int((ui.mouse.y - list.y + a.plScroll) / rowH)
     a.plSelected = if ui.mouse.y >= list.y and i < a.playlist.len: i else: -1
@@ -1374,22 +1523,38 @@ proc playlistPanel(a: App, r: Rect) =
   a.plScroll = clamp(a.plScroll, 0, maxScroll)
   ui.sk.pushClipRect(list)
   let first = int(a.plScroll / rowH)
-  for i in first ..< min(a.playlist.len, first + int(list.h / rowH) + 2):
+  let last = min(a.playlist.len, first + int(list.h / rowH) + 2) - 1
+  for i in first .. last:
     let row = rect(list.x, list.y + i.float32 * rowH - a.plScroll, list.w, rowH)
-    let hov = ui.hover(row) and ui.hover(list)
+    let hov = ui.hover(row) and ui.hover(list) and not ui.hover(grip)
     if i == a.plSelected: ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
     let current = i == a.plIndex
     if current: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
-    let name = ui.ellipsize(a.playlist[i].extractFilename, row.w - 36)
-    ui.textIn(name, rect(row.x + 28, row.y, row.w - 32, rowH),
+    let path = a.playlist[i]
+    let nameW = cells[0][0].w - 32
+    ui.textIn(ui.ellipsize(path.extractFilename, nameW), rect(row.x + 28, row.y, nameW, rowH),
       if current: colAccent else: colText)
+    for (cr, c) in cells[1 .. ^1]:
+      ui.textIn(a.cellText(path, c.sort), rect(cr.x, row.y, cr.w - 9, rowH),
+        if current: colAccent else: colTextDim, FontSmall, h = RightAlign)
     if hov and ui.pressed():
       a.plSelected = i
       ui.consumeClick()
     if hov and a.window.buttonPressed[DoubleClick]:
       a.playIndex(i)
   ui.sk.popClipRect()
+  a.probeNext(first .. last)
+
+proc dropFiles(a: App, paths: seq[string]) =
+  ## Dropped on the playlist: insert at the row boundary under the pointer and
+  ## keep playing. Anywhere else: replace the playlist and play.
+  let list = a.plListRect
+  if list.w > 0 and a.dropAt.inside(list):
+    let at = int((a.dropAt.y - list.y + a.plScroll) / PlaylistRowH + 0.5)
+    a.addToPlaylist(paths, at)
+  else:
+    a.openPaths(paths)
 
 proc idleScreen(a: App, area: Rect) =
   let ui = a.ui
@@ -1516,7 +1681,7 @@ proc frame(a: App) =
   let menuH = if fs: 0'f32 else: MenuBarHeight
   let W = fb.x.float32
   let H = fb.y.float32
-  let plW = if a.cfg.showPlaylist: PlaylistWidth else: 0
+  let plW = if a.cfg.showPlaylist: min(a.playlistWidth, W) else: 0
   let videoArea =
     if fs: rect(0, 0, W, H)
     else: rect(0, menuH, max(0'f32, W - plW), max(0'f32, H - menuH - bottomH))
@@ -1571,6 +1736,7 @@ proc frame(a: App) =
 
   # Chrome
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
+  else: a.plListRect = Rect()
   if bottomVisible and bottomH > 0:
     var y = H - bottomH
     if a.cfg.showSeekBar:
@@ -1613,9 +1779,16 @@ proc frame(a: App) =
   let hide = a.player.playing and a.player.hasVideo and
     ui.mouse.inside(videoArea) and not a.menus.isOpen and a.overlay == ovNone and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
-  if hide != a.cursorHidden:
-    a.cursorHidden = hide
-    w.cursor = if hide: hiddenCursor() else: Cursor(kind: ArrowCursor)
+  let resize = ui.activeId == "plresize" or a.cfg.showPlaylist and
+    ui.hover(rect(plRect.x, plRect.y, PlaylistGripW, plRect.h)) and a.overlay == ovNone and
+    not a.menus.isOpen
+  let shape = if hide: ptHidden elif resize: ptResize else: ptArrow
+  if shape != a.pointerShape:
+    a.pointerShape = shape
+    w.cursor = case shape
+      of ptHidden: hiddenCursor()
+      of ptResize: Cursor(kind: ResizeLeftRightCursor)
+      of ptArrow: Cursor(kind: ArrowCursor)
 
   a.sk.endUi()
   a.drawPreview(fb)
@@ -1786,9 +1959,10 @@ proc main() =
     a.ui.typedPending.add $r
     a.inputPending = true
   # Windy reports a drop one file at a time; gather them so the whole drop
-  # becomes one playlist.
+  # becomes one playlist (or one insertion when dropped on the playlist).
   a.window.onFileDrop = proc (path: string, data: string) =
     touch()
+    if a.dropped.len == 0: a.dropAt = a.window.mousePos.vec2
     a.dropped.add path
   a.window.onFocusChange = proc () =
     touch()
@@ -1800,6 +1974,15 @@ proc main() =
     a.dirtyUntil = now() + 0.5
 
   if files.len > 0: a.openPaths(files)
+  elif c.rememberPlaylist:
+    # Restored without playing; Play starts the entry that was current.
+    a.playlist = c.playlist.filterIt(fileExists(it) or it.contains("://"))
+    if a.playlist.len > 0:
+      let cur = c.playlistIndex
+      a.plSelected =
+        if cur >= 0 and cur < c.playlist.len and c.playlist[cur] in a.playlist:
+          a.playlist.find(c.playlist[cur])
+        else: 0
 
   var lastFrame = 0.0
   while not a.window.closeRequested:
@@ -1810,7 +1993,7 @@ proc main() =
     if a.optWin != nil: a.optWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
-      a.openPaths(a.dropped)
+      a.dropFiles(a.dropped)
       a.dropped.setLen 0
     let incoming = a.instance.poll()
     if incoming.len > 0:
@@ -1824,6 +2007,7 @@ proc main() =
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
     let changed = a.player.pollEvents()
+    a.pollProbe()
     a.preview.pollEvents()
     a.pollDialog()
     for st in a.script.due: a.runScriptStep(st)
@@ -1883,6 +2067,11 @@ proc main() =
     let (pos, size) = (a.window.framePos, a.window.size)
     (a.cfg.windowX, a.cfg.windowY, a.cfg.windowW, a.cfg.windowH) =
       (pos.x.int, pos.y.int, size.x.int, size.y.int)
+  if a.cfg.rememberPlaylist:
+    a.cfg.playlist = a.playlist
+    a.cfg.playlistIndex = if a.plIndex >= 0: a.plIndex else: a.plSelected
+  else:
+    (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
   a.cfg.save()
   a.instance.close()
   for c in a.children: c.close()

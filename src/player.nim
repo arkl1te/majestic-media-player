@@ -379,8 +379,13 @@ type
     width*, height*: int      ## first real video track, 0 for audio only
 
   Prober* = ref object
-    ## Headless, paused mpv with null outputs, for playlist sorting.
+    ## Headless, paused mpv with null outputs, for the playlist's columns and
+    ## sorting. Probes one file at a time, either blocking or in the background.
     h: MpvHandle
+    pending*: string          ## path being probed, "" when idle
+    info*: MediaInfo          ## result of the last finished probe
+    deadline: float
+    loaded: bool              ## a file is open (released by finish)
 
 proc newProber*(): Prober =
   let h = mpv_create()
@@ -397,31 +402,52 @@ proc newProber*(): Prober =
     return nil
   Prober(h: h)
 
-proc probe*(pr: Prober, path: string, timeout = 3.0): MediaInfo =
-  ## Opens path just long enough to read its duration and video size.
-  if pr == nil: return
+proc start*(pr: Prober, path: string, timeout = 3.0) =
+  ## Begins probing path; poll until it returns true, then read `info`.
+  pr.pending = path
+  pr.info = MediaInfo()
+  pr.deadline = epochTime() + timeout
+  pr.loaded = true
   pr.h.command("loadfile", path, "replace")
-  let deadline = epochTime() + timeout
-  while true:
-    let left = deadline - epochTime()
+
+proc poll*(pr: Prober, wait = 0.0): bool =
+  ## Handles the pending probe's events, waiting up to `wait` seconds for one.
+  ## True once it is done; `info` stays zeroed when the file failed or timed out.
+  while pr.pending.len > 0:
+    let left = pr.deadline - epochTime()
     if left <= 0: break
-    let ev = mpv_wait_event(pr.h, left)
+    let ev = mpv_wait_event(pr.h, min(wait, left))
     case ev.eventId
+    of evNone: return false
     of evFileLoaded:
-      result.duration = pr.h.getFloat("duration")
+      # Skip a late event from a file an earlier probe abandoned.
+      if pr.h.getStr("path") != pr.pending: continue
+      pr.info.duration = pr.h.getFloat("duration")
       let tracks = pr.h.getNode("track-list")
       if tracks.kind == JArray:
         for t in tracks:
           if t{"type"}.getStr == "video" and not t{"albumart"}.getBool:
-            result.width = t{"demux-w"}.getInt
-            result.height = t{"demux-h"}.getInt
+            pr.info.width = t{"demux-w"}.getInt
+            pr.info.height = t{"demux-h"}.getInt
             break
       break
     of evEndFile:
       if cast[ptr MpvEventEndFile](ev.data).reason == efError: break
     of evShutdown: break
     else: discard
+  pr.pending = ""
+  true
+
+proc probe*(pr: Prober, path: string, timeout = 3.0): MediaInfo =
+  ## Opens path just long enough to read its duration and video size.
+  if pr == nil: return
+  pr.start(path, timeout)
+  while not pr.poll(timeout): discard
+  pr.info
 
 proc finish*(pr: Prober) =
   ## Releases the last probed file.
-  if pr != nil: pr.h.command("stop")
+  if pr != nil and pr.loaded:
+    pr.pending = ""
+    pr.loaded = false
+    pr.h.command("stop")

@@ -196,6 +196,7 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
   ui.checkRow(p, "o-rxf", "Remember last grab, rotation and scale", c.rememberTransform)
+  ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
   ui.group(p, "Title bar")
   ui.radioRow(p, "o-tname", "File name only", c.titleFullPath, false)
   ui.radioRow(p, "o-tpath", "Display full path", c.titleFullPath, true)
