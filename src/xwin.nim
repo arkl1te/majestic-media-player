@@ -71,7 +71,10 @@ const
   ClientMessage = 33.cint
   SubstructureNotifyMask = 1.clong shl 19
   SubstructureRedirectMask = 1.clong shl 20
+  USPosition = 1.clong shl 0
+  PPosition = 1.clong shl 2
   PMinSize = 1.clong shl 4
+  PMaxSize = 1.clong shl 5
   PAspect = 1.clong shl 7
   PBaseSize = 1.clong shl 8
   NetWmMoveResizeMove = 8
@@ -122,6 +125,12 @@ proc XMapRaised(d: XDisplay, w: XID): cint {.importc, cdecl.}
 proc XUnmapWindow(d: XDisplay, w: XID): cint {.importc, cdecl.}
 proc XCheckWindowEvent(d: XDisplay, w: XID, mask: clong, ev: ptr XEventBuf): cint {.importc, cdecl.}
 proc XSync(d: XDisplay, discardEvents: cint): cint {.importc, cdecl.}
+proc XMoveWindow(d: XDisplay, w: XID, x, y: cint): cint {.importc, cdecl.}
+proc XGetWindowProperty(d: XDisplay, w: XID, prop: Atom, offset, length: clong,
+  delete: cint, reqType: Atom, actualType: ptr Atom, actualFormat: ptr cint,
+  nitems, bytesAfter: ptr culong, data: ptr pointer): cint {.importc, cdecl.}
+proc XFree(data: pointer): cint {.importc, cdecl.}
+proc XSetTransientForHint(d: XDisplay, w, parent: XID): cint {.importc, cdecl.}
 proc glXGetCurrentContext(): pointer {.importc, dynlib: "libGL.so.1".}
 proc glXMakeCurrent(d: XDisplay, drawable: XID, ctx: pointer): cint {.importc, dynlib: "libGL.so.1".}
 proc glXSwapBuffers(d: XDisplay, drawable: XID) {.importc, dynlib: "libGL.so.1".}
@@ -180,6 +189,40 @@ proc startWindowDrag*(window: Window) =
   privateAccess(Window)
   window.state.buttonDown.excl MouseLeft
 
+proc activate*(window: Window) =
+  ## Raises and focuses the window. Source 2 ("pager") asks the WM to honour
+  ## it despite focus-stealing prevention.
+  window.sendWmMessage("_NET_ACTIVE_WINDOW", [2.clong, 0, 0])
+
+proc frameExtents(window: Window): tuple[left, top: int32] =
+  ## Width of the WM frame left of and above the content (_NET_FRAME_EXTENTS).
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  var kind: Atom
+  var format: cint
+  var n, after: culong
+  var data: pointer
+  if XGetWindowProperty(d, window.xid, XInternAtom(d, "_NET_FRAME_EXTENTS", 0),
+      0, 4, 0, 0, kind.addr, format.addr, n.addr, after.addr, data.addr) == 0 and
+     data != nil:
+    if format == 32 and n >= 4:
+      let v = cast[ptr UncheckedArray[clong]](data)  # left, right, top, bottom
+      result = (v[0].int32, v[2].int32)
+    discard XFree(data)
+
+proc framePos*(window: Window): IVec2 =
+  ## Screen position of the window's outer (decorated) top-left corner.
+  let e = window.frameExtents
+  window.pos - ivec2(e.left, e.top)
+
+proc moveFrame*(window: Window, pos: IVec2) =
+  ## Places the outer top-left corner at pos. With the default NorthWest
+  ## gravity the WM reads a client move as the frame's position (ICCCM 4.1.5).
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  discard XMoveWindow(d, window.xid, pos.x, pos.y)
+  discard XFlush(d)
+
 proc setAlwaysOnTop*(window: Window, on: bool) =
   let d = glXGetCurrentDisplay()
   if d == nil: return
@@ -200,6 +243,32 @@ proc setAspectHints*(window: Window, aspect: float, chrome: IVec2, minSize: IVec
     hints.minAspect = [num, 10000]
     hints.maxAspect = [num, 10000]
   XSetWMNormalHints(d, window.xid, hints.addr)
+  discard XFlush(d)
+
+proc setDialogFor*(window, parent: Window) =
+  ## Makes window a modal dialog of parent: the WM keeps it above parent and
+  ## treats it as part of the same app (no taskbar entry). Call before mapping.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  discard XSetTransientForHint(d, window.xid, parent.xid)
+  var kind = XInternAtom(d, "_NET_WM_WINDOW_TYPE_DIALOG", 0).clong
+  discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_WINDOW_TYPE", 0),
+    XaAtom, 32, 0, kind.addr, 1)
+  var state = XInternAtom(d, "_NET_WM_STATE_MODAL", 0).clong
+  discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_STATE", 0),
+    XaAtom, 32, 0, state.addr, 1)
+
+proc placeDialog*(window: Window, pos, size: IVec2) =
+  ## Fixes the window's size and puts its outer top-left corner at pos. The
+  ## position hints make the WM use it instead of its own placement; call
+  ## while the window is unmapped.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  var hints = XSizeHints(flags: USPosition or PPosition or PMinSize or PMaxSize,
+    x: pos.x, y: pos.y, width: size.x, height: size.y,
+    minWidth: size.x, minHeight: size.y, maxWidth: size.x, maxHeight: size.y)
+  XSetWMNormalHints(d, window.xid, hints.addr)
+  discard XMoveResizeWindow(d, window.xid, pos.x, pos.y, size.x.cuint, size.y.cuint)
   discard XFlush(d)
 
 type XRRMonitorInfo = object
@@ -359,6 +428,24 @@ proc endDraw*(p: PopupWindow, main: Window) =
   ## Presents the popup and makes the main window current again.
   let d = glXGetCurrentDisplay()
   glXSwapBuffers(d, p.xid)
+  discard glXMakeCurrent(d, main.xid, mainContext)
+
+var vsyncOffFor: seq[XID]
+
+proc beginDrawOn*(target: Window) =
+  ## Points the current (main window's) GL context at another window of the
+  ## same visual, so it draws with the main window's GL resources.
+  let d = glXGetCurrentDisplay()
+  mainContext = glXGetCurrentContext()
+  discard glXMakeCurrent(d, target.xid, mainContext)
+  if target.xid notin vsyncOffFor:
+    vsyncOffFor.add target.xid
+    disableVsync(target.xid)
+
+proc endDrawOn*(target, main: Window) =
+  ## Presents target and makes the main window current again.
+  let d = glXGetCurrentDisplay()
+  glXSwapBuffers(d, target.xid)
   discard glXMakeCurrent(d, main.xid, mainContext)
 
 proc pollInput*(popups: openArray[PopupWindow], input: var PopupInput) =

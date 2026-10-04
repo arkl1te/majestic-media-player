@@ -73,7 +73,15 @@ builds don't depend on whatever is in `~/.nimble`.
 - vsync is disabled on purpose: with NVIDIA under XWayland, a vsync'd
   `glXSwapBuffers` can block for seconds when the window is hidden. Video frames
   are paced from mpv's frame timing instead; the compositor prevents tearing.
-- Settings and recent files live in `~/.config/majestic-media-player/config.json`.
+- Settings and recent files live in `~/.config/majestic-media-player/config.json`;
+  remembered playback positions (View ▸ Options ▸ Player) in `positions.json` next to it.
+- With "Same player for each media file" (the default), a running player listens
+  on `$XDG_RUNTIME_DIR/majestic-media-player.sock` and files opened from the
+  file manager are handed to it instead of starting a second window.
+- Options ▸ Formats writes file associations to `~/.config/mimeapps.list`.
+  Associations are per MIME type, so extensions that share one (mp4, m4v, f4v)
+  are checked together. Unchecking removes the player from the default list,
+  and the previous default takes over again.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary.
 
 ## Source layout
@@ -84,6 +92,8 @@ builds don't depend on whatever is in `~/.nimble`.
 | `src/player.nim` | mpv playback instance, thumbnail-preview instance, folder helpers |
 | `src/videogl.nim` | mpv → texture rendering and the transformed video quad |
 | `src/menutree.nim` | Menu bar / popup / context-menu system |
+| `src/options.nim` | Options window (page tree and pages) |
+| `src/assoc.nim`, `src/instance.nim` | File associations, single-instance hand-over |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
 | `src/xwin.nim` | X11 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
 | `src/config.nim`, `src/dialogs.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs, palette, vector icons |
@@ -94,6 +104,6 @@ builds don't depend on whatever is in `~/.nimble`.
 - `MMP_SCRIPT` drives the UI for automated checks, e.g.
   `MMP_SCRIPT="1:open ~/v.mkv;3:menu 1;3.5:shot /tmp/view.png;4:quit"`.
   Commands: `open`, `menu <bar> [sub...]`, `ctx x y`, `close`, `mouse x y|off`,
-  `overlay <name>`, `action Menu/Sub/Item`, `fs 0|1`, `seek t`, `pause`,
+  `overlay <name>`, `optpage <page>`, `focus <field id>`, `type <text>`, `action Menu/Sub/Item`, `fs 0|1`, `seek t`, `pause`,
   `size w h`, `set prop value`, `dump props...`, `shot file.png`, `quit`.
   `shot` also writes each open menu popup as `file-menuN.png`.

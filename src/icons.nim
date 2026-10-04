@@ -16,6 +16,7 @@ const iconPaths = {
   "check": (24, "M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"),
   "radio": (24, "M12 7.5a4.5 4.5 0 1 1 0 9a4.5 4.5 0 1 1 0-9z"),
   "arrow": (24, "M9.5 7l5 5-5 5z"),
+  "expand": (24, "M7 9.5l5 5 5-5z"),
   "film": (24, "M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"),
   "music": (24, musicPath),
   "nofile": (24, "M6 2c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6H6zm7 7V3.5L18.5 9H13z"),
@@ -37,11 +38,20 @@ proc renderIcon*(path: string, viewBox, size: int, color = color(1, 1, 1, 1)): I
   let s = size.float32 / 24
   result.fillPath(parsePath(path), color, scale(vec2(s, s)))
 
+proc ringIcon(size: int): Image =
+  ## Radio button outline.
+  result = newImage(size, size)
+  let ctx = newContext(result)
+  ctx.strokeStyle = color(1, 1, 1, 1)
+  ctx.lineWidth = 1.5
+  ctx.strokeCircle(circle(vec2(size / 2, size / 2), size / 2 - 1.5))
+
 proc addIcons*(builder: AtlasBuilder) =
   for (name, spec) in iconPaths:
     for size in [16, 20]:
       let img = renderIcon(spec[1], spec[0], size)
       discard builder.addImage(name & $size, img)
+  discard builder.addImage("ring16", ringIcon(16))
 
 proc appIcon*(): Image =
   ## Window icon: accent crown on a dark rounded tile.

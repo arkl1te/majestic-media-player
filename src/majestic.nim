@@ -2,13 +2,15 @@
 
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils]
 import silky, vmath, bumpy, chroma, pixie, opengl
-import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript
+import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
+  options, instance
 
 const
   AppName = "Majestic Media Player"
-  AppVersion = "0.1.0"
+  AppVersion = staticRead("../VERSION").strip  # single source of truth: /VERSION
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
+  OptionsSize = ivec2(780, 512)
 
 type
   Overlay = enum
@@ -37,6 +39,17 @@ type
     xf: VideoTransform
     afterPlayback: AfterPlayback
     overlay: Overlay
+    optionsDlg: OptionsDialog
+    optWin: Window            ## Options dialog window, created on first use
+    optSk: Silky              ## its own Silky: one tracks one window's input
+    optUi: Ui
+    atlasImg: Image
+    atlas: SilkyAtlas
+    cfgBefore: Config         ## config when Options opened, restored on Cancel
+    settingsKey: string       ## player-facing settings last pushed to mpv
+    positions: Positions      ## remembered playback positions
+    resumedAt: float          ## start time of the file being loaded, else 0
+    instance: InstanceServer  ## receives files from later launches
     props: seq[(string, string)]
     dialog: Dialog
     children: seq[Process]
@@ -116,9 +129,13 @@ proc videoAspect(a: App): float =
 # --- window management ------------------------------------------------------
 
 proc updateTitle(a: App) =
-  let t =
-    if a.player.path.len > 0: a.player.path.fileTitle & " - " & AppName
-    else: AppName
+  let path = a.player.path
+  var name = if a.cfg.titleFullPath: path else: path.fileTitle
+  if a.cfg.titleUseMediaTitle and a.player.loaded:
+    # mpv falls back to the file name when the file has no title tag.
+    let mt = a.player.h.getStr("media-title")
+    if mt.len > 0 and mt != path.fileTitle and mt != path: name = mt
+  let t = if path.len > 0: name & " - " & AppName else: AppName
   if t != a.title:
     a.title = t
     a.window.title = t
@@ -179,13 +196,26 @@ proc applyLoop(a: App) =
   a.player.h.setProp("loop-file",
     if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: "inf" else: "no")
 
+proc savePosition(a: App) =
+  ## Remembers where the current file was left off; finished (or barely
+  ## started) files are forgotten.
+  let p = a.player
+  if not a.cfg.rememberTime or not p.loaded or p.path.len == 0 or p.duration <= 0: return
+  if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached:
+    a.positions.remember(p.path, p.timePos)
+  else:
+    a.positions.del(p.path)
+  a.positions.save()
+
 proc playIndex(a: App, i: int) =
   if i < 0 or i >= a.playlist.len: return
+  a.savePosition()
   a.plIndex = i
   a.plSelected = i
   let path = a.playlist[i]
-  a.xf = VideoTransform()
-  a.player.load(path)
+  if not a.cfg.rememberTransform: a.xf = VideoTransform()
+  a.resumedAt = if a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0) else: 0.0
+  a.player.load(path, a.resumedAt)
   a.applyLoop()
   a.cfg.addRecent(path)
   a.cfg.lastDir = path.parentDir
@@ -204,6 +234,7 @@ proc openPaths(a: App, paths: seq[string]) =
   a.playIndex(0)
 
 proc closeFile(a: App) =
+  a.savePosition()
   a.player.close()
   a.preview.forget()
   a.playlist.setLen 0
@@ -289,13 +320,15 @@ proc handleEof(a: App) =
     a.runAfterPlayback()
 
 proc volumeStep(a: App, up: bool) =
-  ## Soft cap 100, hard cap 200: +5 below the soft cap, +2 above it, -5 down.
+  ## Soft cap 100, hard cap 200: the volume step (default 5) below the soft
+  ## cap, +2 above it, and the volume step down.
   let v = a.player.volume
+  let st = a.cfg.volumeStep
   let nv =
-    if up: (if v < 100: min(v + 5, 100) else: min(v + 2, 200))
-    else: max(v - 5, 0)
+    if up: (if v < 100: min(v + st, 100) else: min(v + 2, 200))
+    else: max(v - st, 0)
   a.player.setVolume(nv)
-  a.osd(&"Volume: {int(round(nv))}%")
+  a.osd(&"Volume: {nv:g}%")
 
 proc setMute(a: App, on: bool) =
   a.player.h.setProp("mute", on)
@@ -419,11 +452,94 @@ proc gatherProperties(a: App) =
   if a.player.chapters.len > 0: add "Chapters", $a.player.chapters.len
   a.props = p
 
+# --- settings -----------------------------------------------------------------
+
+proc langList(s: string): string =
+  ## "eng, jpn" or "eng jpn" -> "eng,jpn" (mpv's list syntax).
+  s.multiReplace((";", ","), (" ", ",")).split(',').filterIt(it.len > 0).join(",")
+
+proc subPathList(s: string): string =
+  ## "Subs; ~/subs" -> "Subs:/home/me/subs" (mpv's path-list syntax).
+  s.split(';').mapIt(it.strip.expandTilde).filterIt(it.len > 0).join(":")
+
+proc applyOsd(a: App) =
+  ## Level 3 adds the time / duration status line to the OSD.
+  a.player.h.setProp("osd-level",
+    if not a.cfg.showOsd: "0" elif a.cfg.osdTimestamp: "3" else: "1")
+
+proc syncSettings(a: App) =
+  ## Pushes the player-facing options to mpv (and the title) when they change.
+  let c = a.cfg
+  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
+    &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}"
+  if key == a.settingsKey: return
+  a.settingsKey = key
+  a.applyOsd()
+  let h = a.player.h
+  h.setProp("slang", langList(c.subLangs))
+  h.setProp("alang", langList(c.audioLangs))
+  h.setProp("sub-delay", c.subDelay / 1000)
+  h.setProp("sub-file-paths", subPathList(c.subPaths))
+  a.updateTitle()
+
+proc closeOptions(a: App, ok: bool) =
+  if ok: a.cfg.save()
+  else: a.cfg = a.cfgBefore  # undo the live edits
+  a.optUi.focusId = ""
+  a.overlay = ovNone
+  a.syncSettings()
+  if a.optWin.visible:
+    a.optWin.visible = false
+    a.window.activate()
+
+proc ensureOptionsWindow(a: App) =
+  if a.optWin != nil: return
+  let w = newWindow("Options", OptionsSize, style = Decorated, visible = false,
+    vsync = false)
+  # Windy made the new window's own context current; it is drawn with the
+  # main one instead (same visual), sharing the atlas texture and shaders.
+  makeContextCurrent(a.window)
+  w.icon = appIcon()
+  w.setDialogFor(a.window)
+  a.optWin = w
+  a.optSk = newSilky(w, a.atlasImg, a.atlas)
+  a.optUi = newUi(a.optSk, w)
+  let touch = proc () = a.dirtyUntil = now() + 1.2
+  let input = proc () =
+    touch()
+    a.inputPending = true
+  w.onMouseMove = touch
+  w.onFocusChange = touch
+  w.onResize = touch
+  w.onScroll = input
+  w.onButtonPress = proc (b: Button) = input()
+  w.onButtonRelease = proc (b: Button) = input()
+  w.onRune = proc (r: Rune) =
+    input()
+    a.optUi.typedPending.add $r
+
+proc showOptionsWindow(a: App) =
+  ## Centres the dialog's frame on the main window's frame (both have the
+  ## same decorations), kept on the main window's monitor.
+  let w = a.optWin
+  var pos = a.window.framePos + (a.window.size - OptionsSize) div 2
+  let m = monitorAt(a.window.pos + a.window.size div 2)
+  pos.x = clamp(pos.x, m.pos.x, max(m.pos.x, m.pos.x + m.size.x - OptionsSize.x))
+  pos.y = clamp(pos.y, m.pos.y, max(m.pos.y, m.pos.y + m.size.y - OptionsSize.y))
+  w.placeDialog(pos, OptionsSize)
+  w.visible = true
+  w.activate()
+
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
   if o == ovProperties:
     if not a.player.loaded: return
     a.gatherProperties()
+  if o == ovOptions and a.overlay != ovOptions:
+    a.cfgBefore = a.cfg
+    a.ensureOptionsWindow()
+    a.optionsDlg.opened(a.optUi)
+    a.showOptionsWindow()
   a.overlay = o
 
 # --- menu tree --------------------------------------------------------------
@@ -492,7 +608,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   view.sep()
   view.check("Show OSD", "", cfg.showOsd, action = proc () =
     a.cfg.showOsd = not a.cfg.showOsd
-    a.player.h.setProp("osd-level", if a.cfg.showOsd: "1" else: "0"))
+    a.syncSettings())
   view.check("Full Screen", "Alt+Enter", a.fullscreen, action = proc () =
     a.setFullscreen(not a.fullscreen))
   let fullScreen = view.children[^1]
@@ -687,7 +803,9 @@ proc handleKeys(a: App) =
   let none = not c and not s and not al
 
   if pressed[KeyEscape]:
-    if a.overlay != ovNone: a.overlay = ovNone
+    # A text field being edited takes Escape itself.
+    if a.overlay == ovOptions: a.closeOptions(false)
+    elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
     return
@@ -864,7 +982,7 @@ proc seekBar(a: App, r: Rect) =
   var snapped = -1
   if hov:
     t = clamp((ui.mouse.x - x0) / w, 0, 1) * dur
-    if a.cfg.snapToChapters and not a.window.shift:
+    if a.cfg.snapWithShift == a.window.shift:
       var best = a.cfg.snapDistance
       for i, m in markers:
         let d = abs(x0 + w * (m[0] / dur) - ui.mouse.x)
@@ -1017,7 +1135,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif s and not c and not al:
     @[@[(",", "-Rate"), (".", "+Rate")],
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
-      @[("Drag", "Seek Without Snapping")]]
+      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Chapters" else: "Seek Without Snapping")]]
   else: @[]
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
@@ -1162,25 +1280,47 @@ proc overlayFrame(a: App, title: string, size: Vec2): Rect =
   ui.rect(rect(r.x + 1, r.y + 50, r.w - 2, 1), colBorder)
   r
 
-proc optionsOverlay(a: App) =
-  let ui = a.ui
-  let r = a.overlayFrame("Options", vec2(420, 470))
-  var y = r.y + 66
-  let x = r.x + 24
-  ui.textIn("STEPS", rect(x, y, 200, 20), colTextDim, FontSmall); y += 26
-  discard ui.stepper("o-pan", vec2(x, y), "Move (pixels)", a.cfg.panStep, 1, 1, 500); y += 32
-  discard ui.stepper("o-rot", vec2(x, y), "Rotate (degrees)", a.cfg.rotateStep, 1, 1, 90); y += 32
-  discard ui.stepper("o-size", vec2(x, y), "Resize (percent)", a.cfg.sizeStep, 1, 1, 50); y += 32
-  discard ui.stepper("o-rate", vec2(x, y), "Playback rate", a.cfg.rateStep, 0.05, 0.05, 1, "x", 2); y += 32
-  discard ui.stepper("o-seek", vec2(x, y), "Jump (seconds)", a.cfg.seekStep, 1, 1, 300, "s"); y += 42
-  ui.textIn("SEEK BAR", rect(x, y, 200, 20), colTextDim, FontSmall); y += 26
-  discard ui.checkbox("o-prev", vec2(x, y), "Show thumbnail preview on hover", a.cfg.seekPreview); y += 30
-  discard ui.checkbox("o-snap", vec2(x, y), "Snap to chapters (hold Shift to bypass)", a.cfg.snapToChapters); y += 30
-  ui.textIn("WINDOW", rect(x, y + 4, 200, 20), colTextDim, FontSmall); y += 30
-  discard ui.checkbox("o-fit", vec2(x, y), "Resize window to fit video on open", a.cfg.autoFitWindow)
-  if ui.textButton("o-done", rect(r.x + r.w - 110, r.y + r.h - 46, 90, 30), "Done", primary = true):
-    a.overlay = ovNone
-    a.cfg.save()
+proc readFramebuffer(size: IVec2): Image =
+  result = newImage(size.x, size.y)
+  glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, result.data[0].addr)
+  result.flipVertical()
+
+proc renderOptions(a: App, shot: string) =
+  ## Draws the Options window. Like the menu popups, call after the main
+  ## window's swap.
+  if a.overlay != ovOptions: return
+  let w = a.optWin
+  let ui = a.optUi
+  if w.closeRequested:  # its title bar's close button, Alt+F4
+    w.closeRequested = false
+    a.closeOptions(false)
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  # A text field being edited takes Escape itself.
+  let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0
+  w.beginDrawOn()
+  ui.beginFrame()
+  a.optSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let action = a.optionsDlg.draw(ui, a.cfg, rect(vec2(0, 0), size.vec2))
+  ui.drawTooltip()
+  a.optSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-options.png")
+  w.endDrawOn(a.window)
+  case action
+  of oaOk: a.closeOptions(true)
+  of oaCancel: a.closeOptions(false)
+  of oaNone:
+    if esc: a.closeOptions(false)
+  if a.optionsDlg.assocApplied:
+    a.optionsDlg.assocApplied = false
+    # Let KDE's service cache notice the new defaults right away.
+    if findExe("kbuildsycoca6").len > 0: a.spawn("kbuildsycoca6")
 
 proc propertiesOverlay(a: App) =
   let ui = a.ui
@@ -1223,11 +1363,6 @@ proc aboutOverlay(a: App) =
     rect(r.x, r.y + 188, r.w, 22), colTextDim, FontSmall, h = CenterAlign)
 
 # --- frame ------------------------------------------------------------------
-
-proc readFramebuffer(size: IVec2): Image =
-  result = newImage(size.x, size.y)
-  glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, result.data[0].addr)
-  result.flipVertical()
 
 proc frame(a: App) =
   let w = a.window
@@ -1320,7 +1455,8 @@ proc frame(a: App) =
     ui.captured = false
     ui.sk.pushLayer(PopupsLayer)
     case a.overlay
-    of ovOptions: a.optionsOverlay()
+    of ovOptions:  # its own window; clicks here bring it back up
+      if ui.pressed(): a.optWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -1357,8 +1493,13 @@ proc frame(a: App) =
   a.menus.renderPopups(ui, if shot.len == 0: nil else:
     proc (level: int, size: IVec2) =
       readFramebuffer(size).writeFile(shot.changeFileExt("") & &"-menu{level}.png"))
+  a.renderOptions(shot)
 
 # --- setup & main loop --------------------------------------------------------
+
+proc keyUi(a: App): Ui =
+  ## The Ui of the window taking the keyboard.
+  if a.overlay == ovOptions: a.optUi else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
   let arg = st.args.join(" ")
@@ -1374,6 +1515,12 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
                      else: vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
   of "mods": a.fakeMods = if arg == "off": "" else: arg
+  of "optpage":
+    a.ensureOptionsWindow()
+    for p in OptionsPage:
+      if ($p).toLowerAscii.startsWith(arg.toLowerAscii): a.optionsDlg.selectPage(a.optUi, p)
+  of "focus": a.keyUi.focusId = arg
+  of "type": a.keyUi.typedPending.add arg
   of "overlay":
     a.showOverlay(case arg
       of "options": ovOptions
@@ -1417,21 +1564,47 @@ proc buildAtlas(): (Image, SilkyAtlas) =
 
 proc main() =
   discard setlocale(LC_NUMERIC, "C")
-  let a = App(plIndex: -1, plSelected: -1)
+  let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog())
   a.cfg = loadConfig()
   a.script = loadScript()
+  let files = commandLineParams().mapIt(if it.contains("://"): it else: it.absolutePath)
+  # Debug scripts must not hand their files to (or take files from) a real
+  # player the user has open.
+  let scripted = a.script.steps.len > 0
+  if files.len > 0 and a.cfg.openMode == omSamePlayer and not scripted and
+     forwardToRunning(files):
+    return
+  if not scripted: a.instance = startServer()
+  a.positions = loadPositions()
+  if a.cfg.rememberTransform:
+    let t = a.cfg.transform
+    a.xf = VideoTransform(pan: vec2(t.panX, t.panY), rotation: t.rotation,
+      zoom: t.zoom, scaleX: t.scaleX, scaleY: t.scaleY)
   # vsync off: under XWayland the NVIDIA driver can block glXSwapBuffers for
   # whole seconds when KWin withholds frame callbacks (hidden/occluded window),
   # freezing UI and video. The compositor presents our buffers tear-free, mpv
   # paces video frames, and UI-only redraws are rate-capped in the main loop.
-  a.window = newWindow(AppName, ivec2(1024, 640), vsync = false)
+  let c = a.cfg
+  let startSize =
+    if c.rememberWindowSize and c.windowW >= MinWindow.x and c.windowH >= MinWindow.y:
+      ivec2(c.windowW.int32, c.windowH.int32)
+    else: ivec2(1024, 640)
+  a.window = newWindow(AppName, startSize, vsync = false)
   a.window.icon = appIcon()
   makeContextCurrent(a.window)
   loadExtensions()
   a.window.disableVsync()
   a.window.setAspectHints(0, ivec2(0, 0), MinWindow)
+  if c.rememberWindowPos and c.windowW > 0:
+    # Only onto a monitor that still exists.
+    let p = ivec2(c.windowX.int32, c.windowY.int32)
+    let m = monitorAt(p + ivec2(40, 40))
+    if p.x + 40 >= m.pos.x and p.y + 40 >= m.pos.y and
+       p.x + 40 < m.pos.x + m.size.x and p.y + 40 < m.pos.y + m.size.y:
+      a.window.moveFrame(p)
 
   let (img, atlas) = buildAtlas()
+  (a.atlasImg, a.atlas) = (img, atlas)
   a.sk = newSilky(a.window, img, atlas)
   a.ui = newUi(a.sk, a.window)
   a.menus = newMenuSystem()
@@ -1440,6 +1613,7 @@ proc main() =
   a.player = newPlayer(a.cfg.volume, a.cfg.muted, a.cfg.showOsd)
   a.player.initRender()
   a.applyLoop()
+  a.syncSettings()
   try:
     a.preview = newPreview()
     if a.preview != nil: a.preview.initRender()
@@ -1460,6 +1634,10 @@ proc main() =
     touch()
     a.inputPending = true
   a.window.onResize = proc () = touch()
+  a.window.onRune = proc (r: Rune) =
+    touch()
+    a.ui.typedPending.add $r
+    a.inputPending = true
   # Windy reports a drop one file at a time; gather them so the whole drop
   # becomes one playlist.
   a.window.onFileDrop = proc (path: string, data: string) =
@@ -1474,16 +1652,27 @@ proc main() =
     a.focusLostAt = if a.window.focused: 0.0 else: now()
     a.dirtyUntil = now() + 0.5
 
-  var args = commandLineParams()
-  if args.len > 0:
-    a.openPaths(args.mapIt(if it.contains("://"): it else: it.absolutePath))
+  if files.len > 0: a.openPaths(files)
 
   var lastFrame = 0.0
   while not a.window.closeRequested:
+    # Silky's own text-input layer (unused here) switches rune input off at
+    # the end of every UI frame and on focus changes; without it Windy drops
+    # typed characters, so turn it back on before reading events.
+    a.window.runeInputEnabled = true
+    if a.optWin != nil: a.optWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
       a.openPaths(a.dropped)
       a.dropped.setLen 0
+    let incoming = a.instance.poll()
+    if incoming.len > 0:
+      if a.overlay == ovOptions: a.closeOptions(false)
+      a.overlay = ovNone
+      a.ui.focusId = ""
+      a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))
+      a.window.activate()
+      a.dirtyUntil = now() + 0.5
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
@@ -1496,6 +1685,9 @@ proc main() =
     if a.player.justLoaded:
       a.player.justLoaded = false
       a.updateTitle()
+      if a.resumedAt > 0:
+        a.osd("Resumed at " & fmtTime(a.resumedAt))
+        a.resumedAt = 0
       a.hintsKey = ""
       if a.cfg.autoFitWindow: a.fitPending = true
     if a.fitPending and a.player.hasVideo:
@@ -1529,13 +1721,23 @@ proc main() =
       a.inputPending = false
       a.handleKeys()
       a.frame()
+      a.syncSettings()
       lastFrame = t
     else:
       sleep(1)
 
+  if a.overlay == ovOptions: a.closeOptions(false)
+  a.savePosition()
   a.cfg.volume = a.player.volume
   a.cfg.muted = a.player.muted
+  a.cfg.transform = SavedTransform(panX: a.xf.pan.x, panY: a.xf.pan.y,
+    rotation: a.xf.rotation, zoom: a.xf.zoom, scaleX: a.xf.scaleX, scaleY: a.xf.scaleY)
+  if not a.fullscreen and not a.window.maximized:
+    let (pos, size) = (a.window.framePos, a.window.size)
+    (a.cfg.windowX, a.cfg.windowY, a.cfg.windowW, a.cfg.windowH) =
+      (pos.x.int, pos.y.int, size.x.int, size.y.int)
   a.cfg.save()
+  a.instance.close()
   for c in a.children: c.close()
   if a.preview != nil:
     mpv_render_context_free(a.preview.render)

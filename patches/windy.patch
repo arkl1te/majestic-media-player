@@ -1,5 +1,5 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..6b8d36a 100644
+index 5b29e3c..1fd2a40 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -814,8 +814,11 @@ proc newWindow*(
@@ -16,6 +16,17 @@ index 5b29e3c..6b8d36a 100644
  
    makeContextCurrent result
  
+@@ -865,8 +868,8 @@ proc pollEvents(window: Window) =
+     d: Display,
+     event: ptr XEvent,
+     userData: pointer
+-  ): bool {.cdecl.} =
+-    event.any.window == cast[Window](userData).handle
++  ): cint {.cdecl.} =
++    cint(event.any.window == cast[Window](userData).handle)
+ 
+   template pushButtonEvent(
+     button: Button,
 @@ -1128,12 +1131,14 @@ proc pollEvents(window: Window) =
            # Parse URI list (files separated by newlines).
            let uriList = prop.data
@@ -37,3 +48,27 @@ index 5b29e3c..6b8d36a 100644
  
          # Clean up the property.
          window.handle.delProperty(xaWindyXdndTargetProperty)
+@@ -1224,8 +1229,8 @@ proc processClipboardEvents: bool =
+     d: Display,
+     event: ptr XEvent,
+     userData: pointer
+-  ): bool {.cdecl.} =
+-    event.any.window == cast[XWindow](userData)
++  ): cint {.cdecl.} =
++    cint(event.any.window == cast[XWindow](userData))
+ 
+   while display.XCheckIfEvent(
+     ev.addr, checkEvent, cast[pointer](clipboardWindow)
+diff --git a/src/windy/platforms/linux/x11/xevent.nim b/src/windy/platforms/linux/x11/xevent.nim
+index 1147b56..f88aa59 100644
+--- a/src/windy/platforms/linux/x11/xevent.nim
++++ b/src/windy/platforms/linux/x11/xevent.nim
+@@ -5,7 +5,7 @@ type
+     d: Display,
+     event: ptr XEvent,
+     p: pointer
+-  ): bool {.cdecl.}
++  ): cint {.cdecl.} ## Xlib's Bool (an int): a Nim bool leaves the upper bytes undefined
+   ErrorHandleProc* = proc (d: Display, event: ptr XErrorEvent): bool {.cdecl.}
+ 
+   XEventKind* {.size: cint.sizeof.} = enum

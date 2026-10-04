@@ -183,15 +183,20 @@ proc pollEvents*(p: Player): bool =
       stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
-proc load*(p: Player, path: string) =
+proc load*(p: Player, path: string, start = 0.0) =
+  ## Opens path, starting at `start` seconds when given.
   p.path = path
   p.stopped = false
   p.eofReached = false
   p.eofHandled = false
-  p.timePos = 0
+  p.timePos = start
   p.duration = 0
   p.loadError = ""
-  p.h.command("loadfile", path, "replace")
+  if start > 0:
+    p.h.command("loadfile", path, "replace", "-1",
+      "start=" & formatFloat(start, ffDecimal, 3))
+  else:
+    p.h.command("loadfile", path, "replace")
   p.h.setProp("pause", false)
 
 proc close*(p: Player) =

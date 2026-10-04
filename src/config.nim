@@ -1,6 +1,6 @@
 ## Persistent settings, stored at ~/.config/majestic-media-player/config.json.
 
-import std/[os, strutils]
+import std/[os, strutils, tables]
 import jsony
 
 type
@@ -13,9 +13,20 @@ type
   RepeatMode* = enum
     rmFile, rmPlaylist
 
+  OpenMode* = enum
+    omSamePlayer, omNewPlayer
+
   AfterPlayback* = enum
     apNothing, apNextInFolder, apMonitorOff, apExit, apSleep, apHibernate,
     apShutdown, apLogOff, apLock
+
+  SavedTransform* = object
+    ## Grab, rotate & scale state, kept when "Remember last grab, rotation
+    ## and scale" is on.
+    panX*, panY*, rotation*: float
+    zoom*: float = 1
+    scaleX*: float = 1
+    scaleY*: float = 1
 
   Config* = object
     recentFiles*: seq[string]
@@ -33,24 +44,45 @@ type
     onTop*: OnTopMode = otDefault
     repeatForever*: bool = false
     repeatMode*: RepeatMode = rmPlaylist
-    # Step sizes (editable in Options).
+    # Options > Player
+    openMode*: OpenMode = omSamePlayer
+    osdTimestamp*: bool = false
+    autoFitWindow*: bool = true
+    rememberTime*: bool = false
+    rememberWindowPos*: bool = false
+    rememberWindowSize*: bool = false
+    rememberTransform*: bool = false
+    titleFullPath*: bool = false
+    titleUseMediaTitle*: bool = false
+    # Options > Playback
+    rateStep*: float = 0.25
+    seekStep*: float = 5           # seconds
+    volumeStep*: float = 5
+    seekPreview*: bool = true
+    snapWithShift*: bool = false   # off: snap unless Shift; on: only with Shift
+    snapDistance*: float = 8       # pixels
+    subLangs*: string = ""         # "eng, jpn": preferred subtitle languages
+    audioLangs*: string = ""
+    # Options > Subtitles
+    subDelay*: float = 0           # milliseconds
+    subPaths*: string = ""         # extra subtitle folders, ';'-separated
+    # Options > Miscellaneous
     panStep*: float = 10           # pixels
     rotateStep*: float = 5         # degrees
     sizeStep*: float = 5           # percent
-    rateStep*: float = 0.25
-    seekStep*: float = 5           # seconds
-    seekPreview*: bool = true
-    snapToChapters*: bool = true
-    snapDistance*: float = 8       # pixels
-    autoFitWindow*: bool = true
+    # Remembered state
+    windowX*, windowY*: int
+    windowW*, windowH*: int        # 0 = never saved
+    transform*: SavedTransform
 
 const MaxRecent = 15
 
 proc newHook*(c: var Config) =
   c = Config()
 
-proc configPath(): string =
-  getConfigDir() / "majestic-media-player" / "config.json"
+proc configDir(): string = getConfigDir() / "majestic-media-player"
+
+proc configPath(): string = configDir() / "config.json"
 
 proc loadConfig*(): Config =
   result = Config()
@@ -76,11 +108,48 @@ proc addRecent*(c: var Config, path: string) =
   if c.recentFiles.len > MaxRecent:
     c.recentFiles.setLen(MaxRecent)
 
-const MediaExtensions* = [
+# --- remembered playback positions -------------------------------------------
+
+type Positions* = OrderedTable[string, float]
+
+const MaxPositions = 500
+
+proc positionsPath(): string = configDir() / "positions.json"
+
+proc loadPositions*(): Positions =
+  let path = positionsPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(Positions)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(p: Positions) =
+  let path = positionsPath()
+  try:
+    createDir(path.parentDir)
+    writeFile(path, p.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+proc remember*(p: var Positions, path: string, t: float) =
+  ## Most recent last, so the oldest entries go first when trimming.
+  p.del(path)
+  p[path] = t
+  while p.len > MaxPositions:
+    for k in p.keys:
+      p.del(k)
+      break
+
+const VideoExtensions* = [
   "mkv", "mp4", "m4v", "webm", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts",
-  "m2ts", "mts", "3gp", "ogv", "vob", "rmvb", "divx", "f4v", "asf",
+  "m2ts", "mts", "3gp", "ogv", "vob", "rmvb", "divx", "f4v", "asf"]
+
+const AudioExtensions* = [
   "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "alac", "ape",
   "wv", "mka", "aiff", "dts", "ac3"]
+
+const MediaExtensions* = @VideoExtensions & @AudioExtensions
 
 const SubtitleExtensions* = ["srt", "ass", "ssa", "vtt", "sub", "sup", "idx", "smi"]
 
