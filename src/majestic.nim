@@ -1,6 +1,7 @@
 ## Majestic Media Player — an mpv-based video player with a Silky UI.
 
-import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils]
+import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
+  random, tables]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance
@@ -15,6 +16,12 @@ const
 type
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout
+
+  ContextMenu = enum
+    cmVideo, cmTime, cmPlaylist  ## where the right-click menu was opened
+
+  PlaylistSort = enum
+    psName, psDuration, psDimension, psSize
 
   VideoTransform = object
     pan: Vec2
@@ -36,6 +43,9 @@ type
     plIndex: int
     plSelected: int
     plScroll: float32
+    plReveal: bool            ## scroll the selected entry into view
+    prober: Prober            ## created on the first sort that needs it
+    mediaInfo: Table[string, MediaInfo]  ## probe results, for sorting
     xf: VideoTransform
     afterPlayback: AfterPlayback
     overlay: Overlay
@@ -54,7 +64,7 @@ type
     dialog: Dialog
     children: seq[Process]
     fullscreen: bool
-    timeMenu: bool            ## context menu opened on the status timestamp
+    ctxMenu: ContextMenu
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
@@ -222,11 +232,14 @@ proc playIndex(a: App, i: int) =
   a.cfg.lastDir = path.parentDir
   a.updateTitle()
 
-proc openPaths(a: App, paths: seq[string]) =
-  var files: seq[string]
+proc expandPaths(paths: seq[string]): seq[string] =
+  ## Files and URLs as given; directories become their media files.
   for p in paths:
-    if dirExists(p): files.add mediaFilesIn(p, isMediaFile)
-    elif fileExists(p) or p.contains("://"): files.add p
+    if dirExists(p): result.add mediaFilesIn(p, isMediaFile)
+    elif fileExists(p) or p.contains("://"): result.add p
+
+proc openPaths(a: App, paths: seq[string]) =
+  let files = expandPaths(paths)
   if files.len == 0:
     a.osd("Nothing playable found")
     return
@@ -277,6 +290,82 @@ proc navigate(a: App, dir: int) =
       a.playIndex(0)
     else:
       a.osd(if dir > 0: "Last file in folder" else: "First file in folder")
+
+# --- playlist editing -------------------------------------------------------
+
+proc addToPlaylist(a: App, paths: seq[string]) =
+  ## Appends to the playlist; starts playing them when nothing is open.
+  let files = expandPaths(paths)
+  if files.len == 0:
+    a.osd("Nothing playable found")
+    return
+  let first = a.playlist.len
+  a.playlist.add files
+  if not a.player.loaded: a.playIndex(first)
+
+proc removeSelected(a: App) =
+  if a.plSelected < 0 or a.plSelected >= a.playlist.len: return
+  a.playlist.delete(a.plSelected)
+  if a.plIndex == a.plSelected: a.plIndex = -1
+  elif a.plIndex > a.plSelected: dec a.plIndex
+  a.plSelected = min(a.plSelected, a.playlist.len - 1)
+
+proc reorderPlaylist(a: App, order: seq[int]) =
+  ## order[new position] = old index; the playing and selected entries follow.
+  let old = a.playlist
+  var cur, sel = -1
+  for i, j in order:
+    a.playlist[i] = old[j]
+    if j == a.plIndex: cur = i
+    if j == a.plSelected: sel = i
+  a.plIndex = cur
+  a.plSelected = sel
+  a.plReveal = true
+
+proc moveSelected(a: App, to: int) =
+  let i = a.plSelected
+  if i < 0 or i >= a.playlist.len: return
+  var order = toSeq(0 ..< a.playlist.len)
+  order.delete(i)
+  order.insert(i, clamp(to, 0, order.len))
+  a.reorderPlaylist(order)
+
+proc probeInfo(a: App, path: string): MediaInfo =
+  ## Duration and video size, probed once per file (streams are not probed).
+  if path in a.mediaInfo: return a.mediaInfo[path]
+  if not path.contains("://"):
+    if a.prober == nil: a.prober = newProber()
+    result = a.prober.probe(path)
+  a.mediaInfo[path] = result
+
+proc sortPlaylist(a: App, by: PlaylistSort) =
+  ## Sorts ascending, or descending when already in ascending order.
+  let n = a.playlist.len
+  if n < 2: return
+  var keys = newSeq[(float, float)](n)
+  for i, p in a.playlist:
+    case by
+    of psName: discard
+    of psDuration: keys[i] = (a.probeInfo(p).duration, 0.0)
+    of psDimension:
+      let m = a.probeInfo(p)
+      keys[i] = (float(m.width * m.height), m.width.float)
+    of psSize:
+      let size = try: getFileSize(p).float except OSError: -1.0
+      keys[i] = (size, 0.0)
+  if by in {psDuration, psDimension}: a.prober.finish()
+  let names = a.playlist.mapIt(it.extractFilename)
+  let byKey = proc (i, j: int): int =
+    if by == psName: naturalCmp(names[i], names[j]) else: cmp(keys[i], keys[j])
+  let ascending = (0 ..< n - 1).toSeq.allIt(byKey(it, it + 1) <= 0)
+  var order = toSeq(0 ..< n)
+  order.sort(byKey, if ascending: Descending else: Ascending)
+  a.reorderPlaylist(order)
+
+proc randomizePlaylist(a: App) =
+  var order = toSeq(0 ..< a.playlist.len)
+  order.shuffle()
+  a.reorderPlaylist(order)
 
 proc spawn(a: App, cmd: string, args: varargs[string]) =
   if findExe(cmd).len == 0:
@@ -397,6 +486,7 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   case purpose
   of "open": a.openPaths(paths)
   of "opendir": a.openPaths(paths[0 .. 0])
+  of "pladd": a.addToPlaylist(paths)
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
   of "audio":
@@ -774,13 +864,38 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   ctx.sep()
   ctx.children.add exitItem
 
-  if a.timeMenu:
+  case a.ctxMenu
+  of cmVideo: (root, ctx)
+  of cmTime:
     let timeCtx = newMenuRoot()
     timeCtx.check("Enable milliseconds", checked = a.cfg.showMillis, action = proc () =
       a.cfg.showMillis = not a.cfg.showMillis
       a.cfg.save())
-    return (root, timeCtx)
-  (root, ctx)
+    (root, timeCtx)
+  of cmPlaylist:
+    let pl = newMenuRoot()
+    let n = a.playlist.len
+    let sel = a.plSelected
+    let hasSel = sel >= 0 and sel < n
+    pl.item("Add Media File...", action = proc () =
+      a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
+        filterName = "Media files"))
+    pl.item("Remove Media File", "Delete", enabled = hasSel, action = proc () =
+      a.removeSelected())
+    pl.sep()
+    let sortBy = proc (by: PlaylistSort) = a.sortPlaylist(by)
+    for (label, by) in [("Sort by A-Z", psName), ("Sort by Duration", psDuration),
+                        ("Sort by Dimension", psDimension), ("Sort by Size", psSize)]:
+      pl.item(label, enabled = n > 1, action = bindAct(sortBy, by))
+    pl.sep()
+    let moveTo = proc (i: int) = a.moveSelected(i)
+    pl.item("Move to Top", enabled = hasSel and sel > 0, action = bindAct(moveTo, 0))
+    pl.item("Move Up", enabled = hasSel and sel > 0, action = bindAct(moveTo, sel - 1))
+    pl.item("Move Down", enabled = hasSel and sel < n - 1, action = bindAct(moveTo, sel + 1))
+    pl.item("Move to Bottom", enabled = hasSel and sel < n - 1, action = bindAct(moveTo, n - 1))
+    pl.sep()
+    pl.item("Randomize", enabled = n > 1, action = proc () = a.randomizePlaylist())
+    (root, pl)
 
 # --- keyboard ---------------------------------------------------------------
 
@@ -855,12 +970,8 @@ proc handleKeys(a: App) =
   elif none and a.player.loaded and (let k = digitPressed(pressed); k >= 0):
     a.player.stopped = false
     a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
-  elif none and pressed[KeyDelete] and a.cfg.showPlaylist and
-       a.plSelected >= 0 and a.plSelected < a.playlist.len:
-    a.playlist.delete(a.plSelected)
-    if a.plIndex == a.plSelected: a.plIndex = -1
-    elif a.plIndex > a.plSelected: dec a.plIndex
-    a.plSelected = min(a.plSelected, a.playlist.len - 1)
+  elif none and pressed[KeyDelete] and a.cfg.showPlaylist:
+    a.removeSelected()
 
   # View toggles and Grab/Rotate/Scale go through the menu actions so the
   # window-resizing side effects live in one place.
@@ -1229,7 +1340,7 @@ proc status(a: App, r: Rect) =
   let timeRect = rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h)
   ui.textIn(timeText, timeRect, colText, FontSmall)
   if ui.hover(timeRect) and ui.released(MouseRight):
-    a.timeMenu = true
+    a.ctxMenu = cmTime
     a.menus.openContext(ui.mouse)
 
 proc playlistPanel(a: App, r: Rect) =
@@ -1242,10 +1353,21 @@ proc playlistPanel(a: App, r: Rect) =
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
   let list = rect(r.x + 1, r.y + 30, r.w - 1, r.h - 30)
   let rowH = 26'f32
+  if ui.hover(r) and ui.released(MouseRight):
+    # Right-click selects the row under the pointer (none below the last one).
+    let i = int((ui.mouse.y - list.y + a.plScroll) / rowH)
+    a.plSelected = if ui.mouse.y >= list.y and i < a.playlist.len: i else: -1
+    a.ctxMenu = cmPlaylist
+    a.menus.openContext(ui.mouse)
   if a.playlist.len == 0:
     ui.textIn("Empty. Use File > Open File...", list, colTextDim, FontSmall, h = CenterAlign)
     return
   let maxScroll = max(0'f32, a.playlist.len.float32 * rowH - list.h)
+  if a.plReveal:
+    a.plReveal = false
+    if a.plSelected >= 0:
+      let y = a.plSelected.float32 * rowH
+      a.plScroll = clamp(a.plScroll, y + rowH - list.h, y)
   if ui.hover(list) and ui.scroll() != 0:
     a.plScroll -= ui.scroll() * rowH * 3
     ui.scrollConsumed = true
@@ -1433,7 +1555,7 @@ proc frame(a: App) =
       a.setFullscreen(not a.fullscreen)
       a.videoPress = false
     if ui.released(MouseRight):
-      a.timeMenu = false
+      a.ctxMenu = cmVideo
       a.menus.openContext(ui.mouse)
     if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
       a.volumeStep(ui.scroll() < 0)
@@ -1525,7 +1647,15 @@ proc runScriptStep(a: App, st: ScriptStep) =
     var path: seq[int]
     for x in st.args[1 .. ^1]: path.add parseInt(x)
     a.menus.openBar(parseInt(st.args[0]), path)
-  of "ctx": a.timeMenu = false; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "ctx": a.ctxMenu = cmVideo; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "plctx": a.ctxMenu = cmPlaylist; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "plselect": a.plSelected = parseInt(arg)
+  of "plaction":  # playlist context menu item by label
+    a.ctxMenu = cmPlaylist
+    for n in a.buildMenu().context.children:
+      if n.label == arg and n.enabled and n.action != nil: n.action()
+    a.ctxMenu = cmVideo
+  of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
   of "close": a.menus.close()
   of "mouse":
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
@@ -1583,6 +1713,7 @@ proc main() =
   let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog())
   a.cfg = loadConfig()
   a.script = loadScript()
+  randomize()
   let files = commandLineParams().mapIt(if it.contains("://"): it else: it.absolutePath)
   # Debug scripts must not hand their files to (or take files from) a real
   # player the user has open.

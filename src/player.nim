@@ -1,7 +1,7 @@
 ## mpv-backed playback core: one instance for playback and a lightweight
 ## second instance that renders seek-bar thumbnails.
 
-import std/[algorithm, atomics, json, strutils, os]
+import std/[algorithm, atomics, json, strutils, os, times]
 import mpv, videogl
 
 type
@@ -370,3 +370,58 @@ proc mediaFilesIn*(dir: string, isMedia: proc (p: string): bool): seq[string] =
     if kind in {pcFile, pcLinkToFile} and isMedia(f):
       result.add f
   result.sort(proc (a, b: string): int = naturalCmp(a.extractFilename, b.extractFilename))
+
+# --- media probing -------------------------------------------------------------
+
+type
+  MediaInfo* = object
+    duration*: float          ## seconds, 0 when unknown
+    width*, height*: int      ## first real video track, 0 for audio only
+
+  Prober* = ref object
+    ## Headless, paused mpv with null outputs, for playlist sorting.
+    h: MpvHandle
+
+proc newProber*(): Prober =
+  let h = mpv_create()
+  if h == nil: return nil
+  for (k, v) in [("config", "no"), ("terminal", "no"), ("vo", "null"),
+                 ("ao", "null"), ("sid", "no"), ("hwdec", "no"),
+                 ("pause", "yes"), ("idle", "yes"), ("keep-open", "yes"),
+                 ("load-scripts", "no"), ("cache", "no"), ("sub-auto", "no"),
+                 ("audio-file-auto", "no"), ("cover-art-auto", "no")]:
+    try: h.setOpt(k, v)
+    except MpvError: discard
+  if mpv_initialize(h) < 0:
+    mpv_terminate_destroy(h)
+    return nil
+  Prober(h: h)
+
+proc probe*(pr: Prober, path: string, timeout = 3.0): MediaInfo =
+  ## Opens path just long enough to read its duration and video size.
+  if pr == nil: return
+  pr.h.command("loadfile", path, "replace")
+  let deadline = epochTime() + timeout
+  while true:
+    let left = deadline - epochTime()
+    if left <= 0: break
+    let ev = mpv_wait_event(pr.h, left)
+    case ev.eventId
+    of evFileLoaded:
+      result.duration = pr.h.getFloat("duration")
+      let tracks = pr.h.getNode("track-list")
+      if tracks.kind == JArray:
+        for t in tracks:
+          if t{"type"}.getStr == "video" and not t{"albumart"}.getBool:
+            result.width = t{"demux-w"}.getInt
+            result.height = t{"demux-h"}.getInt
+            break
+      break
+    of evEndFile:
+      if cast[ptr MpvEventEndFile](ev.data).reason == efError: break
+    of evShutdown: break
+    else: discard
+
+proc finish*(pr: Prober) =
+  ## Releases the last probed file.
+  if pr != nil: pr.h.command("stop")
