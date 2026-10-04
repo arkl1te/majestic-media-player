@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance
+  options, instance, playlists, peers
 
 const
   AppName = "Majestic Media Player"
@@ -73,6 +73,11 @@ type
     positions: Positions      ## remembered playback positions
     resumedAt: float          ## start time of the file being loaded, else 0
     instance: InstanceServer  ## receives files from later launches
+    peers: PeerNet            ## other players, for Synchronize
+    syncMaster: int           ## pid of our group's master, 0 when not synchronized
+    syncMembers: seq[int]     ## the group, master included
+    syncQuiet: bool           ## acting on a peer's command (or on our own EOF):
+                              ## don't repeat it to the group
     props: seq[(string, string)]
     dialog: Dialog
     children: seq[Process]
@@ -219,6 +224,41 @@ proc applyOnTop(a: App) =
     a.onTopApplied = want
     a.window.setAlwaysOnTop(want)
 
+# --- synchronize ------------------------------------------------------------
+# Synchronized players repeat each other's playback controls: whoever acts
+# sends the action to every other member, each playing its own file. Times go
+# out as absolute positions, clamped to each file's duration. The master (the
+# player that started the group) owns the membership and keeps its playlist;
+# the others' playlists are emptied and locked while synchronized.
+
+proc synced(a: App): bool = a.syncMaster != 0
+
+proc isSyncMaster(a: App): bool = a.synced and a.syncMaster == a.peers.pid
+
+proc playlistLocked(a: App): bool = a.synced and not a.isSyncMaster
+
+proc editLocked(a: App): bool =
+  ## True (with a note on screen) when the playlist may not be edited here.
+  if a.playlistLocked and not a.syncQuiet:
+    a.osd("Playlist is locked: synchronized with another player")
+    return true
+
+template quietly(a: App, body: untyped) =
+  let wasQuiet = a.syncQuiet
+  a.syncQuiet = true
+  try: body
+  finally: a.syncQuiet = wasQuiet
+
+proc syncSend(a: App, fields: varargs[string]) =
+  ## Repeats a playback action on the other synchronized players.
+  if a.syncQuiet or not a.synced: return
+  for m in a.syncMembers:
+    if m != a.peers.pid: a.peers.send(m, fields)
+
+proc clampTime(a: App, t: float): float =
+  ## A group member's time on this player's (perhaps shorter) file.
+  if a.player.duration > 0: clamp(t, 0, a.player.duration) else: max(t, 0)
+
 # --- playback actions -------------------------------------------------------
 
 proc applyLoop(a: App) =
@@ -236,14 +276,18 @@ proc savePosition(a: App) =
     a.positions.del(p.path)
   a.positions.save()
 
-proc playIndex(a: App, i: int) =
+proc playIndex(a: App, i: int, start = -1.0) =
+  ## Plays entry i from `start`, or from where it was left off when negative.
   if i < 0 or i >= a.playlist.len: return
   a.savePosition()
   a.plIndex = i
   a.plSelected = i
   let path = a.playlist[i]
   if not a.cfg.rememberTransform: a.xf = VideoTransform()
-  a.resumedAt = if a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0) else: 0.0
+  a.resumedAt =
+    if start >= 0: start
+    elif a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0)
+    else: 0.0
   a.player.load(path, a.resumedAt)
   a.applyLoop()
   a.cfg.addRecent(path)
@@ -257,6 +301,7 @@ proc expandPaths(paths: seq[string]): seq[string] =
     elif fileExists(p) or p.contains("://"): result.add p
 
 proc openPaths(a: App, paths: seq[string]) =
+  if a.editLocked: return
   let files = expandPaths(paths)
   if files.len == 0:
     a.osd("Nothing playable found")
@@ -266,6 +311,7 @@ proc openPaths(a: App, paths: seq[string]) =
   a.playIndex(0)
 
 proc closeFile(a: App) =
+  if a.editLocked: return
   a.savePosition()
   a.player.close()
   a.preview.forget()
@@ -281,13 +327,39 @@ proc reopenLast(a: App): bool =
   if a.playlist.len > 0:
     a.playIndex(max(a.plSelected, 0))
     return true
+  if a.playlistLocked: return false
   for r in a.cfg.recentFiles:
     if fileExists(r) or r.contains("://"):
       a.openPaths(@[r])
       return true
 
+proc play(a: App) =
+  if a.reopenLast(): return
+  let restart = a.player.eofReached  # Play at the end starts over
+  a.player.play()
+  if restart: a.syncSend("seek", "0", "true")
+  a.syncSend("play")
+
+proc pause(a: App) =
+  a.player.pause()
+  a.syncSend("pause", $a.player.timePos)
+
+proc stop(a: App) =
+  a.player.stop()
+  a.syncSend("stop")
+
+proc togglePlay(a: App) =
+  let p = a.player
+  if not p.loaded: return
+  if p.stopped or p.eofReached or p.paused: a.play() else: a.pause()
+
 proc playPause(a: App) =
-  if not a.reopenLast(): a.player.togglePause()
+  if not a.reopenLast(): a.togglePlay()
+
+proc seekTo(a: App, t: float, exact = true) =
+  a.player.stopped = false
+  a.player.seek(a.clampTime(t), exact)
+  a.syncSend("seek", $t, $exact)
 
 proc folderNeighbor(a: App, dir: int): string =
   if a.player.path.len == 0 or not fileExists(a.player.path): return
@@ -296,7 +368,7 @@ proc folderNeighbor(a: App, dir: int): string =
   let j = (if i < 0: files.find(a.player.path) else: i) + dir
   if j >= 0 and j < files.len: files[j] else: ""
 
-proc navigate(a: App, dir: int) =
+proc navigateLocal(a: App, dir: int) =
   ## Previous/next: walks the playlist, or the folder when it is the sole item.
   if a.playlist.len > 1:
     var j = a.plIndex + dir
@@ -313,11 +385,16 @@ proc navigate(a: App, dir: int) =
     else:
       a.osd(if dir > 0: "Last file in folder" else: "First file in folder")
 
+proc navigate(a: App, dir: int) =
+  # Each player has its own file; the folder step would rewrite a locked playlist.
+  if not a.editLocked: a.navigateLocal(dir)
+
 # --- playlist editing -------------------------------------------------------
 
 proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   ## Inserts at `at` (appends when out of range) without touching playback;
   ## starts playing them when nothing is open.
+  if a.editLocked: return
   let files = expandPaths(paths)
   if files.len == 0:
     a.osd("Nothing playable found")
@@ -330,6 +407,7 @@ proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   else: a.osd(if files.len == 1: "Added to playlist" else: &"Added {files.len} files to playlist")
 
 proc removeSelected(a: App) =
+  if a.editLocked: return
   if a.plSelected < 0 or a.plSelected >= a.playlist.len: return
   a.playlist.delete(a.plSelected)
   if a.plIndex == a.plSelected: a.plIndex = -1
@@ -338,6 +416,7 @@ proc removeSelected(a: App) =
 
 proc reorderPlaylist(a: App, order: seq[int]) =
   ## order[new position] = old index; the playing and selected entries follow.
+  if a.editLocked: return
   let old = a.playlist
   var cur, sel = -1
   for i, j in order:
@@ -400,6 +479,7 @@ proc pollProbe(a: App) =
 
 proc sortPlaylist(a: App, by: PlaylistSort) =
   ## Sorts ascending, or descending when already in ascending order.
+  if a.editLocked: return
   let n = a.playlist.len
   if n < 2: return
   var keys = newSeq[(float, float)](n)
@@ -423,6 +503,7 @@ proc sortPlaylist(a: App, by: PlaylistSort) =
 
 proc clearPlaylist(a: App) =
   ## Empties the playlist; the open file keeps playing.
+  if a.editLocked: return
   a.playlist.setLen 0
   a.plIndex = -1
   a.plSelected = -1
@@ -464,16 +545,21 @@ proc runAfterPlayback(a: App) =
       a.spawn("loginctl", "terminate-session", getEnv("XDG_SESSION_ID"))
   of apLock: a.spawn("loginctl", "lock-session")
 
-proc handleEof(a: App) =
-  let p = a.player
-  if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
-  p.eofHandled = true
+proc afterEof(a: App) =
   if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playlist.len > 0:
     a.playIndex((a.plIndex + 1) mod a.playlist.len)
   elif a.plIndex + 1 < a.playlist.len:
     a.playIndex(a.plIndex + 1)
   else:
     a.runAfterPlayback()
+
+proc handleEof(a: App) =
+  let p = a.player
+  if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
+  p.eofHandled = true
+  # A synchronized player's file may be shorter than the master's: it waits at
+  # the end (clamped) until the group seeks back.
+  if not a.playlistLocked: a.afterEof()
 
 proc volumeStep(a: App, up: bool) =
   ## Soft cap 100, hard cap 200: the volume step (default 5) below the soft
@@ -494,6 +580,7 @@ proc changeRate(a: App, dir: float) =
   if not a.player.loaded: return
   let s = clamp(a.player.speed + dir * a.cfg.rateStep, 0.25, 4.0)
   a.player.h.setProp("speed", s)
+  a.syncSend("speed", $s)
   a.osd(&"Speed: {s:.2f}x")
 
 proc cycleTrack(a: App, kind: string, up: bool) =
@@ -507,18 +594,171 @@ proc frameStep(a: App, forward: bool) =
   if not a.player.loaded: return
   a.player.stopped = false
   a.player.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
+  a.syncSend("frame", $forward)
 
 proc seekRelative(a: App, d: float) =
   if a.player.loaded:
     a.player.stopped = false
     a.player.h.commandAsync("seek", $d, "relative")
+    a.syncSend("seek", $(a.player.timePos + d), "false")
 
 proc chapterStep(a: App, d: int) =
-  if a.player.loaded and a.player.chapters.len > 0:
-    a.player.h.commandStr("osd-msg add chapter " & $d)
+  let p = a.player
+  if p.loaded and p.chapters.len > 0:
+    p.h.commandStr("osd-msg add chapter " & $d)
+    # The others' files have chapters of their own: send where this one lands.
+    var cur = -1
+    for i, c in p.chapters:
+      if c.time <= p.timePos + 0.01: cur = i
+    let j = cur + d
+    if j >= 0 and j < p.chapters.len: a.syncSend("seek", $p.chapters[j].time, "true")
 
 proc xfChanged(a: App, msg: string) =
   a.osd(msg)
+
+# --- synchronize: group and peer messages -----------------------------------
+
+proc syncState(a: App): seq[string] =
+  ## Where the master's playback is, for players joining the group.
+  let p = a.player
+  @["state", $p.loaded, $p.timePos, $p.paused, $p.stopped, $p.speed]
+
+proc setGroup(a: App, members: seq[int]) =
+  ## Master (or a player about to become one): the new membership. Newcomers
+  ## get where playback is; a group of one dissolves.
+  let me = a.peers.pid
+  let old = a.syncMembers
+  let keep = if members.len > 1: members else: @[]
+  for m in old:
+    if m != me and m notin keep: a.peers.send(m, "group", "")
+  a.syncMembers = keep
+  a.syncMaster = if keep.len > 0: me else: 0
+  if keep.len == 0: return
+  let list = keep.mapIt($it).join(",")
+  for m in keep:
+    if m == me: continue
+    a.peers.send(m, "group", list)
+    if m notin old: a.peers.send(m, a.syncState)
+
+proc handleSyncRequest(a: App, op: string, pid: int) =
+  ## Master: a membership change asked for here or by a member.
+  let me = a.peers.pid
+  var members = if a.synced: a.syncMembers else: @[me]
+  case op
+  of "all":
+    for p in a.peers.peers:
+      if p.pid notin members: members.add p.pid
+  of "none": members.setLen 0
+  of "add":
+    if pid notin members and a.peers.find(pid) != nil: members.add pid
+  of "remove": members.keepItIf(it != pid)
+  a.setGroup(members)
+
+proc syncRequest(a: App, op: string, pid = 0) =
+  ## Membership changes go through the master; a player that isn't
+  ## synchronized starts a group of its own.
+  if a.peers == nil: return
+  if a.synced and not a.isSyncMaster:
+    a.peers.send(a.syncMaster, "request", op, $pid)
+  else:
+    a.handleSyncRequest(op, pid)
+
+proc leaveGroup(a: App) =
+  ## Before joining another group.
+  if a.isSyncMaster: a.setGroup(@[])
+  elif a.synced: a.peers.send(a.syncMaster, "request", "remove", $a.peers.pid)
+  a.syncMaster = 0
+  a.syncMembers.setLen 0
+
+proc joined(a: App) =
+  ## Just joined a group: the playlist empties (and stays locked); the open
+  ## file keeps playing.
+  a.playlist.setLen 0
+  a.plIndex = -1
+  a.plSelected = -1
+  a.plScroll = 0
+
+proc remotePlay(a: App) =
+  ## Unlike Play here, doesn't restart a file that ended: one shorter than the
+  ## master's stays at its end until the group seeks back.
+  let p = a.player
+  if not p.loaded: return
+  p.stopped = false
+  p.h.setProp("pause", false)
+
+proc applyState(a: App, loaded: bool, t: float, paused, stopped: bool, speed: float) =
+  ## Joins the master's playback: same time (clamped), pause state and rate.
+  let p = a.player
+  if not loaded or not p.loaded: return
+  p.h.setProp("speed", speed)
+  if stopped:
+    a.stop()
+  else:
+    a.seekTo(t)
+    if paused: a.pause() else: a.remotePlay()
+
+proc handlePeerMessage(a: App, m: Message) =
+  let f = m.fields
+  let me = a.peers.pid
+  template arg(i: int): string = (if i < f.len: f[i] else: "")
+  template num(i: int): float =
+    (try: parseFloat(arg(i)) except ValueError: 0.0)
+  template flag(i: int): bool = arg(i) == "true"
+  case f[0]
+  of "group":
+    let members = arg(1).split(',').filterIt(it.len > 0).mapIt(
+      (try: parseInt(it) except ValueError: 0))
+    if me in members:
+      let isNew = a.syncMaster != m.sender
+      if a.synced and isNew: a.leaveGroup()
+      a.syncMaster = m.sender
+      a.syncMembers = members
+      if isNew: a.joined()
+    elif a.syncMaster == m.sender:  # left the group, or it was dissolved
+      a.syncMaster = 0
+      a.syncMembers.setLen 0
+    return
+  of "request":
+    if a.isSyncMaster and m.sender in a.syncMembers:
+      a.handleSyncRequest(arg(1), int(num(2)))
+    return
+  else: discard
+  # Everything else only from our own group.
+  if not a.synced or m.sender notin a.syncMembers: return
+  a.quietly:
+    case f[0]
+    of "state":
+      if m.sender == a.syncMaster: a.applyState(flag(1), num(2), flag(3), flag(4), num(5))
+    of "open":  # files launched on a member go into the master's playlist
+      if a.isSyncMaster:
+        a.syncQuiet = false
+        a.openPaths(f[1 .. ^1])
+    of "play": a.remotePlay()
+    of "pause":
+      a.pause()
+      a.seekTo(num(1))
+    of "stop": a.stop()
+    of "seek": a.seekTo(num(1), flag(2))
+    of "frame": a.frameStep(flag(1))
+    of "speed":
+      if a.player.loaded: a.player.h.setProp("speed", num(1))
+    else: discard
+
+proc pollPeers(a: App): bool =
+  ## Handles peer messages and lost peers; true when anything arrived.
+  if a.peers == nil: return
+  for m in a.peers.poll():
+    result = true
+    a.handlePeerMessage(m)
+  for pid in a.peers.takeGone():
+    result = true
+    if pid == a.syncMaster:
+      a.syncMaster = 0
+      a.syncMembers.setLen 0
+      a.osd("Synchronization ended: the master player closed")
+    elif a.isSyncMaster and pid in a.syncMembers:
+      a.setGroup(a.syncMembers.filterIt(it != pid))
+  a.peers.announce(a.player.path.extractFilename, a.syncMaster)
 
 # --- dialogs ----------------------------------------------------------------
 
@@ -528,11 +768,12 @@ proc startDir(a: App): string =
   else: getHomeDir()
 
 proc ask(a: App, kind: DialogKind, purpose, title: string, start = "",
-         exts: seq[string] = @[], filterName = "") =
+         exts: seq[string] = @[], filterName = "",
+         extraFilters: seq[(string, seq[string])] = @[]) =
   if a.dialog != nil: return
   a.menus.close()
   a.dialog = startDialog(kind, purpose, title,
-    if start.len > 0: start else: a.startDir, exts, filterName)
+    if start.len > 0: start else: a.startDir, exts, filterName, extraFilters)
 
 proc openFileDialog(a: App) =
   a.ask(dkOpenFiles, "open", "Open File", exts = @MediaExtensions,
@@ -547,12 +788,58 @@ proc screenshot(a: App) =
   a.ask(dkSaveFile, "screenshot", "Save Screenshot",
     dir / &"{base}_{stamp}.png", @["png", "jpg", "webp"], "Images")
 
+const PlaylistFilters = @[("M3U playlist", @["m3u", "m3u8"]), ("PLS playlist", @["pls"])]
+
+proc loadPlaylistDialog(a: App) =
+  a.ask(dkOpenFile, "plload", "Load Playlist", exts = @PlaylistExtensions,
+    filterName = "Playlists", extraFilters = PlaylistFilters)
+
+proc savePlaylistDialog(a: App) =
+  a.ask(dkSaveFile, "plsave", "Save Playlist", a.startDir / "Playlist.m3u",
+    extraFilters = PlaylistFilters)
+
+proc loadPlaylist(a: App, path: string) =
+  ## Replaces the playlist with the file's entries and plays the first.
+  if a.editLocked: return
+  var entries: seq[string]
+  try: entries = readPlaylist(path)
+  except IOError, OSError:
+    a.osd("Cannot read playlist: " & path.extractFilename)
+    return
+  let files = expandPaths(entries)
+  if files.len == 0:
+    a.osd("Nothing playable found")
+    return
+  a.playlist = files
+  a.plScroll = 0
+  a.playIndex(0)
+
+proc savePlaylist(a: App, path: string) =
+  ## M3U, or PLS for a .pls name; .m3u is added when there is no extension.
+  var p = path
+  if p.splitFile.ext.len == 0: p.add ".m3u"
+  var entries: seq[PlaylistEntry]
+  for f in a.playlist:
+    # durations only as already probed: probing every file here would stall
+    let d = if f in a.mediaInfo and a.mediaInfo[f].duration > 0: a.mediaInfo[f].duration
+            else: -1.0
+    let title = if f.contains("://"): f else: f.splitFile.name
+    entries.add PlaylistEntry(path: (if f.contains("://"): f else: f.absolutePath),
+                              title: title, duration: d)
+  try:
+    writePlaylist(p, entries)
+    a.osd("Playlist saved: " & p.extractFilename)
+  except IOError, OSError:
+    a.osd("Cannot save playlist: " & p.extractFilename)
+
 proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   if paths.len == 0: return
   case purpose
   of "open": a.openPaths(paths)
   of "opendir": a.openPaths(paths[0 .. 0])
   of "pladd": a.addToPlaylist(paths)
+  of "plload": a.loadPlaylist(paths[0])
+  of "plsave": a.savePlaylist(paths[0])
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
   of "audio":
@@ -720,18 +1007,19 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let cfg = addr a.cfg
 
   # File
+  let locked = a.playlistLocked  # synchronized: the master's playlist rules
   let file = root.sub("File")
-  file.item("Open File...", "Ctrl+O", action = proc () = a.openFileDialog())
-  let recent = file.sub("Open Recent", enabled = a.cfg.recentFiles.len > 0)
+  file.item("Open File...", "Ctrl+O", enabled = not locked, action = proc () = a.openFileDialog())
+  let recent = file.sub("Open Recent", enabled = a.cfg.recentFiles.len > 0 and not locked)
   let openOne = proc (path: string) = a.openPaths(@[path])
   for r in a.cfg.recentFiles:
     recent.item(r.extractFilename, action = bindAct(openOne, r))
   if a.cfg.recentFiles.len > 0:
     recent.sep()
     recent.item("Clear List", action = proc () = a.cfg.recentFiles.setLen 0)
-  file.item("Open Directory...", action = proc () =
+  file.item("Open Directory...", enabled = not locked, action = proc () =
     a.ask(dkOpenDir, "opendir", "Open Directory"))
-  file.item("Close", "Ctrl+C", enabled = loaded, action = proc () = a.closeFile())
+  file.item("Close", "Ctrl+C", enabled = loaded and not locked, action = proc () = a.closeFile())
   file.sep()
   file.item("Save Screenshot...", "Alt+I", enabled = loaded and p.hasVideo,
     action = proc () = a.screenshot())
@@ -843,7 +1131,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   play.item(if p.playing: "Pause" else: "Play", "Space",
     enabled = loaded or a.cfg.recentFiles.len > 0,
     action = proc () = a.playPause())
-  play.item("Stop", "", enabled = loaded, action = proc () = a.player.stop())
+  play.item("Stop", "", enabled = loaded, action = proc () = a.stop())
   let (playPause, stop) = (play.children[0], play.children[1])
   play.item("Frame Forward", ".", enabled = loaded, action = proc () = a.frameStep(true))
   play.item("Frame Back", ",", enabled = loaded, action = proc () = a.frameStep(false))
@@ -888,14 +1176,14 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Navigate
   let nav = root.sub("Navigate")
-  nav.item("Previous File", "Page Up", enabled = loaded, action = proc () = a.navigate(-1))
-  nav.item("Next File", "Page Down", enabled = loaded, action = proc () = a.navigate(1))
+  nav.item("Previous File", "Page Up", enabled = loaded and not locked, action = proc () = a.navigate(-1))
+  nav.item("Next File", "Page Down", enabled = loaded and not locked, action = proc () = a.navigate(1))
   nav.sep()
   nav.item(&"Jump Back {a.cfg.seekStep:g}s", "Left", enabled = loaded,
     action = proc () = a.seekRelative(-a.cfg.seekStep))
   nav.item(&"Jump Forward {a.cfg.seekStep:g}s", "Right", enabled = loaded,
     action = proc () = a.seekRelative(a.cfg.seekStep))
-  nav.item("Go To Beginning", "Home", enabled = loaded, action = proc () = a.player.seek(0))
+  nav.item("Go To Beginning", "Home", enabled = loaded, action = proc () = a.seekTo(0))
   nav.sep()
   let hasCh = p.chapters.len > 0
   nav.item("Previous Chapter", "Ctrl+Left", enabled = hasCh, action = proc () = a.chapterStep(-1))
@@ -903,7 +1191,27 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let chm = nav.sub("Chapters", enabled = hasCh)
   for i, c in p.chapters:
     let label = fmtTime(c.time) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
-    chm.item(label, action = bindAct(proc (t: float) = a.player.seek(t), c.time))
+    chm.item(label, action = bindAct(proc (t: float) = a.seekTo(t), c.time))
+
+  # Synchronize: the other players found, checked when in our group.
+  let syn = root.sub("Synchronize")
+  let others = if a.peers == nil: newSeq[Peer]() else: a.peers.peers
+  syn.item("Connect All", enabled = others.anyIt(it.pid notin a.syncMembers),
+    action = proc () = a.syncRequest("all"))
+  syn.item("Disconnect All", enabled = a.synced, action = proc () = a.syncRequest("none"))
+  syn.sep()
+  if others.len == 0:
+    syn.item("No other players running", enabled = false)
+  let toggle = proc (pid: int) =
+    if pid notin a.syncMembers: a.syncRequest("add", pid)
+    # Unchecking the master leaves its group.
+    elif pid == a.syncMaster: a.syncRequest("remove", a.peers.pid)
+    else: a.syncRequest("remove", pid)
+  for peer in others.sortedByIt(it.pid):
+    var label = (if peer.title.len > 0: peer.title else: "No file") & &"  (PID {peer.pid})"
+    if peer.pid == a.syncMaster: label.add "  · master"
+    elif peer.master != 0 and peer.pid notin a.syncMembers: label.add "  · synchronized elsewhere"
+    syn.check(label, checked = peer.pid in a.syncMembers, action = bindAct(toggle, peer.pid))
 
   # Help
   let help = root.sub("Help")
@@ -944,26 +1252,30 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let n = a.playlist.len
     let sel = a.plSelected
     let hasSel = sel >= 0 and sel < n
-    pl.item("Add Media File...", action = proc () =
+    let edit = not locked
+    pl.item("Add Media File...", enabled = edit, action = proc () =
       a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
         filterName = "Media files"))
-    pl.item("Remove Media File", "Delete", enabled = hasSel, action = proc () =
+    pl.item("Remove Media File", "Delete", enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.sep()
     let sortBy = proc (by: PlaylistSort) = a.sortPlaylist(by)
     for (label, by) in [("Sort by A-Z", psName), ("Sort by Duration", psDuration),
                         ("Sort by Dimensions", psDimensions), ("Sort by Size", psSize)]:
-      pl.item(label, enabled = n > 1, action = bindAct(sortBy, by))
+      pl.item(label, enabled = n > 1 and edit, action = bindAct(sortBy, by))
     pl.sep()
     let moveTo = proc (i: int) = a.moveSelected(i)
-    pl.item("Move to Top", enabled = hasSel and sel > 0, action = bindAct(moveTo, 0))
-    pl.item("Move Up", enabled = hasSel and sel > 0, action = bindAct(moveTo, sel - 1))
-    pl.item("Move Down", enabled = hasSel and sel < n - 1, action = bindAct(moveTo, sel + 1))
-    pl.item("Move to Bottom", enabled = hasSel and sel < n - 1, action = bindAct(moveTo, n - 1))
+    pl.item("Move to Top", enabled = hasSel and sel > 0 and edit, action = bindAct(moveTo, 0))
+    pl.item("Move Up", enabled = hasSel and sel > 0 and edit, action = bindAct(moveTo, sel - 1))
+    pl.item("Move Down", enabled = hasSel and sel < n - 1 and edit, action = bindAct(moveTo, sel + 1))
+    pl.item("Move to Bottom", enabled = hasSel and sel < n - 1 and edit, action = bindAct(moveTo, n - 1))
     pl.sep()
-    pl.item("Randomize", enabled = n > 1, action = proc () = a.randomizePlaylist())
+    pl.item("Randomize", enabled = n > 1 and edit, action = proc () = a.randomizePlaylist())
     pl.sep()
-    pl.item("Clear", enabled = n > 0, action = proc () = a.clearPlaylist())
+    pl.item("Save Playlist...", enabled = n > 0, action = proc () = a.savePlaylistDialog())
+    pl.item("Load Playlist...", enabled = edit, action = proc () = a.loadPlaylistDialog())
+    pl.sep()
+    pl.item("Clear", enabled = n > 0 and edit, action = proc () = a.clearPlaylist())
     (root, pl)
   of cmPlaylistColumns:
     let cols = newMenuRoot()
@@ -1034,7 +1346,7 @@ proc handleKeys(a: App) =
   elif none and pressed[KeyRight]: a.seekRelative(a.cfg.seekStep)
   elif c and pressed[KeyLeft]: a.chapterStep(-1)
   elif c and pressed[KeyRight]: a.chapterStep(1)
-  elif none and pressed[KeyHome]: a.player.seek(0)
+  elif none and pressed[KeyHome]: a.seekTo(0)
   elif none and pressed[KeyPageUp]: a.navigate(-1)
   elif none and pressed[KeyPageDown]: a.navigate(1)
   elif s and pressed[KeyPeriod]: a.changeRate(1)
@@ -1046,6 +1358,7 @@ proc handleKeys(a: App) =
   elif none and a.player.loaded and (let k = digitPressed(pressed); k >= 0):
     a.player.stopped = false
     a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
+    a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
   elif none and pressed[KeyDelete] and a.cfg.showPlaylist:
     a.removeSelected()
 
@@ -1209,10 +1522,10 @@ proc seekBar(a: App, r: Rect) =
       a.seekDragT = t
       if now() - a.lastDragSeekAt > 0.06:
         a.lastDragSeekAt = now()
-        p.seek(t, exact = false)
+        a.seekTo(t, exact = false)
     else:
       a.seekDragging = false
-      p.seek(t, exact = true)
+      a.seekTo(t)
 
   # Hover label and thumbnail
   a.showPreview = false
@@ -1281,16 +1594,16 @@ proc controls(a: App, r: Rect) =
     if ui.iconButton(id, rect(x, y, bw, bh), iconName & "20", tipText, enabled, toggled):
       body
     x += bw + 2
-  btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing):
-    if not a.reopenLast(): a.player.play()
-  btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped): a.player.pause()
-  btn("stop", "stop", "Stop", p.loaded, p.stopped): a.player.stop()
+  btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing): a.play()
+  btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped): a.pause()
+  btn("stop", "stop", "Stop", p.loaded, p.stopped): a.stop()
   ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
   x += 10
-  btn("prev", "prev", "Previous", p.loaded, false): a.navigate(-1)
+  let navOk = p.loaded and not a.playlistLocked
+  btn("prev", "prev", "Previous", navOk, false): a.navigate(-1)
   btn("slower", "slower", "Decrease rate", p.loaded, false): a.changeRate(-1)
   btn("faster", "faster", "Increase rate", p.loaded, false): a.changeRate(1)
-  btn("next", "next", "Next", p.loaded, false): a.navigate(1)
+  btn("next", "next", "Next", navOk, false): a.navigate(1)
 
   # Volume on the right.
   let sw = 100'f32
@@ -1469,6 +1782,11 @@ proc playlistPanel(a: App, r: Rect) =
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
   ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 40, 30), colText)
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
+  if a.playlistLocked:
+    a.plListRect = Rect()
+    ui.textIn("Locked while synchronized", rect(r.x, header.y + 30, r.w, r.h - 30),
+      colTextDim, FontSmall, h = CenterAlign)
+    return
 
   # Column headers: Filename takes what the detail columns leave.
   let colHdr = rect(r.x + 1, r.y + 30, r.w - 1, PlaylistHeaderH)
@@ -1566,6 +1884,33 @@ proc idleScreen(a: App, area: Rect) =
   elif (not a.player.loaded or a.player.stopped) and area.h > 140:
     ui.icon("crown96", c - vec2(0, 24), colAccentDim)
     ui.textIn(AppName, rect(area.x, c.y + 34, area.w, 30), colTextDim, FontTitle, h = CenterAlign)
+
+proc syncOutline(a: App, r: Rect) =
+  ## Synchronized players are framed in their group's color: solid around the
+  ## master, dashed around the others.
+  if not a.synced: return
+  let ui = a.ui
+  # A hue per master, kept semi-saturated so it reads on dark and on video.
+  let hue = float32((a.syncMaster * 137) mod 360)
+  let col = hsl(hue, 55, 60).color.rgbx
+  const t = 1'f32
+  if a.isSyncMaster:
+    ui.border(r, col, t)
+    return
+  const dash = 14'f32
+  const gap = 8'f32
+  var x = r.x
+  while x < r.x + r.w:
+    let w = min(dash, r.x + r.w - x)
+    ui.rect(rect(x, r.y, w, t), col)
+    ui.rect(rect(x, r.y + r.h - t, w, t), col)
+    x += dash + gap
+  var y = r.y
+  while y < r.y + r.h:
+    let h = min(dash, r.y + r.h - y)
+    ui.rect(rect(r.x, y, t, h), col)
+    ui.rect(rect(r.x + r.w - t, y, t, h), col)
+    y += dash + gap
 
 # --- overlays ---------------------------------------------------------------
 
@@ -1729,7 +2074,7 @@ proc frame(a: App) =
     if not ui.down():
       a.videoPress = false
       if ui.window.buttonReleased[MouseLeft]:
-        a.player.togglePause()
+        a.togglePlay()
     elif (ui.mouse - a.videoPressPos).length > 4:
       a.videoPress = false
       if not fs: w.startWindowDrag()
@@ -1771,6 +2116,9 @@ proc frame(a: App) =
     ui.captured = false
     a.menus.updatePopups(ui, root, ctxRoot)
     ui.drawTooltip()
+  ui.sk.pushLayer(PopupsLayer)
+  a.syncOutline(rect(0, 0, W, H))
+  ui.sk.popLayer()
 
   # Cursor auto-hide over playing video.
   if ui.mouse != a.lastMouse:
@@ -1849,8 +2197,19 @@ proc runScriptStep(a: App, st: ScriptStep) =
       else: ovNone)
   of "action": a.runMenuPath(arg.split('/'))
   of "fs": a.setFullscreen(arg == "1")
-  of "seek": a.player.seek(parseFloat(arg))
-  of "pause": a.player.togglePause()
+  of "seek": a.seekTo(parseFloat(arg))
+  of "pause": a.togglePlay()
+  of "sync":  # all | none | add <pid> | remove <pid> | addany (first peer found)
+    if arg == "addany":
+      if a.peers != nil and a.peers.peers.len > 0: a.syncRequest("add", a.peers.peers[0].pid)
+    else: a.syncRequest(st.args[0], if st.args.len > 1: parseInt(st.args[1]) else: 0)
+  of "syncdump":
+    if a.peers == nil: return
+    stderr.writeLine "sync ", a.peers.pid, " master=", a.syncMaster, " members=", $a.syncMembers,
+      " peers=", $a.peers.peers.mapIt((it.pid, it.title, it.master)),
+      " playlist=", $a.playlist.mapIt(it.extractFilename), " index=", a.plIndex,
+      " path=", a.player.path.extractFilename, " t=", a.player.timePos,
+      " paused=", a.player.paused, " stopped=", a.player.stopped, " speed=", a.player.speed
   of "size": a.window.size = ivec2(parseInt(st.args[0]).int32, parseInt(st.args[1]).int32)
   of "shot": a.shotPath = arg
   of "quit": a.window.closeRequested = true
@@ -1895,6 +2254,8 @@ proc main() =
      forwardToRunning(files):
     return
   if not scripted: a.instance = startServer()
+  # Debug scripts only see other players in a folder of their own.
+  if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
   if a.cfg.rememberTransform:
     let t = a.cfg.transform
@@ -1996,7 +2357,12 @@ proc main() =
       a.dropFiles(a.dropped)
       a.dropped.setLen 0
     let incoming = a.instance.poll()
-    if incoming.len > 0:
+    if incoming.len > 0 and a.playlistLocked:
+      # The master's playlist rules; the files go there.
+      a.peers.send(a.syncMaster, @["open"] & incoming.mapIt(
+        if it.contains("://"): it else: it.absolutePath))
+      a.osd("Opening in the synchronization master")
+    elif incoming.len > 0:
       if a.overlay == ovOptions: a.closeOptions(false)
       a.overlay = ovNone
       a.ui.focusId = ""
@@ -2006,7 +2372,8 @@ proc main() =
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
-    let changed = a.player.pollEvents()
+    let peerNews = a.pollPeers()
+    let changed = a.player.pollEvents() or peerNews
     a.pollProbe()
     a.preview.pollEvents()
     a.pollDialog()
@@ -2016,6 +2383,9 @@ proc main() =
     if a.player.justLoaded:
       a.player.justLoaded = false
       a.updateTitle()
+      # The master moved to another file: the group follows to its start time.
+      a.syncSend("seek", $a.resumedAt, "true")
+      a.syncSend("play")
       if a.resumedAt > 0:
         a.osd("Resumed at " & fmtTime(a.resumedAt))
         a.resumedAt = 0
@@ -2074,6 +2444,7 @@ proc main() =
     (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
   a.cfg.save()
   a.instance.close()
+  a.peers.close()
   for c in a.children: c.close()
   if a.preview != nil:
     mpv_render_context_free(a.preview.render)

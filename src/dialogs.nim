@@ -19,16 +19,21 @@ proc globs(exts: seq[string]): string =
     result.add "*." & e
 
 proc startDialog*(kind: DialogKind, purpose, title, startPath: string,
-                  filterExts: seq[string] = @[], filterName = ""): Dialog =
+                  filterExts: seq[string] = @[], filterName = "",
+                  extraFilters: seq[(string, seq[string])] = @[]): Dialog =
+  ## extraFilters: further (name, extensions) choices after the first filter.
+  var filters: seq[(string, seq[string])]
+  if filterExts.len > 0: filters.add (filterName, filterExts)
+  filters.add extraFilters
   var cmd: string
   var args: seq[string]
   if which("kdialog"):
     cmd = "kdialog"
     args = @["--title", title]
-    let filter =
-      if filterExts.len > 0:
-        filterName & " (" & globs(filterExts) & ")|All files (*)"
-      else: ""
+    var filter = ""
+    for (name, exts) in filters:
+      filter.add name & " (" & globs(exts) & ")|"
+    if filter.len > 0: filter.add "All files (*)"
     case kind
     of dkOpenFiles:
       args.add ["--getopenfilename", startPath, filter, "--multiple", "--separate-output"]
@@ -46,8 +51,9 @@ proc startDialog*(kind: DialogKind, purpose, title, startPath: string,
     of dkOpenDir: args.add "--directory"
     of dkSaveFile: args.add ["--save", "--confirm-overwrite"]
     of dkOpenFile: discard
-    if filterExts.len > 0 and kind != dkOpenDir:
-      args.add "--file-filter=" & filterName & " | " & globs(filterExts)
+    if filters.len > 0 and kind != dkOpenDir:
+      for (name, exts) in filters:
+        args.add "--file-filter=" & name & " | " & globs(exts)
       args.add "--file-filter=All files | *"
   else:
     stderr.writeLine "No file dialog available: install kdialog or zenity."
