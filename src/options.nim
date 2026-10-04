@@ -251,7 +251,7 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
       d.assoc.setChecked(shown[c], not d.assoc[shown[c]].checked)
       ui.navVisible = true
   if ui.hover(inner) and ui.scroll() != 0:
-    d.listScroll -= ui.scroll() * rowH / 3
+    d.listScroll += ui.scroll() * rowH / 3
     ui.scrollConsumed = true
   d.listScroll = clamp(d.listScroll, 0, maxScroll)
   let outerClip = ui.hitClip
@@ -383,7 +383,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   let contentH = p.y - origin
   let maxScroll = max(0'f32, contentH - pageR.h)
   if ui.hover(pageR) and ui.scroll() != 0:
-    d.scroll -= ui.scroll() * 3
+    d.scroll += ui.scroll() * 3
     ui.scrollConsumed = true
   d.scroll = clamp(d.scroll, 0, maxScroll)
   if maxScroll > 0:

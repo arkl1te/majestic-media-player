@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers
+  options, instance, playlists, peers, cmdlines, runlog
 
 const
   AppName = "Majestic Media Player"
@@ -13,13 +13,19 @@ const
   MinWindow = ivec2(480, 270)
   OptionsSize = ivec2(780, 512)
   RenameSize = ivec2(400, 116)
+  CommandsSize = ivec2(880, 520)
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
+  RunLogHeaderH = 28'f32
+  RunLogRowH = 18'f32
+  RunLogGripH = 5'f32       ## draggable bottom edge of the run log
+  RunLogBarW = 10'f32       ## its scroll bar
+  RunLogWheelRows = 4       ## lines scrolled per mouse wheel step
 
 type
   Overlay = enum
-    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename
+    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick
 
   ContextMenu = enum
     cmVideo, cmTime, cmSeekBar, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
@@ -33,7 +39,7 @@ type
     sort: PlaylistSort
 
   PointerShape = enum
-    ptArrow, ptHidden, ptResize
+    ptArrow, ptHidden, ptResize, ptResizeV
 
   VideoTransform = object
     pan: Vec2
@@ -88,6 +94,20 @@ type
     renTime: float
     renText: string
     renPlaceholder: string    ## its default label, shown when renText is empty
+    cmdDlg: CmdDialog         ## Command-line Manager, its window created on first use
+    cmdWin: Window
+    cmdSk: Silky
+    cmdUi: Ui
+    commands: seq[CommandLine]  ## the Run menu's command lines
+    runLog: seq[RunEntry]     ## command lines run, oldest first, with their output
+    rlScroll: float32
+    rlFollow: bool            ## keep the run log scrolled to its newest line
+    rlResizeFrom: (float32, float32)     ## pointer y and height when the drag began
+    rlThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
+    pickDlg: PickDialog       ## Run window: bookmarks and values for a run
+    pickWin: Window
+    pickSk: Silky
+    pickUi: Ui
     resumedAt: float          ## start time of the file being loaded, else 0
     instance: InstanceServer  ## receives files from later launches
     peers: PeerNet            ## other players, for Synchronize
@@ -162,10 +182,13 @@ proc bottomHeight(a: App): float32 =
 proc playlistWidth(a: App): float32 =
   max(PlaylistMinWidth, round(a.cfg.playlistWidth).float32)
 
+proc runLogHeight(a: App): float32 =
+  max(RunLogMinHeight, round(a.cfg.runLogHeight).float32)
+
 proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode).
   ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
-        int32(MenuBarHeight + a.bottomHeight))
+        int32(MenuBarHeight + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0)))
 
 proc naturalSize(a: App): Vec2 =
   var w = a.player.videoW.float32
@@ -624,9 +647,6 @@ proc seekRelative(a: App, d: float) =
 
 proc fileBookmarks(a: App): seq[Bookmark] =
   if a.player.loaded: a.bookmarks.getOrDefault(a.player.path) else: @[]
-
-proc label(b: Bookmark, i: int): string =
-  if b.name.len > 0: b.name else: &"Bookmark {i + 1}"
 
 proc chapterStep(a: App, d: int) =
   let p = a.player
@@ -1089,6 +1109,104 @@ proc closeRename(a: App) =
     a.renWin.visible = false
     a.window.activate()
 
+proc latestCommandLine(a: App): CommandLine =
+  ## The command line created last (edits keep their place), else a new one.
+  if a.commands.len > 0: a.commands[^1] else: CommandLine()
+
+proc showCommands(a: App) =
+  ## Opens the Command-line Manager on the command line created last.
+  a.menus.close()
+  a.commands = loadCommandLines()
+  a.cmdDlg.saved = a.commands
+  a.cmdDlg.load(a.latestCommandLine)
+  if a.cmdWin == nil:
+    (a.cmdWin, a.cmdSk, a.cmdUi) = a.newDialogWindow("Command-line Manager", CommandsSize)
+  a.cmdUi.focusId = "cl-title"
+  a.cmdUi.focusFresh = true
+  a.cmdUi.navVisible = false
+  a.showDialog(a.cmdWin, CommandsSize)
+  a.overlay = ovCommands
+
+proc closeCommands(a: App) =
+  a.cmdUi.focusId = ""
+  a.overlay = ovNone
+  if a.cmdWin.visible:
+    a.cmdWin.visible = false
+    a.window.activate()
+
+proc editCommandLines(a: App, edit: proc (cmds: var seq[CommandLine])) =
+  ## Like editBookmarks: applied to the file's latest contents.
+  a.commands = loadCommandLines()
+  edit(a.commands)
+  a.commands.save()
+
+proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
+  ## Runs c with bash in the media file's folder, its cards resolved against
+  ## the current file and picks (what the Run window gave each card). Output
+  ## goes to the run log (and our stdout).
+  let path = if a.player.loaded: a.player.path else: ""
+  let (script, err) = c.parts.compose(path, picks)
+  let dir =
+    if path.len > 0 and not path.contains("://"): path.parentDir else: getHomeDir()
+  let e = newRunEntry(c.title, dir)
+  a.runLog.add e
+  a.runLog.trim()
+  a.rlFollow = true
+  if err.len > 0:
+    e.error = err
+    a.osd(c.title & ": " & err)
+    stderr.writeLine "run ", c.title, ": ", err
+    return
+  try:
+    e.start(script)
+    a.osd("Running " & c.title)
+  except OSError as ex:
+    e.error = "cannot run bash: " & ex.msg
+    a.osd(c.title & ": cannot run bash")
+    stderr.writeLine "run ", c.title, ": ", ex.msg
+
+proc runCommandLine(a: App, c: CommandLine) =
+  ## Runs c, first asking for its bookmarks and values when it has any.
+  let cards = c.parts.runCards
+  if cards.len == 0:
+    a.execute(c)
+    return
+  let marks = a.fileBookmarks
+  let bookmarks = cards.anyIt(it.kind == ckReference)
+  let err =
+    if bookmarks and not a.player.loaded: "No media file is open"
+    elif bookmarks and marks.len == 0: "The media file has no bookmarks"
+    else: ""
+  if err.len > 0:
+    a.osd(c.title & ": " & err)
+    return
+  a.menus.close()
+  a.pickDlg.start(c, marks.len)
+  let (sw, sh) = a.pickDlg.size
+  if a.pickWin == nil:
+    (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh))
+  a.pickWin.title = c.title
+  a.pickUi.focusId = ""
+  a.pickUi.navId = "pk-0"
+  a.pickUi.navVisible = false
+  a.showDialog(a.pickWin, ivec2(sw, sh))
+  a.overlay = ovPick
+
+proc closePick(a: App) =
+  a.overlay = ovNone
+  if a.pickWin.visible:
+    a.pickWin.visible = false
+    a.window.activate()
+
+proc pollJobs(a: App) =
+  for e in a.runLog:
+    if not e.running or not e.poll(): continue
+    if a.cfg.showRunLog: a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+    if not e.running:
+      a.osd(if e.stopped: e.title & " stopped"
+        elif e.code == 0: e.title & " finished"
+        else: &"{e.title} failed (exit code {e.code})")
+
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
   if o == ovProperties:
@@ -1166,6 +1284,11 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.cfg.showPlaylist = not a.cfg.showPlaylist
     let w = int32(a.playlistWidth)
     a.resizeKeepingVideo(ivec2(if a.cfg.showPlaylist: w else: -w, 0)))
+  view.check("Run Log", "Ctrl+5", cfg.showRunLog, action = proc () =
+    a.cfg.showRunLog = not a.cfg.showRunLog
+    if a.cfg.showRunLog: a.rlFollow = true
+    let h = int32(a.runLogHeight)
+    a.resizeKeepingVideo(ivec2(0, if a.cfg.showRunLog: h else: -h)))
   view.sep()
   view.check("Show OSD", "", cfg.showOsd, action = proc () =
     a.cfg.showOsd = not a.cfg.showOsd
@@ -1249,9 +1372,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let (playPause, stop) = (play.children[0], play.children[1])
   play.item("Frame Forward", ".", enabled = loaded, action = proc () = a.frameStep(true))
   play.item("Frame Back", ",", enabled = loaded, action = proc () = a.frameStep(false))
-  play.item(&"Increase Rate (+{a.cfg.rateStep:g}x)", "Shift+.", enabled = loaded,
+  play.item(&"Faster Playback (+{a.cfg.rateStep:g}x)", "Shift+.", enabled = loaded,
     action = proc () = a.changeRate(1))
-  play.item(&"Decrease Rate (-{a.cfg.rateStep:g}x)", "Shift+,", enabled = loaded,
+  play.item(&"Slower Playback (-{a.cfg.rateStep:g}x)", "Shift+,", enabled = loaded,
     action = proc () = a.changeRate(-1))
   let rep = play.sub("Repeat")
   rep.check("Forever", "", cfg.repeatForever, action = proc () =
@@ -1338,6 +1461,16 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     if peer.pid == a.syncMaster: label.add "  · master"
     elif peer.master != 0 and peer.pid notin a.syncMembers: label.add "  · synchronized elsewhere"
     syn.check(label, checked = peer.pid in a.syncMembers, action = bindAct(toggle, peer.pid))
+
+  # Run: the Command-line Manager and the command lines it saved.
+  let run = root.sub("Run")
+  run.item("Command-line Manager...", action = proc () = a.showCommands())
+  run.sep()
+  if a.commands.len == 0:
+    run.item("No command lines", enabled = false)
+  let runOne = proc (c: CommandLine) = a.runCommandLine(c)
+  for c in a.commands:
+    run.item(c.title, action = bindAct(runOne, c))
 
   # Help
   let help = root.sub("Help")
@@ -1528,6 +1661,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
+    elif a.overlay in {ovCommands, ovPick}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -1582,6 +1716,7 @@ proc handleKeys(a: App) =
     elif pressed[Key2]: menuPath = @["View", "Controls"]
     elif pressed[Key3]: menuPath = @["View", "Status"]
     elif pressed[Key4]: menuPath = @["View", "Playlist"]
+    elif pressed[Key5]: menuPath = @["View", "Run Log"]
   let g = "Grab, Rotate & Scale"
   if none:
     if pressed[Numpad5]: menuPath = @["View", g, "Center"]
@@ -1724,7 +1859,10 @@ proc seekBar(a: App, r: Rect) =
   let cy = r.y + r.h / 2
   let dur = p.duration
   let active = a.seekDragging
-  let hov = (ui.hover(r) or active) and dur > 0 and p.loaded
+  # The bar spans the window's width, so leaving it sideways leaves the window
+  # too, and Windy keeps reporting the last pointer position from inside it.
+  let mouseIn = ui.fakeMouse.x >= 0 or a.window.mouseInside
+  let hov = (ui.hover(r) and mouseIn or active) and dur > 0 and p.loaded
   let th = if hov: 6'f32 else: 4'f32
   ui.rect(rect(x0, cy - th / 2, w, th), colTrack)
   let cur = if active: a.seekDragT else: p.timePos
@@ -1856,8 +1994,8 @@ proc controls(a: App, r: Rect) =
   x += 10
   let navOk = p.loaded and not a.playlistLocked
   btn("prev", "prev", "Previous", navOk, false): a.navigate(-1)
-  btn("slower", "slower", "Decrease rate", p.loaded, false): a.changeRate(-1)
-  btn("faster", "faster", "Increase rate", p.loaded, false): a.changeRate(1)
+  btn("slower", "slower", "Slower playback", p.loaded, false): a.changeRate(-1)
+  btn("faster", "faster", "Faster playback", p.loaded, false): a.changeRate(1)
   btn("next", "next", "Next", navOk, false): a.navigate(1)
 
   # Volume on the right.
@@ -1889,7 +2027,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
         ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")],
       @[("O", "Open File"), ("C", "Close")],
-      @[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist")]]
+      @[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist"), ("5", "Run Log")]]
   elif al and not c and not s:
     @[@[("Enter", "Fullscreen")],
       @[("I", "Screenshot")],
@@ -1897,7 +2035,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
         ("Num6", "Rotate " & rot & " CW")],
       @[("X", "Exit")]]
   elif s and not c and not al:
-    @[@[(",", "-Rate"), (".", "+Rate")],
+    @[@[(",", "Slower Playback"), (".", "Faster Playback")],
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
       @[("Num1-9", "Align Subtitles"), ("Arrows", "Move Subtitles"),
         ("Num+", "Bigger Subtitles"), ("Num-", "Smaller Subtitles")],
@@ -1906,38 +2044,52 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
-  ## Groups that don't fit are dropped whole, ending with an ellipsis.
+  ## Groups that don't fit wrap onto more rows, which grow the bar upward
+  ## over the controls so the layout beneath doesn't move.
   let ui = a.ui
-  ui.rect(r, colPanel)
-  ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
   let capH = r.h - 8
-  let cy = r.y + (r.h - capH) / 2
   proc capW(key: string): float32 = max(capH, ui.textSize(key, FontSmall).x + 10)
   proc pairW(h: KeyHint): float32 = capW(h.key) + 5 + ui.textSize(h.label, FontSmall).x
   const PairGap = 14'f32
   const GroupGap = 25'f32
-  var x = r.x + 10
+  let left = r.x + 10
+  let right = r.x + r.w - 10
+  # Lay out first: (row, x) per pair, plus where the group dividers go.
+  var pos: seq[seq[(int, float32)]]
+  var dividers: seq[(int, float32)]
+  var (row, x) = (0, left)
   for gi, g in groups:
     var gw = 0'f32
     for i, h in g: gw += pairW(h) + (if i > 0: PairGap else: 0)
-    let lead = if gi > 0: GroupGap else: 0
-    let reserve = if gi < groups.high: ui.textSize("…", FontSmall).x + GroupGap else: 0
-    if x + lead + gw + reserve > r.x + r.w - 10:
-      if gi > 0: ui.textIn("…", rect(x + 8, r.y, 20, r.h), colTextDim, FontSmall)
-      break
     if gi > 0:
-      ui.rect(rect(x + GroupGap / 2, r.y + 6, 1, r.h - 12), colBorder)
-      x += GroupGap
+      if x + GroupGap + gw > right and x > left: (row, x) = (row + 1, left)
+      else:
+        dividers.add (row, x + GroupGap / 2)
+        x += GroupGap
+    pos.add @[]
     for i, h in g:
-      if i > 0: x += PairGap
-      let cap = rect(x, cy, capW(h.key), capH)
+      if i > 0:
+        if x + PairGap + pairW(h) > right and x > left: (row, x) = (row + 1, left)
+        else: x += PairGap
+      pos[^1].add (row, x)
+      x += pairW(h)
+  let rows = row + 1
+  let top = r.y - (rows - 1).float32 * r.h
+  let bar = rect(r.x, top, r.w, r.y + r.h - top)
+  ui.rect(bar, colPanel)
+  ui.rect(rect(bar.x, bar.y, bar.w, 1), colBorder)
+  for (ri, dx) in dividers:
+    ui.rect(rect(dx, top + ri.float32 * r.h + 6, 1, r.h - 12), colBorder)
+  for gi, g in groups:
+    for i, h in g:
+      let (ri, hx) = pos[gi][i]
+      let ry = top + ri.float32 * r.h
+      let cap = rect(hx, ry + (r.h - capH) / 2, capW(h.key), capH)
       ui.rect(cap, colPanelRaised)
       ui.border(cap, colBorder)
       ui.textIn(h.key, cap, colText, FontSmall, h = CenterAlign)
-      x += cap.w + 5
       let lw = ui.textSize(h.label, FontSmall).x
-      ui.textIn(h.label, rect(x, r.y, lw + 2, r.h), colTextDim, FontSmall)
-      x += lw
+      ui.textIn(h.label, rect(cap.x + cap.w + 5, ry, lw + 2, r.h), colTextDim, FontSmall)
 
 proc status(a: App, r: Rect) =
   let ui = a.ui
@@ -2093,7 +2245,7 @@ proc playlistPanel(a: App, r: Rect) =
       let y = a.plSelected.float32 * rowH
       a.plScroll = clamp(a.plScroll, y + rowH - list.h, y)
   if ui.hover(list) and ui.scroll() != 0:
-    a.plScroll -= ui.scroll() * rowH * 3
+    a.plScroll += ui.scroll() * rowH * 3
     ui.scrollConsumed = true
   a.plScroll = clamp(a.plScroll, 0, maxScroll)
   ui.sk.pushClipRect(list)
@@ -2120,6 +2272,112 @@ proc playlistPanel(a: App, r: Rect) =
       a.playIndex(i)
   ui.sk.popClipRect()
   a.probeNext(first .. last)
+
+proc runLogPanel(a: App, r: Rect) =
+  ## The Run menu's command lines and what they printed, newest at the bottom.
+  let ui = a.ui
+  ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y + r.h - 1, r.w, 1), colBorder)
+  # Dragging the bottom edge resizes the panel; the video frame takes the rest.
+  let grip = rect(r.x, r.y + r.h - RunLogGripH, r.w, RunLogGripH)
+  if ui.hover(grip) and ui.pressed():
+    ui.activeId = "rlresize"
+    a.rlResizeFrom = (ui.mouse.y, r.h)
+    ui.consumeClick()
+  if ui.activeId == "rlresize":
+    let (y0, h0) = a.rlResizeFrom
+    let below = (if a.fullscreen: 0'f32 else: MenuBarHeight + a.bottomHeight) +
+      MinWindow.y.float32 / 2
+    a.cfg.runLogHeight = clamp(h0 + ui.mouse.y - y0, RunLogMinHeight,
+      max(RunLogMinHeight, ui.size.y - below))
+
+  let header = rect(r.x, r.y, r.w, RunLogHeaderH)
+  let running = a.runLog.countIt(it.running)
+  ui.icon("terminal16", vec2(r.x + 18, header.y + header.h / 2), colAccent)
+  ui.textIn(if running > 0: &"Run log ({running} running)" else: "Run log",
+    rect(r.x + 32, header.y, r.w - 120, header.h), colText)
+  # Header buttons, right to left: Clear (finished runs), Stop (running ones).
+  var bx = r.x + r.w - 10
+  let headerButton = proc (label, tip: string): bool =
+    let b = rect(bx - 60, header.y + 4, 60, header.h - 8)
+    bx -= 66
+    let hov = ui.hover(b)
+    ui.rect(b, if hov: colHover else: colPanelRaised)
+    ui.border(b, colBorder)
+    ui.textIn(label, b, colText, FontSmall, h = CenterAlign)
+    ui.tip(b, tip)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      return true
+  if a.runLog.len > running and headerButton("Clear", "Remove the finished runs"):
+    a.runLog.keepItIf(it.running)
+  if running > 0 and headerButton("Stop", "Stop the running command lines"):
+    for e in a.runLog: e.stop()
+  ui.rect(rect(r.x, header.y + header.h - 1, r.w, 1), colBorder)
+
+  let list = rect(r.x, header.y + header.h, r.w, max(0'f32, r.h - header.h - RunLogGripH))
+  if a.runLog.len == 0:
+    ui.textIn("Nothing has run yet. Command lines run from the Run menu show their output here.",
+      list, colTextDim, FontSmall, h = CenterAlign)
+    return
+
+  # One row per line: each run's heading, its output, then how it ended.
+  var rows: seq[(string, ColorRGBX)]
+  for i, e in a.runLog:
+    if i > 0: rows.add ("", colText)
+    rows.add (e.started.format("HH:mm:ss") & "  " & e.title & "  —  " & e.dir, colAccent)
+    for line in e.output: rows.add (line, colText)
+    if e.error.len > 0: rows.add (e.error, colError)
+    elif e.running: rows.add ((if e.stopped: "Stopping…" else: "Running…"), colMarker)
+    elif e.stopped: rows.add ("Stopped", colMarker)
+    elif e.code == 0: rows.add ("Finished", colTextDim)
+    else: rows.add (&"Failed (exit code {e.code})", colError)
+
+  let rowH = RunLogRowH
+  let pad = 6'f32
+  let contentH = rows.len.float32 * rowH + 2 * pad
+  let maxScroll = max(0'f32, contentH - list.h)
+  if ui.hover(list) and ui.scroll() != 0:
+    # Windy reports ±10 per wheel notch on X11; count notches by direction.
+    a.rlScroll += sgn(ui.scroll()).float32 * rowH * RunLogWheelRows
+    a.rlScroll = clamp(a.rlScroll, 0, maxScroll)
+    a.rlFollow = a.rlScroll >= maxScroll
+    ui.scrollConsumed = true
+
+  # Scroll bar: drag the thumb, or click the track to jump there.
+  let track = rect(list.x + list.w - RunLogBarW - 2, list.y + 2, RunLogBarW, max(0'f32, list.h - 4))
+  if maxScroll > 0 and track.h > 0:
+    let thumbH = max(24'f32, track.h * list.h / contentH).min(track.h)
+    let span = track.h - thumbH
+    var thumb = rect(track.x, track.y + span * a.rlScroll / maxScroll, track.w, thumbH)
+    if ui.hover(track) and ui.pressed():
+      ui.consumeClick()
+      if not ui.hover(thumb):
+        # Center the thumb on the pointer, then keep dragging from there.
+        a.rlScroll = clamp((ui.mouse.y - track.y - thumbH / 2) / span * maxScroll, 0, maxScroll)
+      ui.activeId = "rlscroll"
+      a.rlThumbFrom = (ui.mouse.y, a.rlScroll)
+    if ui.activeId == "rlscroll":
+      let (y0, s0) = a.rlThumbFrom
+      if span > 0:
+        a.rlScroll = clamp(s0 + (ui.mouse.y - y0) / span * maxScroll, 0, maxScroll)
+      a.rlFollow = a.rlScroll >= maxScroll
+    a.rlScroll = clamp(a.rlScroll, 0, maxScroll)
+    thumb.y = track.y + span * a.rlScroll / maxScroll
+    ui.rect(track, colTrack)
+    ui.rect(thumb, if ui.activeId == "rlscroll": colAccent
+      elif ui.hover(thumb): colTextDim else: colTextDisabled)
+  if a.rlFollow: a.rlScroll = maxScroll
+  a.rlScroll = clamp(a.rlScroll, 0, maxScroll)
+
+  let textW = list.w - 24 - (if maxScroll > 0: RunLogBarW + 4 else: 0)
+  ui.sk.pushClipRect(rect(list.x, list.y, list.w - RunLogBarW - 4, list.h))
+  let first = max(0, int((a.rlScroll - pad) / rowH))
+  let last = min(rows.len, first + int(list.h / rowH) + 2) - 1
+  for i in first .. last:
+    let y = list.y + pad + i.float32 * rowH - a.rlScroll
+    ui.textIn(rows[i][0], rect(list.x + 12, y, textW, rowH), rows[i][1], FontSmall)
+  ui.sk.popClipRect()
 
 proc dropFiles(a: App, paths: seq[string]) =
   ## Dropped on the playlist: insert at the row boundary under the pointer and
@@ -2182,6 +2440,10 @@ proc overlayFrame(a: App, title: string, size: Vec2): Rect =
   if ui.iconButton("ov-close", rect(r.x + r.w - 40, r.y + 10, 30, 30), "close20", "Close"):
     a.overlay = ovNone
   ui.rect(rect(r.x + 1, r.y + 50, r.w - 2, 1), colBorder)
+  # A press on the scrim dismisses it, without reaching anything beneath.
+  if (ui.pressed() or ui.pressed(MouseRight)) and not ui.mouse.inside(r):
+    a.overlay = ovNone
+    ui.consumeClick()
   r
 
 proc readFramebuffer(size: IVec2): Image =
@@ -2261,6 +2523,88 @@ proc renderRename(a: App, shot: string) =
   elif esc:
     a.closeRename()
 
+proc renderCommands(a: App, shot: string) =
+  ## Draws the Command-line Manager window and carries out its buttons.
+  if a.overlay != ovCommands: return
+  let w = a.cmdWin
+  let ui = a.cmdUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeCommands()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  w.beginDrawOn()
+  ui.beginFrame()
+  a.cmdSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let path = if a.player.loaded: a.player.path else: ""
+  let action = a.cmdDlg.draw(ui, rect(vec2(0, 0), size.vec2), path)
+  ui.drawTooltip()
+  a.cmdSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-commands.png")
+  w.endDrawOn(a.window)
+  let d = a.cmdDlg
+  case action
+  of caNone: discard
+  of caCancel: a.closeCommands()
+  of caApply:
+    let (orig, c) = (d.origTitle, d.commandLine)
+    a.editCommandLines(proc (cmds: var seq[CommandLine]) =
+      let i = cmds.mapIt(it.title).find(orig)
+      if orig.len > 0 and i >= 0: cmds[i] = c
+      else: cmds.add c)
+    a.closeCommands()
+  of caDelete:
+    let orig = d.origTitle
+    a.editCommandLines(proc (cmds: var seq[CommandLine]) =
+      cmds.keepItIf(it.title != orig))
+    d.saved = a.commands
+    d.load(a.latestCommandLine)
+
+proc renderPick(a: App, shot: string) =
+  ## Draws the Run window; Run executes the command line with the bookmarks
+  ## chosen.
+  if a.overlay != ovPick: return
+  let w = a.pickWin
+  let ui = a.pickUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closePick()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let marks = a.fileBookmarks
+  w.beginDrawOn()
+  ui.beginFrame()
+  a.pickSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), size.vec2), marks)
+  ui.drawTooltip()
+  a.pickSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-pick.png")
+  w.endDrawOn(a.window)
+  case action
+  of paNone: discard
+  of paCancel: a.closePick()
+  of paRun:
+    let d = a.pickDlg
+    var picks = initTable[string, string]()
+    for i, row in d.rows:
+      if row.kind == ckValue: picks[row.name] = d.texts[i]
+      elif d.picks[i] >= 0 and d.picks[i] < marks.len:
+        picks[row.name] = fmtTime(marks[d.picks[i]].time, millis = true)
+    a.closePick()
+    a.execute(d.cmd, picks)
+
 proc propertiesOverlay(a: App) =
   let ui = a.ui
   let r = a.overlayFrame("Properties", vec2(560, 90 + a.props.len.float32 * 26))
@@ -2270,30 +2614,72 @@ proc propertiesOverlay(a: App) =
     ui.textIn(ui.ellipsize(v, r.w - 210), rect(r.x + 180, y, r.w - 200, 24), colText)
     y += 26
 
-const shortcutList = [
-  ("Open file", "Ctrl+O"), ("Load subtitle", "Ctrl+Shift+O"), ("Close", "Ctrl+C"),
-  ("Save screenshot", "Alt+I"), ("Exit", "Alt+X"), ("Options", "O"),
-  ("Play / Pause", "Space or click video"), ("Frame forward / back", ". / ,"),
-  ("Rate up / down", "Shift+. / Shift+,"), ("Jump back / forward", "Left / Right"),
-  ("Previous / next chapter", "Ctrl+Left / Ctrl+Right"), ("Previous / next file", "Page Up / Page Down"),
-  ("Jump to 0% ... 90%", "0 ... 9"), ("Add bookmark", "Insert"),
-  ("Volume up / down", "Up / Down or wheel"), ("Mute", "Ctrl+M"),
-  ("Next / previous audio", "A / Shift+A"), ("Next / previous subtitle", "S / Shift+S"),
-  ("Full screen", "Alt+Enter or double-click"), ("Toggle seek bar, controls, status, playlist", "Ctrl+1 ... Ctrl+4"),
-  ("Move video", "Numpad 8 / 2 / 4 / 6, 5 centers"), ("Rotate", "Alt+Numpad 4 / 6, Alt+5 resets"),
-  ("Resize video", "Ctrl+Numpad 9 / 3, 6 / 4, 8 / 2"),
-  ("Align subtitles", "Shift+Numpad 1 ... 9"), ("Move subtitles", "Shift+Arrows"),
-  ("Subtitle size", "Shift+Numpad + / -"), ("Context menu", "Right-click video"),
-  ("Move window", "Drag the video")]
+type ShortcutGroup = tuple[title: string, rows: seq[(string, string)]]
+
+const shortcutColumns: array[2, seq[ShortcutGroup]] = [
+  @[
+    ("File", @[
+      ("Open file", "Ctrl+O"), ("Load subtitle file", "Ctrl+Shift+O"), ("Close", "Ctrl+C"),
+      ("Save screenshot", "Alt+I"), ("Exit", "Alt+X")]),
+    ("Playback", @[
+      ("Play / Pause", "Space"), ("Frame forward / back", ". / ,"),
+      ("Faster / slower playback", "Shift+. / Shift+,"),
+      ("Volume up / down", "Up / Down"), ("Mute", "Ctrl+M"),
+      ("Next / previous audio track", "A / Shift+A"),
+      ("Next / previous subtitle track", "S / Shift+S")]),
+    ("Navigate", @[
+      ("Jump forward / back", "Right / Left"), ("Go to beginning", "Home"),
+      ("Jump to 0% ... 90%", "0 ... 9"), ("Next / previous chapter", "Ctrl+Right / Ctrl+Left"),
+      ("Next / previous file", "Page Down / Page Up"), ("Add bookmark", "Insert"),
+      ("Remove selected playlist item", "Delete")]),
+    ("Subtitles", @[
+      ("Align (numpad as a 3x3 grid)", "Shift+Numpad 1 ... 9"),
+      ("Move", "Shift+Arrows"), ("Bigger / smaller", "Shift+Numpad + / -")])],
+  @[
+    ("View", @[
+      ("Seek bar", "Ctrl+1"), ("Controls", "Ctrl+2"), ("Status", "Ctrl+3"),
+      ("Playlist", "Ctrl+4"), ("Run log", "Ctrl+5"), ("Full screen", "Alt+Enter"),
+      ("Leave full screen / close dialog", "Esc"), ("Options", "O"),
+      ("Keyboard shortcuts", "F1")]),
+    ("Grab, Rotate & Scale", @[
+      ("Center", "Numpad 5"), ("Move up / down", "Numpad 8 / 2"),
+      ("Move left / right", "Numpad 4 / 6"), ("0 degrees", "Alt+Numpad 5"),
+      ("Rotate clockwise / counter-clockwise", "Alt+Numpad 6 / 4"),
+      ("Restore size", "Ctrl+Numpad 5"), ("Increase / decrease size", "Ctrl+Numpad 9 / 3"),
+      ("Increase / decrease width", "Ctrl+Numpad 6 / 4"),
+      ("Increase / decrease height", "Ctrl+Numpad 8 / 2")]),
+    ("Mouse", @[
+      ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
+      ("Move window", "Drag video"), ("Context menu", "Right-click"),
+      ("Volume", "Wheel"), ("Toggle seek snapping", "Shift+Drag seek bar")])]]
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
-  let r = a.overlayFrame("Keyboard Shortcuts", vec2(600, 80 + shortcutList.len.float32 * 23))
-  var y = r.y + 62
-  for (k, v) in shortcutList:
-    ui.textIn(k, rect(r.x + 24, y, 300, 22), colText, FontSmall)
-    ui.textIn(v, rect(r.x + 300, y, r.w - 324, 22), colAccent, FontSmall, h = RightAlign)
-    y += 23
+  const
+    RowH = 21'f32
+    HeadH = 32'f32
+    ColW = 420'f32
+    ColGap = 32'f32
+    Pad = 24'f32
+  var colH = 0'f32
+  for col in shortcutColumns:
+    var h = 0'f32
+    for g in col: h += HeadH + g.rows.len.float32 * RowH
+    colH = max(colH, h)
+  let r = a.overlayFrame("Keyboard Shortcuts",
+    vec2(Pad * 2 + ColW * 2 + ColGap, 60 + colH + Pad - 8))
+  for ci, col in shortcutColumns:
+    let x = r.x + Pad + ci.float32 * (ColW + ColGap)
+    var y = r.y + 58
+    for g in col:
+      ui.textIn(g.title, rect(x, y, ColW, 24), colAccent)
+      ui.rect(rect(x, y + 25, ColW, 1), colBorder)
+      y += HeadH
+      for (k, v) in g.rows:
+        let vw = ui.textSize(v, FontSmall).x
+        ui.textIn(k, rect(x, y, ColW - vw - 12, RowH), colText, FontSmall)
+        ui.textIn(v, rect(x + ColW - vw - 2, y, vw + 2, RowH), colTextDim, FontSmall, h = RightAlign)
+        y += RowH
 
 proc aboutOverlay(a: App) =
   let ui = a.ui
@@ -2321,9 +2707,14 @@ proc frame(a: App) =
   let W = fb.x.float32
   let H = fb.y.float32
   let plW = if a.cfg.showPlaylist: min(a.playlistWidth, W) else: 0
+  # The run log spans the window's width under the menu bar (in full screen,
+  # over the top of the video).
+  let rlH = if a.cfg.showRunLog: min(a.runLogHeight, max(0'f32, H - menuH - bottomH)) else: 0
+  let rlRect = rect(0, menuH, W, rlH)
+  let top = menuH + rlH
   let videoArea =
     if fs: rect(0, 0, W, H)
-    else: rect(0, menuH, max(0'f32, W - plW), max(0'f32, H - menuH - bottomH))
+    else: rect(0, top, max(0'f32, W - plW), max(0'f32, H - top - bottomH))
   a.videoRect = videoArea
   let revealZone = H - bottomH - 48
   let mouseIn = ui.fakeMouse.x >= 0 or w.mouseInside
@@ -2331,8 +2722,8 @@ proc frame(a: App) =
     a.seekDragging or ui.activeId == "volume"
   let bottomRect = rect(0, H - bottomH, W, bottomH)
   let plRect =
-    if fs: rect(W - plW, 0, plW, if bottomVisible: H - bottomH else: H)
-    else: rect(W - plW, menuH, plW, H - menuH - bottomH)
+    if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
+    else: rect(W - plW, top, plW, H - top - bottomH)
 
   # Input capture order: overlays > menus > everything else.
   if a.overlay != ovNone:
@@ -2351,7 +2742,8 @@ proc frame(a: App) =
 
   # Video-frame mouse handling: click = play/pause, drag = move window.
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
-     not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
+     not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
+     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)):
     if ui.pressed():
       a.videoPress = true
       a.videoPressPos = ui.mouse
@@ -2376,6 +2768,7 @@ proc frame(a: App) =
   # Chrome
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
   else: a.plListRect = Rect()
+  if a.cfg.showRunLog: a.runLogPanel(rlRect)
   if bottomVisible and bottomH > 0:
     var y = H - bottomH
     if a.cfg.showSeekBar:
@@ -2402,6 +2795,10 @@ proc frame(a: App) =
       if ui.pressed(): a.optWin.activate()
     of ovRename:
       if ui.pressed(): a.renWin.activate()
+    of ovCommands:
+      if ui.pressed(): a.cmdWin.activate()
+    of ovPick:
+      if ui.pressed(): a.pickWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -2422,16 +2819,21 @@ proc frame(a: App) =
     a.lastMouseMove = now()
   let hide = a.player.playing and a.player.hasVideo and
     ui.mouse.inside(videoArea) and not a.menus.isOpen and a.overlay == ovNone and
+    not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
   let resize = ui.activeId == "plresize" or a.cfg.showPlaylist and
     ui.hover(rect(plRect.x, plRect.y, PlaylistGripW, plRect.h)) and a.overlay == ovNone and
     not a.menus.isOpen
-  let shape = if hide: ptHidden elif resize: ptResize else: ptArrow
+  let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
+    ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) and
+    a.overlay == ovNone and not a.menus.isOpen
+  let shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV else: ptArrow
   if shape != a.pointerShape:
     a.pointerShape = shape
     w.cursor = case shape
       of ptHidden: hiddenCursor()
       of ptResize: Cursor(kind: ResizeLeftRightCursor)
+      of ptResizeV: Cursor(kind: ResizeUpDownCursor)
       of ptArrow: Cursor(kind: ArrowCursor)
 
   a.sk.endUi()
@@ -2450,6 +2852,8 @@ proc frame(a: App) =
       readFramebuffer(size).writeFile(shot.changeFileExt("") & &"-menu{level}.png"))
   a.renderOptions(shot)
   a.renderRename(shot)
+  a.renderCommands(shot)
+  a.renderPick(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -2458,6 +2862,8 @@ proc keyUi(a: App): Ui =
   case a.overlay
   of ovOptions: a.optUi
   of ovRename: a.renUi
+  of ovCommands: a.cmdUi
+  of ovPick: a.pickUi
   else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
@@ -2496,6 +2902,19 @@ proc runScriptStep(a: App, st: ScriptStep) =
       of "shortcuts": ovShortcuts
       of "about": ovAbout
       else: ovNone)
+  of "commands": a.showCommands()
+  of "cmdcard":  # name [value|reference [content]]: a card at the caret
+    let kind = if st.args.len > 1 and st.args[1] == "reference": ckReference else: ckValue
+    a.cmdDlg.addCard(st.args[0], kind, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "")
+  of "cmdapply": a.cmdDlg.applyRequested = true
+  of "run": a.runMenuPath(@["Run", arg])
+  of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
+  of "pick":  # row bookmark: choose a bookmark (0-based) in the Run window
+    a.pickDlg.picks[parseInt(st.args[0])] = parseInt(st.args[1])
+  of "pickrun": a.pickDlg.runRequested = true
+  of "picktext":  # row text: a value for this run
+    a.pickDlg.texts[parseInt(st.args[0])] = st.args[1 .. ^1].join(" ")
+  of "pickopen": a.pickDlg.openRow = parseInt(arg)
   of "action": a.runMenuPath(arg.split('/'))
   of "fs": a.setFullscreen(arg == "1")
   of "subs":  # alignX alignY dx dy scale
@@ -2546,7 +2965,8 @@ proc buildAtlas(): (Image, SilkyAtlas) =
 
 proc main() =
   discard setlocale(LC_NUMERIC, "C")
-  let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog())
+  let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog(),
+    cmdDlg: newCmdDialog(), pickDlg: newPickDialog())
   a.cfg = loadConfig()
   a.script = loadScript()
   randomize()
@@ -2562,6 +2982,7 @@ proc main() =
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
   a.bookmarks = loadBookmarks()
+  a.commands = loadCommandLines()
   if a.cfg.rememberTransform:
     let t = a.cfg.transform
     a.xf = VideoTransform(pan: vec2(t.panX, t.panY), rotation: t.rotation,
@@ -2658,6 +3079,8 @@ proc main() =
     a.window.runeInputEnabled = true
     if a.optWin != nil: a.optWin.runeInputEnabled = true
     if a.renWin != nil: a.renWin.runeInputEnabled = true
+    if a.cmdWin != nil: a.cmdWin.runeInputEnabled = true
+    if a.pickWin != nil: a.pickWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
@@ -2671,6 +3094,8 @@ proc main() =
     elif incoming.len > 0:
       if a.overlay == ovOptions: a.closeOptions(false)
       if a.overlay == ovRename: a.closeRename()
+      if a.overlay == ovCommands: a.closeCommands()
+      if a.overlay == ovPick: a.closePick()
       a.overlay = ovNone
       a.ui.focusId = ""
       a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))
@@ -2684,6 +3109,7 @@ proc main() =
     a.pollProbe()
     a.preview.pollEvents()
     a.pollDialog()
+    a.pollJobs()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 

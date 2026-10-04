@@ -25,6 +25,9 @@ let
   colTrack* = c("#30333b")
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")
+  colError* = c("#ff6b6b")
+  colCardValue* = c("#9d8cff", 0.28)
+  colCardRef* = c("#ffc857", 0.24)
   colShadow* = c("#000000", 0.45)
   colScrim* = c("#000000", 0.55)
   colOverlayBg* = c("#121317", 0.92)
@@ -37,6 +40,7 @@ const
   ControlsHeight* = 38'f32
   StatusHeight* = 24'f32
   PlaylistMinWidth* = 180'f32
+  RunLogMinHeight* = 80'f32
   MenuRowHeight* = 26'f32
   MenuSeparatorHeight* = 9'f32
   FontMain* = "Default"

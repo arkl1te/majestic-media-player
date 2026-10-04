@@ -40,6 +40,8 @@ type
     playlistWidth*: float = 300    # pixels, changed by dragging its left edge
     playlistShowSize*: bool = false
     playlistShowDimensions*: bool = false
+    showRunLog*: bool = false
+    runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
     showOsd*: bool = true
     frameMode*: FrameMode = fmTouchInside
     aspectOverride*: string = ""   # "" = original, else "4:3", "16:9", ...
@@ -173,6 +175,9 @@ proc parseHook*(s: string, i: var int, v: var Bookmark) =
     v = Bookmark()
     parseHook(s, i, v.time)
 
+proc label*(b: Bookmark, i: int): string =
+  if b.name.len > 0: b.name else: "Bookmark " & $(i + 1)
+
 proc bookmarksPath(): string = configDir() / "bookmarks.json"
 
 proc loadBookmarks*(): Bookmarks =
@@ -188,6 +193,43 @@ proc save*(b: Bookmarks) =
   try:
     createDir(path.parentDir)
     writeFile(path, b.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+# --- command lines (Run menu) --------------------------------------------------
+
+type
+  CardKind* = enum
+    ckValue = "value"             ## content is the text itself
+    ckReference = "reference"     ## content is a key: "file" or "bookmark:N"
+
+  CmdPart* = object
+    ## Literal text, or a card: a variable placed in the command line.
+    text*: string
+    card*: bool
+    name*: string
+    kind*: CardKind
+    content*: string
+
+  CommandLine* = object
+    title*: string
+    parts*: seq[CmdPart]
+
+proc commandLinesPath(): string = configDir() / "commandlines.json"
+
+proc loadCommandLines*(): seq[CommandLine] =
+  let path = commandLinesPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(seq[CommandLine])
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(cmds: seq[CommandLine]) =
+  let path = commandLinesPath()
+  try:
+    createDir(path.parentDir)
+    writeFile(path, cmds.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
