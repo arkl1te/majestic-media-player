@@ -24,6 +24,7 @@ let
   colAccentDim* = c("#9d8cff", 0.35)
   colTrack* = c("#30333b")
   colMarker* = c("#ffc857")
+  colBookmark* = c("#ff4d4d")
   colShadow* = c("#000000", 0.45)
   colScrim* = c("#000000", 0.55)
   colOverlayBg* = c("#121317", 0.92)

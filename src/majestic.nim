@@ -12,16 +12,17 @@ const
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
   OptionsSize = ivec2(780, 512)
+  RenameSize = ivec2(400, 116)
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
 
 type
   Overlay = enum
-    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout
+    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename
 
   ContextMenu = enum
-    cmVideo, cmTime, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
+    cmVideo, cmTime, cmSeekBar, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
 
   PlaylistSort = enum
     psName, psDuration, psDimensions, psSize
@@ -40,6 +41,12 @@ type
     zoom: float32 = 1
     scaleX: float32 = 1
     scaleY: float32 = 1
+
+  SubLayout = object
+    alignX: int = 1           ## 0 left, 1 center, 2 right
+    alignY: int = 2           ## 0 top, 1 middle, 2 bottom
+    offset: Vec2              ## screen pixels, +x right, +y down
+    scale: float32 = 1
 
   App = ref object
     window: Window
@@ -60,6 +67,8 @@ type
     fileSizes: Table[string, int64]      ## -1 for streams and unreadable files
     plResizeFrom: (float32, float32)     ## pointer x and width when the drag began
     xf: VideoTransform
+    subs: SubLayout
+    subsKey: string           ## mpv subtitle placement last pushed
     afterPlayback: AfterPlayback
     overlay: Overlay
     optionsDlg: OptionsDialog
@@ -71,6 +80,14 @@ type
     cfgBefore: Config         ## config when Options opened, restored on Cancel
     settingsKey: string       ## player-facing settings last pushed to mpv
     positions: Positions      ## remembered playback positions
+    bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
+    renWin: Window            ## Rename Bookmark dialog, created on first use
+    renSk: Silky
+    renUi: Ui
+    renPath: string           ## the bookmark being renamed: its file and time
+    renTime: float
+    renText: string
+    renPlaceholder: string    ## its default label, shown when renText is empty
     resumedAt: float          ## start time of the file being loaded, else 0
     instance: InstanceServer  ## receives files from later launches
     peers: PeerNet            ## other players, for Synchronize
@@ -92,6 +109,9 @@ type
     # seek bar
     seekDragging: bool
     seekDragT: float
+    seekRect: Rect            ## seek bar as last drawn
+    ctxSeekT: float           ## seek bar time the context menu was opened at
+    ctxBookmark: int          ## bookmark under the pointer then, else -1
     lastDragSeekAt: float
     previewQuad: Rect
     showPreview: bool
@@ -602,16 +622,83 @@ proc seekRelative(a: App, d: float) =
     a.player.h.commandAsync("seek", $d, "relative")
     a.syncSend("seek", $(a.player.timePos + d), "false")
 
+proc fileBookmarks(a: App): seq[Bookmark] =
+  if a.player.loaded: a.bookmarks.getOrDefault(a.player.path) else: @[]
+
+proc label(b: Bookmark, i: int): string =
+  if b.name.len > 0: b.name else: &"Bookmark {i + 1}"
+
 proc chapterStep(a: App, d: int) =
   let p = a.player
-  if p.loaded and p.chapters.len > 0:
+  if not p.loaded: return
+  var cur = -1
+  for i, c in p.chapters:
+    if c.time <= p.timePos + 0.01: cur = i
+  # With bookmarks as chapters, a bookmark nearer than the chapter mpv would
+  # land on wins. mpv never goes back past the current chapter's start.
+  if a.cfg.bookmarksAsChapters:
+    let marks = a.fileBookmarks
+    var bi = -1
+    if d > 0:
+      let limit = if cur + 1 < p.chapters.len: p.chapters[cur + 1].time else: Inf
+      for i, b in marks:
+        if b.time > p.timePos + 0.05 and b.time < limit: bi = i; break
+    else:
+      let limit = if cur >= 0: p.chapters[cur].time else: -Inf
+      for i in countdown(marks.high, 0):
+        if marks[i].time < p.timePos - 0.5 and marks[i].time > limit: bi = i; break
+    if bi >= 0:
+      a.seekTo(marks[bi].time)
+      a.osd(marks[bi].label(bi))
+      return
+  if p.chapters.len > 0:
     p.h.commandStr("osd-msg add chapter " & $d)
     # The others' files have chapters of their own: send where this one lands.
-    var cur = -1
-    for i, c in p.chapters:
-      if c.time <= p.timePos + 0.01: cur = i
     let j = cur + d
     if j >= 0 and j < p.chapters.len: a.syncSend("seek", $p.chapters[j].time, "true")
+
+proc nearestBookmark(a: App, t: float): int =
+  ## Index of the current file's bookmark closest to time t, else -1.
+  result = -1
+  var best = Inf
+  for i, b in a.fileBookmarks:
+    if abs(b.time - t) < best:
+      best = abs(b.time - t)
+      result = i
+
+proc editBookmarks(a: App, path: string, edit: proc (marks: var seq[Bookmark])) =
+  ## Applies `edit` to a file's bookmarks on the file's latest contents, so
+  ## other players' bookmarks aren't overwritten.
+  a.bookmarks = loadBookmarks()
+  var marks = a.bookmarks.getOrDefault(path)
+  edit(marks)
+  if marks.len > 0: a.bookmarks[path] = marks
+  else: a.bookmarks.del(path)
+  a.bookmarks.save()
+
+proc addBookmark(a: App, t: float) =
+  let p = a.player
+  if not p.loaded or p.path.len == 0: return
+  if a.fileBookmarks.anyIt(abs(it.time - t) < 0.05): return
+  a.editBookmarks(p.path, proc (marks: var seq[Bookmark]) =
+    var i = 0
+    while i < marks.len and marks[i].time < t: inc i
+    marks.insert(Bookmark(time: t), i))
+  a.osd("Bookmark added at " & fmtTime(t, a.cfg.showMillis))
+
+proc removeBookmark(a: App, t: float) =
+  ## Removes the current file's bookmark at time t.
+  a.editBookmarks(a.player.path, proc (marks: var seq[Bookmark]) =
+    for i, b in marks:
+      if b.time == t:
+        marks.delete(i)
+        break)
+  a.osd("Bookmark removed at " & fmtTime(t, a.cfg.showMillis))
+
+proc renameBookmark(a: App, path: string, t: float, name: string) =
+  a.editBookmarks(path, proc (marks: var seq[Bookmark]) =
+    for b in marks.mitems:
+      if b.time == t: b.name = name)
 
 proc xfChanged(a: App, msg: string) =
   a.osd(msg)
@@ -937,18 +1024,17 @@ proc closeOptions(a: App, ok: bool) =
     a.optWin.visible = false
     a.window.activate()
 
-proc ensureOptionsWindow(a: App) =
-  if a.optWin != nil: return
-  let w = newWindow("Options", OptionsSize, style = Decorated, visible = false,
+proc newDialogWindow(a: App, title: string, size: IVec2): (Window, Silky, Ui) =
+  ## A hidden dialog window over the main one, with its own Silky and Ui.
+  let w = newWindow(title, size, style = Decorated, visible = false,
     vsync = false)
   # Windy made the new window's own context current; it is drawn with the
   # main one instead (same visual), sharing the atlas texture and shaders.
   makeContextCurrent(a.window)
   w.icon = appIcon()
   w.setDialogFor(a.window)
-  a.optWin = w
-  a.optSk = newSilky(w, a.atlasImg, a.atlas)
-  a.optUi = newUi(a.optSk, w)
+  let sk = newSilky(w, a.atlasImg, a.atlas)
+  let ui = newUi(sk, w)
   let touch = proc () = a.dirtyUntil = now() + 1.2
   let input = proc () =
     touch()
@@ -961,19 +1047,47 @@ proc ensureOptionsWindow(a: App) =
   w.onButtonRelease = proc (b: Button) = input()
   w.onRune = proc (r: Rune) =
     input()
-    a.optUi.typedPending.add $r
+    ui.typedPending.add $r
+  (w, sk, ui)
 
-proc showOptionsWindow(a: App) =
-  ## Centres the dialog's frame on the main window's frame (both have the
+proc ensureOptionsWindow(a: App) =
+  if a.optWin != nil: return
+  (a.optWin, a.optSk, a.optUi) = a.newDialogWindow("Options", OptionsSize)
+
+proc showDialog(a: App, w: Window, size: IVec2) =
+  ## Centres a dialog's frame on the main window's frame (both have the
   ## same decorations), kept on the main window's monitor.
-  let w = a.optWin
-  var pos = a.window.framePos + (a.window.size - OptionsSize) div 2
+  var pos = a.window.framePos + (a.window.size - size) div 2
   let m = monitorAt(a.window.pos + a.window.size div 2)
-  pos.x = clamp(pos.x, m.pos.x, max(m.pos.x, m.pos.x + m.size.x - OptionsSize.x))
-  pos.y = clamp(pos.y, m.pos.y, max(m.pos.y, m.pos.y + m.size.y - OptionsSize.y))
-  w.placeDialog(pos, OptionsSize)
+  pos.x = clamp(pos.x, m.pos.x, max(m.pos.x, m.pos.x + m.size.x - size.x))
+  pos.y = clamp(pos.y, m.pos.y, max(m.pos.y, m.pos.y + m.size.y - size.y))
+  w.placeDialog(pos, size)
   w.visible = true
   w.activate()
+
+proc showRename(a: App, i: int) =
+  ## Opens the Rename Bookmark dialog for the current file's bookmark i.
+  let marks = a.fileBookmarks
+  if i < 0 or i >= marks.len: return
+  a.menus.close()
+  a.renPath = a.player.path
+  a.renTime = marks[i].time
+  a.renText = marks[i].name
+  a.renPlaceholder = marks[i].label(i)
+  if a.renWin == nil:
+    (a.renWin, a.renSk, a.renUi) = a.newDialogWindow("Rename Bookmark", RenameSize)
+  # Type right away, the caret after the current name.
+  a.renUi.focusId = "ren-name"
+  a.renUi.focusFresh = true
+  a.showDialog(a.renWin, RenameSize)
+  a.overlay = ovRename
+
+proc closeRename(a: App) =
+  a.renUi.focusId = ""
+  a.overlay = ovNone
+  if a.renWin.visible:
+    a.renWin.visible = false
+    a.window.activate()
 
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
@@ -984,7 +1098,7 @@ proc showOverlay(a: App, o: Overlay) =
     a.cfgBefore = a.cfg
     a.ensureOptionsWindow()
     a.optionsDlg.opened(a.optUi)
-    a.showOptionsWindow()
+    a.showDialog(a.optWin, OptionsSize)
   a.overlay = o
 
 # --- menu tree --------------------------------------------------------------
@@ -1176,22 +1290,34 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Navigate
   let nav = root.sub("Navigate")
-  nav.item("Previous File", "Page Up", enabled = loaded and not locked, action = proc () = a.navigate(-1))
-  nav.item("Next File", "Page Down", enabled = loaded and not locked, action = proc () = a.navigate(1))
+  let bm = nav.sub("Bookmarks", enabled = loaded)
+  bm.item("Add Bookmark", "Insert", enabled = loaded, action = proc () = a.addBookmark(a.player.timePos))
+  bm.item("Remove Bookmark", enabled = a.fileBookmarks.len > 0, action = proc () =
+    let i = a.nearestBookmark(a.player.timePos)
+    if i >= 0: a.removeBookmark(a.fileBookmarks[i].time))
+  let marks = a.fileBookmarks
+  if marks.len > 0:
+    bm.sep()
+    for i, b in marks:
+      bm.item(fmtTime(b.time) & "  " & b.label(i), action = bindAct(proc (t: float) = a.seekTo(t), b.time))
   nav.sep()
-  nav.item(&"Jump Back {a.cfg.seekStep:g}s", "Left", enabled = loaded,
-    action = proc () = a.seekRelative(-a.cfg.seekStep))
   nav.item(&"Jump Forward {a.cfg.seekStep:g}s", "Right", enabled = loaded,
     action = proc () = a.seekRelative(a.cfg.seekStep))
+  nav.item(&"Jump Back {a.cfg.seekStep:g}s", "Left", enabled = loaded,
+    action = proc () = a.seekRelative(-a.cfg.seekStep))
   nav.item("Go To Beginning", "Home", enabled = loaded, action = proc () = a.seekTo(0))
   nav.sep()
   let hasCh = p.chapters.len > 0
-  nav.item("Previous Chapter", "Ctrl+Left", enabled = hasCh, action = proc () = a.chapterStep(-1))
-  nav.item("Next Chapter", "Ctrl+Right", enabled = hasCh, action = proc () = a.chapterStep(1))
+  let canStep = hasCh or (a.cfg.bookmarksAsChapters and a.fileBookmarks.len > 0)
   let chm = nav.sub("Chapters", enabled = hasCh)
   for i, c in p.chapters:
     let label = fmtTime(c.time) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
     chm.item(label, action = bindAct(proc (t: float) = a.seekTo(t), c.time))
+  nav.item("Next Chapter", "Ctrl+Right", enabled = canStep, action = proc () = a.chapterStep(1))
+  nav.item("Previous Chapter", "Ctrl+Left", enabled = canStep, action = proc () = a.chapterStep(-1))
+  nav.sep()
+  nav.item("Next File", "Page Down", enabled = loaded and not locked, action = proc () = a.navigate(1))
+  nav.item("Previous File", "Page Up", enabled = loaded and not locked, action = proc () = a.navigate(-1))
 
   # Synchronize: the other players found, checked when in our group.
   let syn = root.sub("Synchronize")
@@ -1247,6 +1373,21 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.showMillis = not a.cfg.showMillis
       a.cfg.save())
     (root, timeCtx)
+  of cmSeekBar:
+    # Adds at the time clicked; removes or renames the bookmark clicked on.
+    let sb = newMenuRoot()
+    let i = a.ctxBookmark
+    let on = i >= 0 and i < a.fileBookmarks.len
+    let (t, bt) = (a.ctxSeekT, if on: a.fileBookmarks[i].time else: 0.0)
+    sb.item("Add Bookmark", enabled = loaded and not on, action = proc () = a.addBookmark(t))
+    sb.item("Remove Bookmark", enabled = on, action = proc () = a.removeBookmark(bt))
+    sb.sep()
+    sb.item("Rename Bookmark...", enabled = on, action = proc () = a.showRename(i))
+    sb.sep()
+    sb.check("Bookmarks as chapters", checked = a.cfg.bookmarksAsChapters, action = proc () =
+      a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
+      a.cfg.save())
+    (root, sb)
   of cmPlaylist:
     let pl = newMenuRoot()
     let n = a.playlist.len
@@ -1301,6 +1442,75 @@ proc runMenuPath(a: App, path: seq[string]) =
     node = found
   if node.action != nil and node.enabled: node.action()
 
+# --- subtitle placement ------------------------------------------------------
+
+const
+  SubMoveStep = 2'f32        ## Shift+arrows, screen pixels
+  SubScaleStep = 0.1'f32     ## Shift+Numpad +/-
+  SubMarginX = 19            ## mpv's sub-margin-x / sub-margin-y defaults
+  SubMarginY = 34
+
+proc alignSubs(a: App, x, y: int) =
+  ## Re-aligning drops the nudge: it was relative to the old anchor.
+  a.subs.alignX = x
+  a.subs.alignY = y
+  a.subs.offset = vec2(0, 0)
+  const names = [["Top Left", "Top", "Top Right"], ["Left", "Middle", "Right"],
+                 ["Bottom Left", "Bottom", "Bottom Right"]]
+  a.osd("Subtitles: " & names[y][x])
+
+proc moveSubs(a: App, d: Vec2) =
+  a.subs.offset += d
+  a.osd(&"Subtitle offset: {int(a.subs.offset.x)}, {int(a.subs.offset.y)}")
+
+proc scaleSubs(a: App, dir: float32) =
+  a.subs.scale = clamp(a.subs.scale + dir * SubScaleStep, 0.2'f32, 5'f32)
+  a.osd(&"Subtitle size: {int(round(a.subs.scale * 100))}%")
+
+proc subPadding(a: App): tuple[l, r, t, b: float32] =
+  ## mpv can't shift centered subtitles, but text subtitles are laid out on
+  ## the whole render target while video-margin-ratio keeps the video out of
+  ## its margins: padding one side of the target moves them by half of it.
+  let o = a.subs.offset
+  if a.subs.alignX == 1:
+    result.l = max(0, -2 * o.x)
+    result.r = max(0, 2 * o.x)
+  if a.subs.alignY == 1:
+    result.t = max(0, -2 * o.y)
+    result.b = max(0, 2 * o.y)
+
+proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32]) =
+  ## Pushes the placement for a video drawn `video` pixels big. The anchored
+  ## cases use mpv's own margins, in scaled pixels: 720 of them span the
+  ## height, and text subtitles' 384x288 canvas makes 960 span the width.
+  let s = a.subs
+  let full = video + vec2(pad.l + pad.r, pad.t + pad.b)
+  let (kx, ky) = (full.x / 960, full.y / 720)
+  let marginX =
+    case s.alignX
+    of 0: max(0, int(round(SubMarginX + s.offset.x / kx)))
+    of 2: max(0, int(round(SubMarginX - s.offset.x / kx)))
+    else: SubMarginX
+  let marginY = if s.alignY == 0: max(0, int(round(SubMarginY + s.offset.y / ky))) else: SubMarginY
+  let pos = if s.alignY == 2: clamp(100 + s.offset.y / video.y * 100, 0'f32, 150'f32) else: 100'f32
+  # Subtitles scale with the target height; keep padding from growing them.
+  let scale = s.scale * video.y / full.y
+  let key = &"{s.alignX}|{s.alignY}|{marginX}|{marginY}|{pos:.3f}|{scale:.4f}|" &
+    &"{pad.l / full.x:.5f}|{pad.r / full.x:.5f}|{pad.t / full.y:.5f}|{pad.b / full.y:.5f}"
+  if key == a.subsKey: return
+  a.subsKey = key
+  let h = a.player.h
+  h.setProp("sub-align-x", ["left", "center", "right"][s.alignX])
+  h.setProp("sub-align-y", ["top", "center", "bottom"][s.alignY])
+  h.setProp("sub-margin-x", $marginX)
+  h.setProp("sub-margin-y", $marginY)
+  h.setProp("sub-pos", pos)
+  h.setProp("sub-scale", scale)
+  h.setProp("video-margin-ratio-left", pad.l / full.x)
+  h.setProp("video-margin-ratio-right", pad.r / full.x)
+  h.setProp("video-margin-ratio-top", pad.t / full.y)
+  h.setProp("video-margin-ratio-bottom", pad.b / full.y)
+
 proc digitPressed(pressed: ButtonView): int =
   ## Top-row digit pressed this frame (0-9), or -1.
   const keys = [Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9]
@@ -1317,6 +1527,7 @@ proc handleKeys(a: App) =
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
+    elif a.overlay == ovRename: a.closeRename()
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -1359,6 +1570,7 @@ proc handleKeys(a: App) =
     a.player.stopped = false
     a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
     a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
+  elif none and pressed[KeyInsert]: a.addBookmark(a.player.timePos)
   elif none and pressed[KeyDelete] and a.cfg.showPlaylist:
     a.removeSelected()
 
@@ -1390,6 +1602,18 @@ proc handleKeys(a: App) =
     elif pressed[Numpad8]: menuPath = @["View", g, "Increase Height"]
     elif pressed[Numpad2]: menuPath = @["View", g, "Decrease Height"]
   if menuPath.len > 0: a.runMenuPath(menuPath)
+
+  # Shift: subtitle alignment (numpad as a 3x3 grid), nudging and size.
+  if s and not c and not al:
+    const grid = [Numpad7, Numpad8, Numpad9, Numpad4, Numpad5, Numpad6, Numpad1, Numpad2, Numpad3]
+    for i, k in grid:
+      if pressed[k]: a.alignSubs(i mod 3, i div 3)
+    if pressed[KeyUp]: a.moveSubs(vec2(0, -SubMoveStep))
+    elif pressed[KeyDown]: a.moveSubs(vec2(0, SubMoveStep))
+    elif pressed[KeyLeft]: a.moveSubs(vec2(-SubMoveStep, 0))
+    elif pressed[KeyRight]: a.moveSubs(vec2(SubMoveStep, 0))
+    if pressed[NumpadAdd]: a.scaleSubs(1)
+    elif pressed[NumpadSubtract]: a.scaleSubs(-1)
 
 # --- video geometry ---------------------------------------------------------
 
@@ -1440,18 +1664,26 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
     return
   let (center, size) = a.videoGeometry(area)
   if size.x < 1 or size.y < 1: return
+  # The target is padded around the video to move centered subtitles.
+  let pad = a.subPadding()
+  let full = size + vec2(pad.l + pad.r, pad.t + pad.b)
+  a.applySubLayout(size, pad)
   # Render at the on-screen size (mpv does the high-quality scaling); cap the
   # texture so extreme zoom doesn't allocate huge buffers.
-  let cap = min(1'f32, 4096 / max(size.x, size.y))
-  let tw = max(1, int(round(size.x * cap)))
-  let th = max(1, int(round(size.y * cap)))
+  let cap = min(1'f32, 4096 / max(full.x, full.y))
+  let tw = max(1, int(round(full.x * cap)))
+  let th = max(1, int(round(full.y * cap)))
   let resized = tw != a.player.target.w or th != a.player.target.h
   a.player.target.ensureSize(tw, th)
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
-  a.quad.draw(a.player.target.tex, transformedCorners(center, size, a.xf.rotation), fb.vec2)
+  # Shift the padded quad so the video part stays where the video belongs.
+  let sh = vec2((pad.r - pad.l) / 2, (pad.b - pad.t) / 2)
+  let rad = a.xf.rotation * PI.float32 / 180
+  let shift = vec2(sh.x * cos(rad) - sh.y * sin(rad), sh.x * sin(rad) + sh.y * cos(rad))
+  a.quad.draw(a.player.target.tex, transformedCorners(center + shift, full, a.xf.rotation), fb.vec2)
   glDisable(GL_SCISSOR_TEST)
 
 proc drawPreview(a: App, fb: IVec2) =
@@ -1466,9 +1698,26 @@ proc drawPreview(a: App, fb: IVec2) =
 
 # --- UI panels --------------------------------------------------------------
 
+proc seekBarContext(a: App, pos: Vec2) =
+  ## Opens the seek bar's context menu for the point pos on it.
+  let r = a.seekRect
+  let (x0, w, dur) = (r.x + 12, r.w - 24, a.player.duration)
+  if dur <= 0 or not a.player.loaded: return
+  a.ctxSeekT = clamp((pos.x - x0) / w, 0, 1) * dur
+  a.ctxBookmark = -1
+  var best = max(a.cfg.snapDistance, 4)
+  for i, b in a.fileBookmarks:
+    let d = abs(x0 + w * (b.time / dur) - pos.x)
+    if d <= best:
+      best = d
+      a.ctxBookmark = i
+  a.ctxMenu = cmSeekBar
+  a.menus.openContext(pos)
+
 proc seekBar(a: App, r: Rect) =
   let ui = a.ui
   let p = a.player
+  a.seekRect = r
   ui.rect(r, colPanel)
   let x0 = r.x + 12
   let w = r.w - 24
@@ -1482,10 +1731,13 @@ proc seekBar(a: App, r: Rect) =
   let frac = if dur > 0: clamp(cur / dur, 0, 1) else: 0
   ui.rect(rect(x0, cy - th / 2, w * frac, th), colAccent)
 
-  # Markers (chapters for now; the list is generic so other marks can be added).
+  # Markers: chapters and bookmarks, both snapped to.
   var markers: seq[(float, string, ColorRGBX)]
   for i, c in p.chapters:
     markers.add (c.time, (if c.title.len > 0: c.title else: &"Chapter {i + 1}"), colMarker)
+  for i, b in a.fileBookmarks:
+    markers.add (b.time, b.label(i), colBookmark)
+  markers.sort(proc (x, y: (float, string, ColorRGBX)): int = cmp(x[0], y[0]))
 
   var t = 0.0
   var snapped = -1
@@ -1509,6 +1761,9 @@ proc seekBar(a: App, r: Rect) =
 
   if dur > 0 and p.loaded:
     ui.icon("knob16", vec2(x0 + w * frac, cy), colWhite)
+
+  if hov and not active and ui.released(MouseRight):
+    a.seekBarContext(ui.mouse)
 
   # Dragging / clicking
   if hov and ui.pressed() and not active:
@@ -1644,7 +1899,9 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif s and not c and not al:
     @[@[(",", "-Rate"), (".", "+Rate")],
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
-      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Chapters" else: "Seek Without Snapping")]]
+      @[("Num1-9", "Align Subtitles"), ("Arrows", "Move Subtitles"),
+        ("Num+", "Bigger Subtitles"), ("Num-", "Smaller Subtitles")],
+      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]]
   else: @[]
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
@@ -1969,6 +2226,41 @@ proc renderOptions(a: App, shot: string) =
     # Let KDE's service cache notice the new defaults right away.
     if findExe("kbuildsycoca6").len > 0: a.spawn("kbuildsycoca6")
 
+proc renderRename(a: App, shot: string) =
+  ## Draws the Rename Bookmark window; Enter does what its button does.
+  if a.overlay != ovRename: return
+  let w = a.renWin
+  let ui = a.renUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeRename()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+  let esc = w.buttonPressed[KeyEscape]
+  w.beginDrawOn()
+  ui.beginFrame()
+  a.renSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = size.x.float32
+  ui.textIn("Name", rect(16, 10, W - 32, 22), colTextDim, FontSmall)
+  discard ui.textField("ren-name", rect(16, 34, W - 32, 28), a.renText, a.renPlaceholder)
+  let ok = ui.textButton("ren-ok", rect(W - 116, 74, 100, 28), "Rename", primary = true)
+  ui.drawTooltip()
+  a.renSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-rename.png")
+  w.endDrawOn(a.window)
+  if ok or enter:
+    a.renameBookmark(a.renPath, a.renTime, a.renText.strip)
+    a.closeRename()
+  elif esc:
+    a.closeRename()
+
 proc propertiesOverlay(a: App) =
   let ui = a.ui
   let r = a.overlayFrame("Properties", vec2(560, 90 + a.props.len.float32 * 26))
@@ -1984,12 +2276,14 @@ const shortcutList = [
   ("Play / Pause", "Space or click video"), ("Frame forward / back", ". / ,"),
   ("Rate up / down", "Shift+. / Shift+,"), ("Jump back / forward", "Left / Right"),
   ("Previous / next chapter", "Ctrl+Left / Ctrl+Right"), ("Previous / next file", "Page Up / Page Down"),
-  ("Jump to 0% ... 90%", "0 ... 9"),
+  ("Jump to 0% ... 90%", "0 ... 9"), ("Add bookmark", "Insert"),
   ("Volume up / down", "Up / Down or wheel"), ("Mute", "Ctrl+M"),
   ("Next / previous audio", "A / Shift+A"), ("Next / previous subtitle", "S / Shift+S"),
   ("Full screen", "Alt+Enter or double-click"), ("Toggle seek bar, controls, status, playlist", "Ctrl+1 ... Ctrl+4"),
   ("Move video", "Numpad 8 / 2 / 4 / 6, 5 centers"), ("Rotate", "Alt+Numpad 4 / 6, Alt+5 resets"),
-  ("Resize video", "Ctrl+Numpad 9 / 3, 6 / 4, 8 / 2"), ("Context menu", "Right-click video"),
+  ("Resize video", "Ctrl+Numpad 9 / 3, 6 / 4, 8 / 2"),
+  ("Align subtitles", "Shift+Numpad 1 ... 9"), ("Move subtitles", "Shift+Arrows"),
+  ("Subtitle size", "Shift+Numpad + / -"), ("Context menu", "Right-click video"),
   ("Move window", "Drag the video")]
 
 proc shortcutsOverlay(a: App) =
@@ -2106,6 +2400,8 @@ proc frame(a: App) =
     case a.overlay
     of ovOptions:  # its own window; clicks here bring it back up
       if ui.pressed(): a.optWin.activate()
+    of ovRename:
+      if ui.pressed(): a.renWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -2153,12 +2449,16 @@ proc frame(a: App) =
     proc (level: int, size: IVec2) =
       readFramebuffer(size).writeFile(shot.changeFileExt("") & &"-menu{level}.png"))
   a.renderOptions(shot)
+  a.renderRename(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
 proc keyUi(a: App): Ui =
   ## The Ui of the window taking the keyboard.
-  if a.overlay == ovOptions: a.optUi else: a.ui
+  case a.overlay
+  of ovOptions: a.optUi
+  of ovRename: a.renUi
+  else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
   let arg = st.args.join(" ")
@@ -2170,6 +2470,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.menus.openBar(parseInt(st.args[0]), path)
   of "ctx": a.ctxMenu = cmVideo; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "plctx": a.ctxMenu = cmPlaylist; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "sbctx": a.seekBarContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "plselect": a.plSelected = parseInt(arg)
   of "plaction":  # playlist context menu item by label
     a.ctxMenu = cmPlaylist
@@ -2197,6 +2498,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
       else: ovNone)
   of "action": a.runMenuPath(arg.split('/'))
   of "fs": a.setFullscreen(arg == "1")
+  of "subs":  # alignX alignY dx dy scale
+    a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
+      offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]))
   of "seek": a.seekTo(parseFloat(arg))
   of "pause": a.togglePlay()
   of "sync":  # all | none | add <pid> | remove <pid> | addany (first peer found)
@@ -2257,6 +2561,7 @@ proc main() =
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
+  a.bookmarks = loadBookmarks()
   if a.cfg.rememberTransform:
     let t = a.cfg.transform
     a.xf = VideoTransform(pan: vec2(t.panX, t.panY), rotation: t.rotation,
@@ -2352,6 +2657,7 @@ proc main() =
     # typed characters, so turn it back on before reading events.
     a.window.runeInputEnabled = true
     if a.optWin != nil: a.optWin.runeInputEnabled = true
+    if a.renWin != nil: a.renWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
@@ -2364,6 +2670,7 @@ proc main() =
       a.osd("Opening in the synchronization master")
     elif incoming.len > 0:
       if a.overlay == ovOptions: a.closeOptions(false)
+      if a.overlay == ovRename: a.closeRename()
       a.overlay = ovNone
       a.ui.focusId = ""
       a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))

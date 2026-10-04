@@ -57,6 +57,7 @@ type
     rememberWindowSize*: bool = false
     rememberTransform*: bool = false
     rememberPlaylist*: bool = false
+    bookmarksAsChapters*: bool = false  # chapter steps also stop at bookmarks
     titleFullPath*: bool = false
     titleUseMediaTitle*: bool = false
     # Options > Playback
@@ -147,6 +148,48 @@ proc remember*(p: var Positions, path: string, t: float) =
     for k in p.keys:
       p.del(k)
       break
+
+# --- bookmarks ---------------------------------------------------------------
+
+type
+  Bookmark* = object
+    time*: float
+    name*: string                 ## "" shows as "Bookmark N"
+
+  BookmarkJson = object
+    time: float
+    name: string
+
+  Bookmarks* = OrderedTable[string, seq[Bookmark]]  ## path -> sorted by time
+
+proc parseHook*(s: string, i: var int, v: var Bookmark) =
+  ## Objects, or the bare times that older versions wrote.
+  eatSpace(s, i)
+  if i < s.len and s[i] == '{':
+    var o: BookmarkJson
+    parseHook(s, i, o)
+    v = Bookmark(time: o.time, name: o.name)
+  else:
+    v = Bookmark()
+    parseHook(s, i, v.time)
+
+proc bookmarksPath(): string = configDir() / "bookmarks.json"
+
+proc loadBookmarks*(): Bookmarks =
+  let path = bookmarksPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(Bookmarks)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(b: Bookmarks) =
+  let path = bookmarksPath()
+  try:
+    createDir(path.parentDir)
+    writeFile(path, b.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
 const VideoExtensions* = [
   "mkv", "mp4", "m4v", "webm", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts",
