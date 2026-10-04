@@ -54,6 +54,7 @@ type
     dialog: Dialog
     children: seq[Process]
     fullscreen: bool
+    timeMenu: bool            ## context menu opened on the status timestamp
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
@@ -470,7 +471,7 @@ proc applyOsd(a: App) =
 proc syncSettings(a: App) =
   ## Pushes the player-facing options to mpv (and the title) when they change.
   let c = a.cfg
-  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
+  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
     &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}"
   if key == a.settingsKey: return
   a.settingsKey = key
@@ -479,6 +480,7 @@ proc syncSettings(a: App) =
   h.setProp("slang", langList(c.subLangs))
   h.setProp("alang", langList(c.audioLangs))
   h.setProp("sub-delay", c.subDelay / 1000)
+  h.setProp("osd-fractions", if c.showMillis: "yes" else: "no")
   h.setProp("sub-file-paths", subPathList(c.subPaths))
   a.updateTitle()
 
@@ -771,6 +773,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   ctx.children.add options
   ctx.sep()
   ctx.children.add exitItem
+
+  if a.timeMenu:
+    let timeCtx = newMenuRoot()
+    timeCtx.check("Enable milliseconds", checked = a.cfg.showMillis, action = proc () =
+      a.cfg.showMillis = not a.cfg.showMillis
+      a.cfg.save())
+    return (root, timeCtx)
   (root, ctx)
 
 # --- keyboard ---------------------------------------------------------------
@@ -1021,7 +1030,7 @@ proc seekBar(a: App, r: Rect) =
   # Hover label and thumbnail
   a.showPreview = false
   if hov:
-    var label = fmtTime(t)
+    var label = fmtTime(t, a.cfg.showMillis)
     if snapped >= 0: label.add "  " & markers[snapped][1]
     else:
       for i in countdown(markers.high, 0):
@@ -1211,11 +1220,17 @@ proc status(a: App, r: Rect) =
     of "mono16": "Mono"
     else: "No sound"
   ui.tip(rect(ix - iw / 2, r.y, iw, r.h), audioTip)
-  var timeText = fmtTime(if a.seekDragging: a.seekDragT else: p.timePos) & " / " & fmtTime(p.duration)
+  let ms = a.cfg.showMillis
+  var timeText = fmtTime(if a.seekDragging: a.seekDragT else: p.timePos, ms) & " / " &
+    fmtTime(p.duration, ms)
   if p.loaded and abs(p.speed - 1) > 0.001:
     timeText = &"{p.speed:g}x   " & timeText
   let tw = ui.textSize(timeText, FontSmall).x
-  ui.textIn(timeText, rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h), colText, FontSmall)
+  let timeRect = rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h)
+  ui.textIn(timeText, timeRect, colText, FontSmall)
+  if ui.hover(timeRect) and ui.released(MouseRight):
+    a.timeMenu = true
+    a.menus.openContext(ui.mouse)
 
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
@@ -1418,6 +1433,7 @@ proc frame(a: App) =
       a.setFullscreen(not a.fullscreen)
       a.videoPress = false
     if ui.released(MouseRight):
+      a.timeMenu = false
       a.menus.openContext(ui.mouse)
     if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
       a.volumeStep(ui.scroll() < 0)
@@ -1509,7 +1525,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     var path: seq[int]
     for x in st.args[1 .. ^1]: path.add parseInt(x)
     a.menus.openBar(parseInt(st.args[0]), path)
-  of "ctx": a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "ctx": a.timeMenu = false; a.menus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
   of "close": a.menus.close()
   of "mouse":
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)

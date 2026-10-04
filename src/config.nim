@@ -47,6 +47,7 @@ type
     # Options > Player
     openMode*: OpenMode = omSamePlayer
     osdTimestamp*: bool = false
+    showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
     autoFitWindow*: bool = true
     rememberTime*: bool = false
     rememberWindowPos*: bool = false

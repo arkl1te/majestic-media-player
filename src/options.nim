@@ -190,6 +190,7 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.radioRow(p, "o-new", "New player for each media file", c.openMode, omNewPlayer)
   p.gap
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
+  ui.checkRow(p, "o-millis", "Show milliseconds", c.showMillis)
   ui.checkRow(p, "o-fit", "Resize window to fit video on open", c.autoFitWindow)
   ui.checkRow(p, "o-rtime", "Remember time (continue where the file was left off)", c.rememberTime)
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)

@@ -440,6 +440,9 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
       ui.caret = ui.editText.len
     elif ui.focusId == fid: ui.focusId = ""
 
-proc fmtTime*(t: float): string =
-  let s = max(0, int(t))
-  &"{s div 3600:02}:{(s mod 3600) div 60:02}:{s mod 60:02}"
+proc fmtTime*(t: float, millis = false): string =
+  ## HH:MM:SS, or HH:MM:SS.mmm with millis.
+  let ms = max(0, int(t * 1000))
+  let s = ms div 1000
+  result = &"{s div 3600:02}:{(s mod 3600) div 60:02}:{s mod 60:02}"
+  if millis: result.add &".{ms mod 1000:03}"
