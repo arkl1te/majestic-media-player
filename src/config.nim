@@ -53,6 +53,7 @@ type
     openMode*: OpenMode = omSamePlayer
     osdTimestamp*: bool = false
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
+    showRemaining*: bool = false   # status/OSD time as -remaining / duration
     autoFitWindow*: bool = true
     rememberTime*: bool = false
     rememberWindowPos*: bool = false

@@ -1,5 +1,5 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..1b33c2c 100644
+index 5b29e3c..0872a09 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -814,8 +814,11 @@ proc newWindow*(
@@ -41,7 +41,24 @@ index 5b29e3c..1b33c2c 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -1128,12 +1138,14 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1065,13 @@ proc pollEvents(window: Window) =
+ 
+     of xeButtonPress, xeButtonRelease:
+ 
++      # X11 sends a press and a release per wheel notch: count the press
++      # only, and add up the notches that arrive within one poll.
+       template pushScrollEvent(delta: Vec2) =
+-        window.perFrame.scrollDelta = delta
+-        if window.onScroll != nil:
+-          window.onScroll()
++        if ev.kind == xeButtonPress:
++          window.perFrame.scrollDelta += delta
++          if window.onScroll != nil:
++            window.onScroll()
+ 
+       let
+         now = getTime()
+@@ -1128,12 +1141,14 @@ proc pollEvents(window: Window) =
            # Parse URI list (files separated by newlines).
            let uriList = prop.data
            for line in uriList.splitLines():
@@ -62,7 +79,7 @@ index 5b29e3c..1b33c2c 100644
  
          # Clean up the property.
          window.handle.delProperty(xaWindyXdndTargetProperty)
-@@ -1224,8 +1236,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1239,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -73,7 +90,7 @@ index 5b29e3c..1b33c2c 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1348,8 +1360,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1363,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64

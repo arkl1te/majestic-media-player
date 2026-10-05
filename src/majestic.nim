@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo
 
 const
   AppName = "Majestic Media Player"
@@ -115,7 +115,10 @@ type
     syncMembers: seq[int]     ## the group, master included
     syncQuiet: bool           ## acting on a peer's command (or on our own EOF):
                               ## don't repeat it to the group
-    props: seq[(string, string)]
+    props: seq[InfoSection]   ## File > Properties report
+    propScroll: float32
+    propPageH: float32        ## height of its scrolling body, for Page Up / Down
+    propThumbFrom: (float32, float32)    ## pointer y and scroll when the thumb drag began
     dialog: Dialog
     children: seq[Process]
     fullscreen: bool
@@ -971,37 +974,23 @@ proc pollDialog(a: App) =
 # --- properties -------------------------------------------------------------
 
 proc gatherProperties(a: App) =
+  ## MediaInfo-style report, plus how this player is decoding the file.
   let h = a.player.h
-  var p: seq[(string, string)]
+  a.props = gatherMediaInfo(h, a.player.path)
+  a.propScroll = 0
+  var p = InfoSection(title: "Playback")
   template add(k, v: string) =
-    if v.len > 0: p.add (k, v)
-  add "File", a.player.path.extractFilename
-  add "Location", a.player.path.parentDir
-  let size = h.getInt("file-size", -1)
-  if size >= 0: add "Size", formatSize(size, includeSpace = true)
-  add "Container", h.getStr("file-format")
-  if a.player.duration > 0: add "Duration", fmtTime(a.player.duration)
-  add "Title", h.getStr("media-title")
+    if v.len > 0: p.rows.add (k, v)
   if a.player.hasVideo:
-    add "Video codec", h.getStr("video-format")
-    add "Resolution", &"{h.getInt(\"width\")} x {h.getInt(\"height\")}"
-    add "Display size", &"{a.player.videoW} x {a.player.videoH}"
-    let fps = h.getFloat("container-fps")
-    if fps > 0: add "Frame rate", &"{fps:.3f} fps"
+    add "Video decoder", h.getStr("video-codec")
     add "Hardware decoding", h.getStr("hwdec-current")
-  add "Audio codec", h.getStr("audio-codec-name")
-  let sr = h.getInt("audio-params/samplerate")
-  if sr > 0: add "Sample rate", &"{sr} Hz"
-  if a.player.audioChannels > 0: add "Channels", $a.player.audioChannels
-  var counts: array[3, int]
-  for t in a.player.tracks:
-    case t.kind
-    of "video": inc counts[0]
-    of "audio": inc counts[1]
-    of "sub": inc counts[2]
-  add "Tracks", &"{counts[0]} video, {counts[1]} audio, {counts[2]} subtitle"
-  if a.player.chapters.len > 0: add "Chapters", $a.player.chapters.len
-  a.props = p
+    add "Decoded pixel format", h.getStr("video-params/pixelformat")
+    add "Display size", &"{a.player.videoW} x {a.player.videoH}"
+    add "Video output", h.getStr("current-vo")
+  add "Audio decoder", h.getStr("audio-codec")
+  add "Audio output", h.getStr("current-ao")
+  add "Audio device", h.getStr("audio-device")
+  if p.rows.len > 0: a.props.add p
 
 # --- settings -----------------------------------------------------------------
 
@@ -1017,11 +1006,15 @@ proc applyOsd(a: App) =
   ## Level 3 adds the time / duration status line to the OSD.
   a.player.h.setProp("osd-level",
     if not a.cfg.showOsd: "0" elif a.cfg.osdTimestamp: "3" else: "1")
+  # Empty osd-msg3 is mpv's built-in elapsed-time line.
+  let f = if a.cfg.showMillis: "/full" else: ""
+  a.player.h.setProp("osd-msg3", if not a.cfg.showRemaining: "" else:
+    "${osd-sym-cc} -${time-remaining" & f & "} / ${duration" & f & "} (${percent-pos}%)")
 
 proc syncSettings(a: App) =
   ## Pushes the player-facing options to mpv (and the title) when they change.
   let c = a.cfg
-  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
+  let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.showRemaining}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
     &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}"
   if key == a.settingsKey: return
   a.settingsKey = key
@@ -1505,6 +1498,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     timeCtx.check("Enable milliseconds", checked = a.cfg.showMillis, action = proc () =
       a.cfg.showMillis = not a.cfg.showMillis
       a.cfg.save())
+    timeCtx.check("Show remaining time", checked = a.cfg.showRemaining, action = proc () =
+      a.cfg.showRemaining = not a.cfg.showRemaining
+      a.cfg.save())
     (root, timeCtx)
   of cmSeekBar:
     # Adds at the time clicked; removes or renames the bookmark clicked on.
@@ -1666,6 +1662,16 @@ proc handleKeys(a: App) =
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
     return
+  if a.overlay == ovProperties:
+    # The report scrolls from the keyboard too; propertiesOverlay clamps.
+    const RowH = 21'f32
+    let page = max(RowH, a.propPageH - RowH * 2)
+    if pressed[KeyDown]: a.propScroll += RowH
+    elif pressed[KeyUp]: a.propScroll -= RowH
+    elif pressed[KeyPageDown] or pressed[KeySpace]: a.propScroll += page
+    elif pressed[KeyPageUp]: a.propScroll -= page
+    elif pressed[KeyHome]: a.propScroll = 0
+    elif pressed[KeyEnd]: a.propScroll = float32.high
   if a.overlay != ovNone: return
 
   # Alt+Enter must be checked before anything grabs Enter.
@@ -2130,13 +2136,18 @@ proc status(a: App, r: Rect) =
     else: "No sound"
   ui.tip(rect(ix - iw / 2, r.y, iw, r.h), audioTip)
   let ms = a.cfg.showMillis
-  var timeText = fmtTime(if a.seekDragging: a.seekDragT else: p.timePos, ms) & " / " &
-    fmtTime(p.duration, ms)
+  let pos = if a.seekDragging: a.seekDragT else: p.timePos
+  var timeText =
+    (if a.cfg.showRemaining: "-" & fmtTime(max(0.0, p.duration - pos), ms) else: fmtTime(pos, ms)) &
+    " / " & fmtTime(p.duration, ms)
   if p.loaded and abs(p.speed - 1) > 0.001:
     timeText = &"{p.speed:g}x   " & timeText
   let tw = ui.textSize(timeText, FontSmall).x
   let timeRect = rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h)
   ui.textIn(timeText, timeRect, colText, FontSmall)
+  if ui.hover(timeRect) and ui.released():
+    a.cfg.showRemaining = not a.cfg.showRemaining
+    a.cfg.save()
   if ui.hover(timeRect) and ui.released(MouseRight):
     a.ctxMenu = cmTime
     a.menus.openContext(ui.mouse)
@@ -2338,8 +2349,7 @@ proc runLogPanel(a: App, r: Rect) =
   let contentH = rows.len.float32 * rowH + 2 * pad
   let maxScroll = max(0'f32, contentH - list.h)
   if ui.hover(list) and ui.scroll() != 0:
-    # Windy reports ±10 per wheel notch on X11; count notches by direction.
-    a.rlScroll += sgn(ui.scroll()).float32 * rowH * RunLogWheelRows
+    a.rlScroll += ui.wheelNotches * rowH * RunLogWheelRows
     a.rlScroll = clamp(a.rlScroll, 0, maxScroll)
     a.rlFollow = a.rlScroll >= maxScroll
     ui.scrollConsumed = true
@@ -2606,13 +2616,76 @@ proc renderPick(a: App, shot: string) =
     a.execute(d.cmd, picks)
 
 proc propertiesOverlay(a: App) =
+  ## Scrollable sections, two columns: field name and value.
+  const
+    RowH = 21'f32
+    HeadH = 34'f32
+    KeyW = 260'f32
+    Pad = 24'f32
   let ui = a.ui
-  let r = a.overlayFrame("Properties", vec2(560, 90 + a.props.len.float32 * 26))
-  var y = r.y + 64
-  for (k, v) in a.props:
-    ui.textIn(k, rect(r.x + 24, y, 150, 24), colTextDim)
-    ui.textIn(ui.ellipsize(v, r.w - 210), rect(r.x + 180, y, r.w - 200, 24), colText)
-    y += 26
+  var contentH = 0'f32
+  for s in a.props: contentH += HeadH + s.rows.len.float32 * RowH
+  let size = vec2(min(900'f32, ui.size.x - 40),
+    min(64 + contentH + 8 + 56, ui.size.y - 40))
+  let r = a.overlayFrame("Properties", size)
+  let body = rect(r.x + 1, r.y + 52, r.w - 2, r.h - 52 - 51)
+  a.propPageH = body.h
+  let maxScroll = max(0'f32, contentH + 8 - body.h)
+  if ui.hover(body) and ui.scroll() != 0:
+    a.propScroll += ui.wheelNotches * RowH * RunLogWheelRows
+    ui.scrollConsumed = true
+  a.propScroll = clamp(a.propScroll, 0, maxScroll)
+
+  # Scroll bar: drag the thumb, or click the track to jump there.
+  let track = rect(r.x + r.w - RunLogBarW - 4, body.y + 2, RunLogBarW, max(0'f32, body.h - 4))
+  if maxScroll > 0 and track.h > 0:
+    let thumbH = max(24'f32, track.h * body.h / (contentH + 8)).min(track.h)
+    let span = track.h - thumbH
+    var thumb = rect(track.x, track.y + span * a.propScroll / maxScroll, track.w, thumbH)
+    if ui.hover(track) and ui.pressed():
+      ui.consumeClick()
+      if not ui.hover(thumb):
+        # Center the thumb on the pointer, then keep dragging from there.
+        a.propScroll = clamp((ui.mouse.y - track.y - thumbH / 2) / span * maxScroll, 0, maxScroll)
+      ui.activeId = "propscroll"
+      a.propThumbFrom = (ui.mouse.y, a.propScroll)
+    if ui.activeId == "propscroll" and span > 0:
+      let (y0, s0) = a.propThumbFrom
+      a.propScroll = clamp(s0 + (ui.mouse.y - y0) / span * maxScroll, 0, maxScroll)
+    thumb.y = track.y + span * a.propScroll / maxScroll
+    ui.rect(track, colTrack)
+    ui.rect(thumb, if ui.activeId == "propscroll": colAccent
+      elif ui.hover(thumb): colTextDim else: colTextDisabled)
+
+  ui.sk.pushClipRect(body)
+  let outerClip = ui.hitClip
+  ui.hitClip = body
+  let x = r.x + Pad
+  let valW = r.w - Pad * 2 - KeyW - 12 - RunLogBarW
+  var y = body.y + 4 - a.propScroll
+  for s in a.props:
+    if y + HeadH > body.y and y < body.y + body.h:
+      ui.textIn(s.title, rect(x, y + 4, r.w - Pad * 2, 24), colAccent)
+      ui.rect(rect(x, y + 29, r.w - Pad * 2, 1), colBorder)
+    y += HeadH
+    for (k, v) in s.rows:
+      if y + RowH > body.y and y < body.y + body.h:
+        ui.textIn(ui.ellipsize(k, KeyW - 8, FontSmall), rect(x, y, KeyW, RowH), colTextDim, FontSmall)
+        let shown = ui.ellipsize(v, valW, FontSmall)
+        let vr = rect(x + KeyW, y, valW, RowH)
+        ui.textIn(shown, vr, colText, FontSmall)
+        if shown != v: ui.tip(vr, v)
+      y += RowH
+  ui.hitClip = outerClip
+  ui.sk.popClipRect()
+  ui.rect(rect(r.x + 1, r.y + r.h - 50, r.w - 2, 1), colBorder)
+  let by = r.y + r.h - 40
+  if ui.textButton("prop-copy", rect(r.x + Pad, by, 150, 30), "Copy to Clipboard"):
+    setClipboardString(a.props.toText)
+    a.osd("Properties copied")
+  if ui.textButton("prop-close", rect(r.x + r.w - 116, by, 92, 30), "Close", primary = true):
+    a.overlay = ovNone
+  ui.drawTooltip()
 
 type ShortcutGroup = tuple[title: string, rows: seq[(string, string)]]
 

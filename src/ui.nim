@@ -89,6 +89,11 @@ proc consumeClick*(ui: Ui) = ui.clickConsumed = true
 proc scroll*(ui: Ui): float32 =
   if ui.scrollConsumed: 0'f32 else: ui.window.scrollDelta.y
 
+proc wheelNotches*(ui: Ui): float32 =
+  ## Wheel notches this frame, + = down. Windy reports ±10 per notch on X11
+  ## (added up when several arrive within one poll).
+  ui.scroll() / 10
+
 proc shiftDown(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
 
 # --- keyboard focus ----------------------------------------------------------
