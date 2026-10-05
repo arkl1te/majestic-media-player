@@ -21,6 +21,9 @@ type
     hitClip*: Rect           ## when w > 0, the mouse only hits widgets inside it
     focusId*: string         ## text field owning the keyboard
     caret*: int              ## byte offset of the caret in the focused field
+    selAnchor*: int          ## other end of the focused field's selection (== caret: none)
+    dragFrom*: int           ## text field press: byte offset under the press
+    dragX*: float32          ## text field press: where it happened
     fieldScroll*: float32    ## horizontal scroll of the focused field's text
     editText*: string        ## numberField: text being typed
     typed*: string           ## text typed since the previous frame
@@ -307,16 +310,25 @@ proc nextRune(s: string, i: int): int =
 
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
                 placeholder = ""): set[EditEvent] =
-  ## Single-line text input. Click to focus; Enter, Tab, Escape or a click
-  ## elsewhere ends editing (eeCommitted).
+  ## Single-line text input. Focusing it (click or Tab) selects all of its
+  ## text; Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
+  ## Dragging or Shift+click/arrows select, Ctrl+A/C/X/V work on the selection.
   let w = ui.window
   let hov = ui.hover(r)
   let pad = 7'f32
+  proc hitIndex(text: string, x: float32): int =
+    ## Character boundary nearest to window x.
+    let x = x - r.x - pad + ui.fieldScroll
+    while result < text.len:
+      let j = nextRune(text, result)
+      let mid = (ui.textSize(text[0 ..< result]).x + ui.textSize(text[0 ..< j]).x) / 2
+      if x < mid: break
+      result = j
   discard ui.tabStop(id, r, edit = true)
   if ui.focusId == id and ui.focusFresh:
-    # Focused with Tab: edit from the end of the text.
     ui.focusFresh = false
     ui.fieldScroll = 0
+    ui.selAnchor = 0
     ui.caret = text.len
     result.incl eeFocused
   if ui.focusId == id and w.buttonPressed[MouseLeft] and not hov:
@@ -325,44 +337,81 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
   if hov and ui.pressed():
     ui.consumeClick()
     ui.navId = id
+    ui.activeId = id
+    ui.dragFrom = hitIndex(text, ui.mouse.x)
+    ui.dragX = ui.mouse.x
     if ui.focusId != id:
       ui.focusId = id
       ui.fieldScroll = 0
+      ui.selAnchor = 0
+      ui.caret = text.len
       result.incl eeFocused
-    # Caret at the character boundary nearest to the click.
-    let x = ui.mouse.x - r.x - pad + ui.fieldScroll
-    var i = 0
-    while i < text.len:
-      let j = nextRune(text, i)
-      let mid = (ui.textSize(text[0 ..< i]).x + ui.textSize(text[0 ..< j]).x) / 2
-      if x < mid: break
-      i = j
-    ui.caret = i
+    elif w.buttonPressed[DoubleClick]:
+      ui.selAnchor = 0
+      ui.caret = text.len
+    else:
+      if not w.shiftDown: ui.selAnchor = ui.dragFrom
+      ui.caret = ui.dragFrom
   let focused = ui.focusId == id
+  if focused and ui.activeId == id and ui.down() and abs(ui.mouse.x - ui.dragX) > 3:
+    # Dragging selects from the press, even the one that focused the field.
+    ui.selAnchor = ui.dragFrom
+    ui.caret = hitIndex(text, ui.mouse.x)
   if focused:
     ui.caret = clamp(ui.caret, 0, text.len)
+    ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let shift = w.shiftDown
+    let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    proc deleteSelection(text: var string) =
+      text.delete(s0 ..< s1)
+      ui.caret = s0
+      ui.selAnchor = s0
+    if ctrl and w.buttonPressed[KeyA]:
+      ui.selAnchor = 0
+      ui.caret = text.len
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+      setClipboardString(text[s0 ..< s1])
+      if w.buttonPressed[KeyX]:
+        deleteSelection(text)
+        result.incl eeChanged
     var ins = ""
     for ch in ui.typed:  # drop control characters such as Tab
       if ch.ord >= 0x20 and ch.ord != 0x7f: ins.add ch
     if ctrl and w.buttonPressed[KeyV]:
       ins.add getClipboardString().multiReplace(("\r", ""), ("\n", " "))
     if ins.len > 0:
+      if ui.caret != ui.selAnchor: deleteSelection(text)
       text.insert(ins, ui.caret)
       ui.caret += ins.len
+      ui.selAnchor = ui.caret
       result.incl eeChanged
-    if w.buttonPressed[KeyBackspace] and ui.caret > 0:
+    if (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
+       ui.caret != ui.selAnchor:
+      deleteSelection(text)
+      result.incl eeChanged
+    elif w.buttonPressed[KeyBackspace] and ui.caret > 0:
       let a = if ctrl: 0 else: prevRune(text, ui.caret)
       text.delete(a ..< ui.caret)
       ui.caret = a
+      ui.selAnchor = a
       result.incl eeChanged
-    if w.buttonPressed[KeyDelete] and ui.caret < text.len:
+    elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
       text.delete(ui.caret ..< nextRune(text, ui.caret))
       result.incl eeChanged
-    if w.buttonPressed[KeyLeft]: ui.caret = prevRune(text, ui.caret)
-    if w.buttonPressed[KeyRight]: ui.caret = nextRune(text, ui.caret)
-    if w.buttonPressed[KeyHome]: ui.caret = 0
-    if w.buttonPressed[KeyEnd]: ui.caret = text.len
+    # Arrows, Home and End move the caret; with Shift they extend the
+    # selection, without it a selection collapses to the side moved toward.
+    var move = -1
+    let (lo, hi) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    if w.buttonPressed[KeyLeft]:
+      move = if shift or lo == hi: prevRune(text, ui.caret) else: lo
+    if w.buttonPressed[KeyRight]:
+      move = if shift or lo == hi: nextRune(text, ui.caret) else: hi
+    if w.buttonPressed[KeyHome]: move = 0
+    if w.buttonPressed[KeyEnd]: move = text.len
+    if move >= 0:
+      ui.caret = move
+      if not shift: ui.selAnchor = move
     if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or
        w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
       ui.focusId = ""
@@ -375,6 +424,10 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     let cx = ui.textSize(text[0 ..< ui.caret]).x
     if cx - ui.fieldScroll > inner.w - 2: ui.fieldScroll = cx - inner.w + 2
     if cx - ui.fieldScroll < 0: ui.fieldScroll = cx
+    if ui.selAnchor != ui.caret:
+      let ax = ui.textSize(text[0 ..< ui.selAnchor]).x
+      ui.rect(rect(inner.x + min(ax, cx) - ui.fieldScroll, r.y + 4, abs(ax - cx), r.h - 8),
+        colAccentDim)
     ui.textIn(text, rect(inner.x - ui.fieldScroll, r.y, inner.w + ui.fieldScroll + 4000, r.h), colText)
     ui.rect(rect(inner.x + cx - ui.fieldScroll, r.y + 5, 1, r.h - 10), colAccent)
   elif text.len > 0:
@@ -398,6 +451,7 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
   let ev = ui.textField(fid, fr, buf)
   if eeFocused in ev:
     buf = fmt(value)
+    ui.selAnchor = 0
     ui.caret = buf.len
   # Up/Down step the value while typing in it, keeping the field focused.
   var keyDelta = 0.0
@@ -442,6 +496,7 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
       result = true
     if keyDelta != 0:
       ui.editText = fmt(value)
+      ui.selAnchor = 0
       ui.caret = ui.editText.len
     elif ui.focusId == fid: ui.focusId = ""
 

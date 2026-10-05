@@ -7,7 +7,7 @@
         1. Open File (Ctrl+O)
         2. Open Recent
         3. Open Directory
-        4. Close (Ctrl+C)
+        4. Close (Ctrl+X)
         5. (separator)
         6. Save screenshot (Alt+I)
         7. (separator)

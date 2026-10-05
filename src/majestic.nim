@@ -1,10 +1,11 @@
 ## Majestic Media Player — an mpv-based video player with a Silky UI.
 
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
-  random, tables]
+  random, tables, streams]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo
+from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
   AppName = "Majestic Media Player"
@@ -28,7 +29,7 @@ type
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick
 
   ContextMenu = enum
-    cmVideo, cmTime, cmSeekBar, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
+    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
 
   PlaylistSort = enum
     psName, psDuration, psDimensions, psSize
@@ -365,6 +366,62 @@ proc closeFile(a: App) =
   a.plIndex = -1
   a.plSelected = -1
   a.updateTitle()
+
+proc onWayland(): bool =
+  getEnv("WAYLAND_DISPLAY").len > 0 and findExe("wl-copy").len > 0 and
+    findExe("wl-paste").len > 0
+
+proc fileUri(path: string): string =
+  result = "file://"
+  for part in path.absolutePath.split('/'):
+    if part.len > 0: result.add "/" & encodeUrl(part, usePlus = false)
+
+proc copyToClipboard(a: App) =
+  ## The opened file goes on the clipboard as a file (text/uri-list), so a
+  ## file manager pastes the file itself; streams go as their URL.
+  let path = a.player.path
+  if not a.player.loaded or path.len == 0: return
+  if path.contains("://") or not onWayland():
+    setClipboardString(path)
+  else:
+    try:
+      let p = startProcess("wl-copy", args = @["--type", "text/uri-list"],
+        options = {poUsePath})
+      p.inputStream.write(path.fileUri & "\r\n")
+      p.inputStream.close()
+      discard p.waitForExit(2000)
+      p.close()
+    except OSError:
+      setClipboardString(path)
+  a.osd("Copied " & path.extractFilename)
+
+proc clipboardPaths(): seq[string] =
+  ## Files and URLs on the clipboard: a file manager's text/uri-list, or
+  ## plain text holding paths or URLs, one per line.
+  var text = ""
+  if onWayland():
+    # Listing types never asks the owner for data, so this cannot stall on
+    # our own X selection; only a uri-list (never ours) is then fetched.
+    let (types, code) = execCmdEx("wl-paste --list-types")
+    if code == 0 and "text/uri-list" in types.splitLines:
+      let (uris, code2) = execCmdEx("wl-paste --no-newline --type text/uri-list")
+      if code2 == 0: text = uris
+  if text.len == 0: text = getClipboardString()
+  for line in text.splitLines:
+    let e = strutils.strip(line, chars = Whitespace + {'"', '\''})
+    if e.len == 0 or e.startsWith("#"): continue
+    if e.toLowerAscii.startsWith("file://"):
+      result.add decodeUrl(e.parseUri.path, false)
+    elif e.contains("://"): result.add e
+    else: result.add e.expandTilde
+
+proc openFromClipboard(a: App) =
+  if a.editLocked: return
+  let paths = clipboardPaths()
+  if paths.len == 0:
+    a.osd("Clipboard has no file to open")
+    return
+  a.openPaths(paths)
 
 proc reopenLast(a: App): bool =
   ## With nothing loaded, Play starts the selected playlist entry, or else
@@ -1244,7 +1301,11 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     recent.item("Clear List", action = proc () = a.cfg.recentFiles.setLen 0)
   file.item("Open Directory...", enabled = not locked, action = proc () =
     a.ask(dkOpenDir, "opendir", "Open Directory"))
-  file.item("Close", "Ctrl+C", enabled = loaded and not locked, action = proc () = a.closeFile())
+  file.item("Open From Clipboard", "Ctrl+V", enabled = not locked,
+    action = proc () = a.openFromClipboard())
+  file.item("Copy to Clipboard", "Ctrl+C", enabled = loaded,
+    action = proc () = a.copyToClipboard())
+  file.item("Close", "Ctrl+X", enabled = loaded and not locked, action = proc () = a.closeFile())
   file.sep()
   file.item("Save Screenshot...", "Alt+I", enabled = loaded and p.hasVideo,
     action = proc () = a.screenshot())
@@ -1502,6 +1563,12 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.showRemaining = not a.cfg.showRemaining
       a.cfg.save())
     (root, timeCtx)
+  of cmStatus:
+    let st = newMenuRoot()
+    st.check("Show all shortcuts", checked = a.cfg.showAllShortcuts, action = proc () =
+      a.cfg.showAllShortcuts = not a.cfg.showAllShortcuts
+      a.cfg.save())
+    (root, st)
   of cmSeekBar:
     # Adds at the time clicked; removes or renames the bookmark clicked on.
     let sb = newMenuRoot()
@@ -1684,7 +1751,9 @@ proc handleKeys(a: App) =
       a.ask(dkOpenFile, "subtitle", "Load Subtitle", exts = @SubtitleExtensions,
         filterName = "Subtitles")
   elif c and pressed[KeyO]: a.openFileDialog()
-  elif c and pressed[KeyC]: a.closeFile()
+  elif c and pressed[KeyX]: a.closeFile()
+  elif c and pressed[KeyC]: a.copyToClipboard()
+  elif c and pressed[KeyV]: a.openFromClipboard()
   elif al and pressed[KeyI]: a.screenshot()
   elif al and pressed[KeyX]: w.closeRequested = true
   elif none and pressed[KeyO]: a.showOverlay(ovOptions)
@@ -2025,28 +2094,32 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   if a.fakeMods.len > 0:
     (c, s, al) = ("ctrl" in a.fakeMods, "shift" in a.fakeMods, "alt" in a.fakeMods)
   let rot = &"{a.cfg.rotateStep:g}°"
+  # View toggles and grab/rotate/scale only show with "Show all shortcuts".
+  let all = a.cfg.showAllShortcuts
   if c and s and not al:
-    @[@[("O", "Load Subtitle")]]
+    result = @[@[("O", "Load Subtitle")]]
   elif c and not s and not al:
-    @[@[("←", "Previous Chapter"), ("→", "Next Chapter")],
+    result = @[@[("←", "Previous Chapter"), ("→", "Next Chapter")],
       @[("M", "Mute")],
-      @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
-        ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")],
-      @[("O", "Open File"), ("C", "Close")],
-      @[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist"), ("5", "Run Log")]]
+      @[("O", "Open File"), ("V", "Open From Clipboard"), ("C", "Copy to Clipboard"),
+        ("X", "Close")]]
+    if all:
+      result.add @[@[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist"),
+        ("5", "Run Log")],
+        @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
+          ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")]]
   elif al and not c and not s:
-    @[@[("Enter", "Fullscreen")],
-      @[("I", "Screenshot")],
-      @[("Num4", "Rotate " & rot & " CCW"), ("Num5", "Reset Rotation"),
-        ("Num6", "Rotate " & rot & " CW")],
-      @[("X", "Exit")]]
+    result = @[@[("Enter", "Fullscreen")], @[("I", "Screenshot")]]
+    if all:
+      result.add @[("Num4", "Rotate " & rot & " CCW"), ("Num5", "Reset Rotation"),
+        ("Num6", "Rotate " & rot & " CW")]
+    result.add @[("X", "Exit")]
   elif s and not c and not al:
-    @[@[(",", "Slower Playback"), (".", "Faster Playback")],
+    result = @[@[(",", "Slower Playback"), (".", "Faster Playback")],
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
       @[("Num1-9", "Align Subtitles"), ("Arrows", "Move Subtitles"),
         ("Num+", "Bigger Subtitles"), ("Num-", "Smaller Subtitles")],
       @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]]
-  else: @[]
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
@@ -2104,6 +2177,9 @@ proc status(a: App, r: Rect) =
     let hints = a.modifierHints()
     if hints.len > 0:
       a.keyHintBar(r, hints)
+      if ui.hover(r) and ui.released(MouseRight):
+        a.ctxMenu = cmStatus
+        a.menus.openContext(ui.mouse)
       return
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
@@ -2150,6 +2226,9 @@ proc status(a: App, r: Rect) =
     a.cfg.save()
   if ui.hover(timeRect) and ui.released(MouseRight):
     a.ctxMenu = cmTime
+    a.menus.openContext(ui.mouse)
+  elif ui.hover(r) and ui.released(MouseRight):
+    a.ctxMenu = cmStatus
     a.menus.openContext(ui.mouse)
 
 proc fmtSize(bytes: int64): string =
@@ -2692,7 +2771,8 @@ type ShortcutGroup = tuple[title: string, rows: seq[(string, string)]]
 const shortcutColumns: array[2, seq[ShortcutGroup]] = [
   @[
     ("File", @[
-      ("Open file", "Ctrl+O"), ("Load subtitle file", "Ctrl+Shift+O"), ("Close", "Ctrl+C"),
+      ("Open file", "Ctrl+O"), ("Load subtitle file", "Ctrl+Shift+O"),
+      ("Open from clipboard", "Ctrl+V"), ("Copy to clipboard", "Ctrl+C"), ("Close", "Ctrl+X"),
       ("Save screenshot", "Alt+I"), ("Exit", "Alt+X")]),
     ("Playback", @[
       ("Play / Pause", "Space"), ("Frame forward / back", ". / ,"),

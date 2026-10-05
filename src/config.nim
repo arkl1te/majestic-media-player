@@ -54,6 +54,7 @@ type
     osdTimestamp*: bool = false
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
+    showAllShortcuts*: bool = false  # status bar hints include view toggles and grab/rotate/scale
     autoFitWindow*: bool = true
     rememberTime*: bool = false
     rememberWindowPos*: bool = false
