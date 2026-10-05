@@ -185,6 +185,9 @@ proc hint(ui: Ui, p: var Pane, s: string) =
 # --- pages ----------------------------------------------------------------------
 
 proc playerPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Interface")
+  ui.numberRow(p, "o-scale", "UI scaling (percent)", c.uiScale, 25, 50, 300)
+  ui.hint(p, "Size of text, menus and controls in every window.")
   ui.group(p, "Open options")
   ui.radioRow(p, "o-same", "Same player for each media file", c.openMode, omSamePlayer)
   ui.radioRow(p, "o-new", "New player for each media file", c.openMode, omNewPlayer)
@@ -199,9 +202,6 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
   ui.checkRow(p, "o-millis", "Show milliseconds", c.showMillis)
   ui.checkRow(p, "o-remain", "Show remaining time", c.showRemaining)
-  ui.group(p, "Seekbar")
-  ui.checkRow(p, "o-bmch", "Bookmarks as chapters", c.bookmarksAsChapters)
-  ui.hint(p, "Next/previous chapter also stops at bookmarks.")
   ui.group(p, "Title bar")
   ui.radioRow(p, "o-tname", "File name only", c.titleFullPath, false)
   ui.radioRow(p, "o-tpath", "Display full path", c.titleFullPath, true)
@@ -324,19 +324,24 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
   p.y += 18
 
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
-  ui.group(p, "Steps")
-  ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
-  ui.numberRow(p, "o-jump", "Jump (seconds)", c.seekStep, 1, 1, 600)
-  ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
+  ui.group(p, "Display")
+  ui.checkRow(p, "o-awake", "Keep the monitor on while playing video", c.keepDisplayOn)
+  ui.hint(p, "Stops the system from blanking or turning off the screen during video playback.")
+  ui.group(p, "Track preference")
+  ui.textRow(p, "o-slang", "Subtitles", c.subLangs, "e.g. eng, jpn")
+  ui.textRow(p, "o-alang", "Audio", c.audioLangs, "e.g. jpn, eng")
+  ui.hint(p, "Language codes in order of preference; the first matching track is picked on open.")
   ui.group(p, "Seek bar")
   ui.checkRow(p, "o-prev", "Show thumbnail preview on hover", c.seekPreview)
   ui.checkRow(p, "o-snap", "Hold Shift to snap to chapters", c.snapWithShift)
   ui.hint(p, if c.snapWithShift: "Seeking snaps to chapters only while Shift is held."
              else: "Seeking snaps to chapters; hold Shift to seek freely.")
-  ui.group(p, "Track preference")
-  ui.textRow(p, "o-slang", "Subtitles", c.subLangs, "e.g. eng, jpn")
-  ui.textRow(p, "o-alang", "Audio", c.audioLangs, "e.g. jpn, eng")
-  ui.hint(p, "Language codes in order of preference; the first matching track is picked on open.")
+  ui.checkRow(p, "o-bmch", "Bookmarks as chapters", c.bookmarksAsChapters)
+  ui.hint(p, "Next/previous chapter also stops at bookmarks.")
+  ui.group(p, "Steps")
+  ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
+  ui.numberRow(p, "o-jump", "Jump (seconds)", c.seekStep, 1, 1, 600)
+  ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
 
 proc subtitlesPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Subtitles")

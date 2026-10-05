@@ -100,6 +100,7 @@ proc mpv_command_string*(ctx: MpvHandle, args: cstring): cint
 proc mpv_command_async*(ctx: MpvHandle, replyUserdata: uint64, args: ptr cstring): cint
 proc mpv_set_property*(ctx: MpvHandle, name: cstring, format: MpvFormat, data: pointer): cint
 proc mpv_set_property_string*(ctx: MpvHandle, name, data: cstring): cint
+proc mpv_set_property_async*(ctx: MpvHandle, replyUserdata: uint64, name: cstring, format: MpvFormat, data: pointer): cint
 proc mpv_get_property*(ctx: MpvHandle, name: cstring, format: MpvFormat, data: pointer): cint
 proc mpv_get_property_string*(ctx: MpvHandle, name: cstring): cstring
 proc mpv_observe_property*(ctx: MpvHandle, replyUserdata: uint64, name: cstring, format: MpvFormat): cint
@@ -143,16 +144,22 @@ proc commandAsync*(h: MpvHandle, args: varargs[string]) =
 proc setOpt*(h: MpvHandle, name, value: string) =
   check mpv_set_option_string(h, name, value), "option " & name
 
+# Setters are asynchronous: the app's main thread is also mpv's render thread,
+# and mpv's core can be waiting on the render thread (e.g. for a decoder's
+# frame buffers), so blocking on the core from there can deadlock. Requests
+# still run in order with each other and with later synchronous calls.
+
 proc setProp*(h: MpvHandle, name, value: string): cint {.discardable.} =
-  mpv_set_property_string(h, name, value)
+  var v = value.cstring
+  mpv_set_property_async(h, 0, name, fmtString, v.addr)
 
 proc setProp*(h: MpvHandle, name: string, value: float): cint {.discardable.} =
   var v = value.cdouble
-  mpv_set_property(h, name, fmtDouble, v.addr)
+  mpv_set_property_async(h, 0, name, fmtDouble, v.addr)
 
 proc setProp*(h: MpvHandle, name: string, value: bool): cint {.discardable.} =
   var v = cint(value)
-  mpv_set_property(h, name, fmtFlag, v.addr)
+  mpv_set_property_async(h, 0, name, fmtFlag, v.addr)
 
 proc getStr*(h: MpvHandle, name: string): string =
   let s = mpv_get_property_string(h, name)

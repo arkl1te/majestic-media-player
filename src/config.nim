@@ -1,7 +1,7 @@
 ## Persistent settings, stored at ~/.config/majestic-media-player/config.json.
 
-import std/[os, strutils, tables]
-import jsony
+import std/[os, strutils, tables, sequtils, math, algorithm]
+import jsony, crunchy/sha256
 
 type
   FrameMode* = enum
@@ -41,6 +41,7 @@ type
     playlistShowSize*: bool = false
     playlistShowDimensions*: bool = false
     showRunLog*: bool = false
+    seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
     showOsd*: bool = true
     frameMode*: FrameMode = fmTouchInside
@@ -50,6 +51,7 @@ type
     repeatForever*: bool = false
     repeatMode*: RepeatMode = rmPlaylist
     # Options > Player
+    uiScale*: float = 100          # percent
     openMode*: OpenMode = omSamePlayer
     osdTimestamp*: bool = false
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
@@ -65,6 +67,7 @@ type
     titleFullPath*: bool = false
     titleUseMediaTitle*: bool = false
     # Options > Playback
+    keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
     seekStep*: float = 5           # seconds
     volumeStep*: float = 5
@@ -164,7 +167,15 @@ type
     time: float
     name: string
 
-  Bookmarks* = OrderedTable[string, seq[Bookmark]]  ## path -> sorted by time
+  BookmarkEntry* = object
+    path*: string                 ## where the file was last seen, for people
+    marks*: seq[Bookmark]         ## sorted by time
+
+  BookmarkEntryJson = object
+    path: string
+    marks: seq[Bookmark]
+
+  Bookmarks* = OrderedTable[string, BookmarkEntry]  ## mediaKey -> entry
 
 proc parseHook*(s: string, i: var int, v: var Bookmark) =
   ## Objects, or the bare times that older versions wrote.
@@ -177,8 +188,113 @@ proc parseHook*(s: string, i: var int, v: var Bookmark) =
     v = Bookmark()
     parseHook(s, i, v.time)
 
+proc parseHook*(s: string, i: var int, v: var BookmarkEntry) =
+  ## Entries, or the bare bookmark lists that older versions wrote (keyed by
+  ## path, so the path is filled in from the key once loaded).
+  eatSpace(s, i)
+  if i < s.len and s[i] == '{':
+    var o: BookmarkEntryJson
+    parseHook(s, i, o)
+    v = BookmarkEntry(path: o.path, marks: o.marks)
+  else:
+    v = BookmarkEntry()
+    parseHook(s, i, v.marks)
+
+proc mediaKey*(path: string): string =
+  ## Identifies a media file by its contents, so bookmarks follow it when it
+  ## is moved or renamed: its size and a SHA-256 of its first and last 64 KiB
+  ## (which mpv reads anyway, so they're usually cached). Streams and
+  ## unreadable files fall back to their path.
+  const chunk = 65536
+  if path.len == 0 or path.contains("://"): return path
+  var f: File
+  if not f.open(path): return path
+  defer: f.close()
+  try:
+    let size = f.getFileSize
+    var data = newString(min(size, 2 * chunk))
+    if size <= 2 * chunk:
+      if data.len > 0 and f.readBuffer(data[0].addr, data.len) != data.len: return path
+    else:
+      for n, pos in [0'i64, size - chunk]:
+        f.setFilePos(pos)
+        if f.readBuffer(data[n * chunk].addr, chunk) != chunk: return path
+    let digest = sha256(data)
+    result = toHex(size, 12).toLowerAscii & "-"
+    for b in digest[0 ..< 16]: result.add toHex(b, 2).toLowerAscii
+  except CatchableError:
+    result = path
+
+# mediaKey on a thread of its own: a cold file on a spinning or network disk
+# can take a few hundred ms to read.
+var keyRequests: Channel[string]
+var keyResults: Channel[(string, string)]
+var keyWorker: Thread[void]
+
+proc keyLoop() {.thread.} =
+  while true:
+    let path = keyRequests.recv()
+    keyResults.send((path, mediaKey(path)))
+
+proc requestMediaKey*(path: string) =
+  ## Works out path's mediaKey in the background; see takeMediaKey.
+  if not keyWorker.running:
+    keyRequests.open()
+    keyResults.open()
+    createThread(keyWorker, keyLoop)
+  keyRequests.send(path)
+
+proc takeMediaKey*(): tuple[ok: bool, path, key: string] =
+  ## A finished requestMediaKey, if any: the path and its key.
+  if not keyWorker.running: return
+  let (ok, r) = keyResults.tryRecv()
+  if ok: result = (true, r[0], r[1])
+
 proc label*(b: Bookmark, i: int): string =
   if b.name.len > 0: b.name else: "Bookmark " & $(i + 1)
+
+proc toSimpleChapters*(marks: seq[Bookmark]): string =
+  ## Matroska simple-chapter format (OGM style), which mkvmerge, mkvpropedit
+  ## --chapters and mpv --chapters-file read:
+  ##   CHAPTER01=00:51:32.881
+  ##   CHAPTER01NAME=Gun Kata 1
+  let digits = max(2, len($marks.len))
+  for i, b in marks:
+    let n = intToStr(i + 1, digits)
+    let ms = max(0, int(round(b.time * 1000)))
+    let s = ms div 1000
+    result.add "CHAPTER" & n & "=" & intToStr(s div 3600, 2) & ":" &
+      intToStr((s mod 3600) div 60, 2) & ":" & intToStr(s mod 60, 2) & "." &
+      intToStr(ms mod 1000, 3) & "\n"
+    result.add "CHAPTER" & n & "NAME=" & b.label(i) & "\n"
+
+proc parseSimpleChapters*(text: string): seq[Bookmark] =
+  ## Reads toSimpleChapters' format, sorted by time. Lines that aren't
+  ## chapters are skipped; names like "Bookmark 3" (the default label) come
+  ## back as unnamed. Raises ValueError when no chapter is found.
+  var byNum: OrderedTable[string, Bookmark]
+  for raw in text.splitLines:
+    let line = (if raw.startsWith("\xEF\xBB\xBF"): raw[3 .. ^1] else: raw).strip
+    let eq = line.find('=')
+    if eq < 0 or not line.toUpperAscii.startsWith("CHAPTER"): continue
+    var key = line[7 ..< eq].toUpperAscii
+    let value = line[eq + 1 .. ^1]
+    if key.endsWith("NAME"):
+      key.setLen key.len - 4
+      if key.len > 0 and key.allCharsInSet(Digits):
+        byNum.mgetOrPut(key.strip(trailing = false, chars = {'0'}), Bookmark()).name = value.strip
+    elif key.len > 0 and key.allCharsInSet(Digits):
+      let parts = value.strip.split(':')
+      if parts.len != 3: continue
+      try:
+        let t = float(parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60) + parseFloat(parts[2])
+        byNum.mgetOrPut(key.strip(trailing = false, chars = {'0'}), Bookmark()).time = t
+      except ValueError: discard
+  for k, b in byNum: result.add b
+  if result.len == 0: raise newException(ValueError, "no chapters found")
+  result.sort(proc (x, y: Bookmark): int = cmp(x.time, y.time))
+  for i, b in result.mpairs:
+    if b.name == "Bookmark " & $(i + 1): b.name = ""
 
 proc bookmarksPath(): string = configDir() / "bookmarks.json"
 
@@ -187,6 +303,8 @@ proc loadBookmarks*(): Bookmarks =
   if fileExists(path):
     try:
       result = readFile(path).fromJson(Bookmarks)
+      for k, e in result.mpairs:
+        if e.path.len == 0: e.path = k
     except CatchableError as e:
       stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
 
@@ -234,6 +352,22 @@ proc save*(cmds: seq[CommandLine]) =
     writeFile(path, cmds.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+const PresetCommandLines = staticRead("../assets/presets/commandlines.json")
+
+proc seedPresets*(c: var Config): bool =
+  ## Adds the shipped command lines the user hasn't been offered yet, each
+  ## once, so deleting one sticks. True when c changed and needs saving.
+  var cmds = loadCommandLines()
+  var added = false
+  for p in PresetCommandLines.fromJson(seq[CommandLine]):
+    if p.title in c.seededPresets: continue
+    c.seededPresets.add p.title
+    result = true
+    if not cmds.anyIt(it.title == p.title):
+      cmds.add p
+      added = true
+  if added: cmds.save()
 
 const VideoExtensions* = [
   "mkv", "mp4", "m4v", "webm", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts",

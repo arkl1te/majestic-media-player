@@ -1,0 +1,185 @@
+[
+ {
+  "title": "Create cut",
+  "parts": [
+   {
+    "text": "ffmpeg -ss ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "from",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -to ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "to",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -i ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "video",
+    "kind": "reference",
+    "content": "file"
+   },
+   {
+    "text": " -pix_fmt yuv420p -movflags +faststart ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/output.mp4"
+   },
+   {
+    "text": " ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   }
+  ]
+ },
+ {
+  "title": "Create cut (w/subtitles)",
+  "parts": [
+   {
+    "text": "t=$(mktemp -d) && ln -s ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "video",
+    "kind": "reference",
+    "content": "file"
+   },
+   {
+    "text": " \"$t/media\" && ffmpeg -ss ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "from",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -to ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "to",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -copyts -i ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "video",
+    "kind": "reference",
+    "content": "file"
+   },
+   {
+    "text": " -vf \"subtitles=$t/media,setpts=PTS-STARTPTS\" -af \"asetpts=PTS-STARTPTS\" -pix_fmt yuv420p -movflags +faststart ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/output.mp4"
+   },
+   {
+    "text": "; rm -r \"$t\"",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   }
+  ]
+ },
+ {
+  "title": "Create chapters from file",
+  "parts": [
+   {
+    "text": "mkvpropedit ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "video",
+    "kind": "reference",
+    "content": "file"
+   },
+   {
+    "text": " --chapters ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "chapters",
+    "kind": "reference",
+    "content": "external"
+   }
+  ]
+ }
+]

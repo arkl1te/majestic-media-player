@@ -45,17 +45,22 @@ type
 proc newUi*(sk: Silky, window: Window): Ui =
   Ui(sk: sk, window: window, fakeMouse: vec2(-1, -1))
 
+proc scale*(ui: Ui): float32 =
+  ## Window pixels per UI unit (Options > Player > UI scaling). Layout,
+  ## mouse and sizes here are in UI units.
+  ui.sk.uiScale
+
 proc beginFrame*(ui: Ui) =
-  ui.mouse = if ui.fakeMouse.x >= 0: ui.fakeMouse else: ui.window.mousePos.vec2
+  ui.mouse = if ui.fakeMouse.x >= 0: ui.fakeMouse else: ui.window.mousePos.vec2 / ui.scale
   # Windy only tracks the pointer from motion events, so a click without a
   # preceding motion (e.g. the first one after the window appears or gets
   # focus) would be tested against a stale position. Ask the server instead.
   if ui.fakeMouse.x < 0:
     for b in [MouseLeft, MouseRight, MouseMiddle]:
       if ui.window.buttonPressed[b] or ui.window.buttonReleased[b]:
-        ui.mouse = ui.window.pointerPos.local.vec2
+        ui.mouse = ui.window.pointerPos.local.vec2 / ui.scale
         break
-  ui.size = ui.window.size.vec2
+  ui.size = ui.window.size.vec2 / ui.scale
   ui.captured = false
   ui.clickConsumed = false
   ui.scrollConsumed = false

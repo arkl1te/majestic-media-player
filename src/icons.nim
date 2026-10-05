@@ -1,5 +1,6 @@
 ## Vector icons rasterized into the Silky atlas at startup (white; tinted when drawn).
 
+import std/math
 import pixie, silky
 
 const musicPath* = "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"
@@ -44,15 +45,18 @@ proc ringIcon(size: int): Image =
   result = newImage(size, size)
   let ctx = newContext(result)
   ctx.strokeStyle = color(1, 1, 1, 1)
-  ctx.lineWidth = 1.5
-  ctx.strokeCircle(circle(vec2(size / 2, size / 2), size / 2 - 1.5))
+  let k = size / 16
+  ctx.lineWidth = 1.5 * k
+  ctx.strokeCircle(circle(vec2(size / 2, size / 2), size / 2 - 1.5 * k))
 
-proc addIcons*(builder: AtlasBuilder) =
+proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
+  ## Names keep the nominal size; images are rasterized at size * scale.
+  proc px(size: int): int = int(round(size.float32 * scale))
   for (name, spec) in iconPaths:
     for size in [16, 20]:
-      let img = renderIcon(spec[1], spec[0], size)
+      let img = renderIcon(spec[1], spec[0], px(size))
       discard builder.addImage(name & $size, img)
-  discard builder.addImage("ring16", ringIcon(16))
+  discard builder.addImage("ring16", ringIcon(px(16)))
 
 proc appIcon*(): Image =
   ## Window icon: accent crown on a dark rounded tile.

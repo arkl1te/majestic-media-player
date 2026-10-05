@@ -69,6 +69,9 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("config", "no")
   h.setOpt("vo", "libmpv")
   h.setOpt("hwdec", "auto-safe")
+  # Direct rendering has the decoder wait on the render thread (ours) for
+  # frame buffers, so any blocking mpv call from the UI could deadlock.
+  h.setOpt("vd-lavc-dr", "no")
   h.setOpt("keep-open", "yes")
   h.setOpt("idle", "yes")
   h.setOpt("terminal", "no")
@@ -193,14 +196,14 @@ proc load*(p: Player, path: string, start = 0.0) =
   p.duration = 0
   p.loadError = ""
   if start > 0:
-    p.h.command("loadfile", path, "replace", "-1",
+    p.h.commandAsync("loadfile", path, "replace", "-1",
       "start=" & formatFloat(start, ffDecimal, 3))
   else:
-    p.h.command("loadfile", path, "replace")
+    p.h.commandAsync("loadfile", path, "replace")
   p.h.setProp("pause", false)
 
 proc close*(p: Player) =
-  p.h.command("stop")
+  p.h.commandAsync("stop")
   p.path = ""
   p.loaded = false
   p.stopped = false
@@ -282,6 +285,7 @@ proc newPreview*(): Preview =
   h.setOpt("config", "no")
   h.setOpt("vo", "libmpv")
   h.setOpt("hwdec", "auto-safe")
+  h.setOpt("vd-lavc-dr", "no")         # see newPlayer
   h.setOpt("terminal", "no")
   h.setOpt("audio", "no")
   h.setOpt("sid", "no")
@@ -309,7 +313,7 @@ proc request*(pv: Preview, path: string, t: float) =
     pv.hasFrame = false
     pv.busy = true
     pv.shown = -1
-    pv.h.command("loadfile", path, "replace", "-1",
+    pv.h.commandAsync("loadfile", path, "replace", "-1",
       "start=" & formatFloat(t, ffDecimal, 2))
   pv.wanted = t
   if not pv.busy and abs(pv.wanted - pv.shown) > 0.05:
@@ -337,7 +341,7 @@ proc pollEvents*(pv: Preview) =
 proc forget*(pv: Preview) =
   ## Drop the loaded file (e.g. when the main file is closed).
   if pv == nil or pv.path.len == 0: return
-  pv.h.command("stop")
+  pv.h.commandAsync("stop")
   pv.path = ""
   pv.hasFrame = false
   pv.busy = false

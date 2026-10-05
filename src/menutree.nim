@@ -37,7 +37,7 @@ type
     windows: seq[PopupWindow] ## one per depth, reused across opens
     input: PopupInput         ## popup-window clicks since the last frame
     mouse: Vec2               ## pointer in main-window coordinates
-    origin: Vec2              ## main window's content origin on screen
+    origin: Vec2              ## main window's content origin on screen (pixels)
     bounds: Rect              ## monitor the menus open on, main-window coordinates
     boundsValid: bool
     grabbed: bool             ## holds the pointer grab taken while open
@@ -113,7 +113,7 @@ proc overMenu(m: MenuSystem, p: Vec2): bool =
 
 proc pointerOverPopup*(m: MenuSystem, ui: Ui): bool =
   ## Live check (not last frame's pointer), for focus-change handling.
-  let local = ui.window.pointerPos.local.vec2
+  let local = ui.window.pointerPos.local.vec2 / ui.scale
   for lv in m.levels:
     if local.inside(lv.rect): return true
 
@@ -126,11 +126,11 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
   # so ask the server where it is.
   let (screen, local) = ui.window.pointerPos
   m.origin = (screen - local).vec2
-  if ui.fakeMouse.x < 0: m.mouse = local.vec2
+  if ui.fakeMouse.x < 0: m.mouse = local.vec2 / ui.scale
   if not m.boundsValid:
     m.boundsValid = true
     let mon = monitorAt(screen)
-    m.bounds = rect(mon.pos.vec2 - m.origin, mon.size.vec2)
+    m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
   if m.overMenu(m.mouse) or m.input.anyPressed:
     ui.captured = true
   elif ui.window.buttonPressed[MouseLeft] or ui.window.buttonPressed[MouseRight] or
@@ -297,8 +297,10 @@ proc renderPopups*(m: MenuSystem, ui: Ui,
   for i, lv in m.levels:
     if i >= m.windows.len: m.windows.add newPopupWindow(colPopup)
     let w = m.windows[i]
-    let screen = m.origin + lv.rect.xy
-    w.show(ivec2(int32(screen.x), int32(screen.y)), ivec2(int32(lv.rect.w), int32(lv.rect.h)))
+    let screen = m.origin + lv.rect.xy * ui.scale
+    let size = lv.rect.wh * ui.scale
+    w.show(ivec2(int32(round(screen.x)), int32(round(screen.y))),
+      ivec2(int32(ceil(size.x)), int32(ceil(size.y))))
     w.beginDraw()
     ui.sk.beginUi(ui.window, w.size)
     m.drawPopup(ui, lv, i)

@@ -1,8 +1,9 @@
 ## Command-line Manager: composes shell commands for the Run menu out of text
 ## and cards. A card is a bash variable drawn as a chip inside the command
-## line; it holds a value, or refers to the current media file or to a
-## bookmark of it. When the command runs, the Run window asks for the
-## bookmarks and lets the values be changed.
+## line; it holds a value, or refers to the current media file, a bookmark of
+## it or an external file. When the command runs, a file dialog asks for each
+## external file, then the Run window asks for the bookmarks and lets the
+## values be changed.
 
 import std/[strutils, sequtils, os, math, tables]
 import silky, vmath, bumpy, pixie
@@ -67,6 +68,15 @@ proc toParts(toks: seq[CmdPart]): seq[CmdPart] =
 proc isBookmark(p: CmdPart): bool =
   p.card and p.kind == ckReference and p.content.startsWith("bookmark")
 
+proc isExternal(p: CmdPart): bool =
+  p.card and p.kind == ckReference and p.content == "external"
+
+proc externalCards*(parts: seq[CmdPart]): seq[string] =
+  ## Names of the external-file cards, asked for with a file dialog on run,
+  ## each once, in order.
+  for p in parts:
+    if p.isExternal and p.name notin result: result.add p.name
+
 proc runCards*(parts: seq[CmdPart]): seq[CmdPart] =
   ## The cards the Run window asks about (values and bookmarks), each name
   ## once, in order.
@@ -76,8 +86,8 @@ proc runCards*(parts: seq[CmdPart]): seq[CmdPart] =
 
 proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[value, err: string] =
   ## A card's value now, or why it has none. picks holds what the Run window
-  ## gave each card: the chosen bookmark's time, or a value replacing the
-  ## card's own.
+  ## gave each card: the chosen bookmark's time, the chosen external file, or
+  ## a value replacing the card's own.
   case p.kind
   of ckValue:
     let v = picks.getOrDefault(p.name, p.content)
@@ -89,6 +99,9 @@ proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[val
     elif p.isBookmark:
       if p.name in picks: result.value = picks[p.name]
       else: result.err = "No bookmark chosen for " & p.name
+    elif p.isExternal:
+      if p.name in picks: result.value = picks[p.name]
+      else: result.err = "No file chosen for " & p.name
     else:
       result.err = "Card " & p.name & " doesn't refer to anything"
 
@@ -119,10 +132,11 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string]): 
 
 proc preview(toks: seq[CmdPart], path: string): string =
   ## The command line as it would run now, values in place of the cards;
-  ## bookmarks are only known once chosen in the Run window.
+  ## bookmarks and external files are only known once chosen on run.
   for t in toks:
     if not t.card: result.add t.text
     elif t.isBookmark: result.add "[" & t.name & ": bookmark]"
+    elif t.isExternal: result.add "[" & t.name & ": external file]"
     else:
       let (value, err) = t.resolve(path, initTable[string, string]())
       result.add(if err.len > 0: "[" & t.name & "?]" else: quoteShell(value))
@@ -391,10 +405,11 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
 
 proc referenceList(d: CmdDialog, ui: Ui, r: Rect, card: var CmdPart, path: string) =
   ## Flat list of what a card can refer to: the media file's path, or a
-  ## bookmark picked when the command runs.
-  let rows: array[2, tuple[key, label, detail: string]] = [
+  ## bookmark or external file picked when the command runs.
+  let rows: array[3, tuple[key, label, detail: string]] = [
     ("file", (if path.len > 0: path else: "Media file (none open)"), ""),
-    ("bookmark", "Bookmark", "chosen on run")]
+    ("bookmark", "Bookmark", "chosen on run"),
+    ("external", "External file", "chosen on run")]
   ui.rect(r, colBackground)
   ui.border(r, colBorder)
   let inner = rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2)
@@ -486,7 +501,7 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
     ui.textIn("A leading ~ means your home folder.",
       rect(r.x + labelW, y + 46, r.w - labelW, 18), colTextDim, FontSmall)
   else:
-    let h = RowH * 2 + 2
+    let h = RowH * 3 + 2
     d.referenceList(ui, rect(r.x + labelW, y, r.w - labelW, h), d.toks[s], path)
 
 # --- window ---------------------------------------------------------------------

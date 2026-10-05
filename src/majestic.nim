@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables, streams]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog, mediainfo
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -88,6 +88,8 @@ type
     settingsKey: string       ## player-facing settings last pushed to mpv
     positions: Positions      ## remembered playback positions
     bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
+    bmPath, bmKey: string     ## the current file and its mediaKey, once known
+    bmPending: string         ## the file whose mediaKey is being worked out
     renWin: Window            ## Rename Bookmark dialog, created on first use
     renSk: Silky
     renUi: Ui
@@ -106,6 +108,9 @@ type
     rlResizeFrom: (float32, float32)     ## pointer y and height when the drag began
     rlThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
     pickDlg: PickDialog       ## Run window: bookmarks and values for a run
+    extRun: CommandLine       ## the command line whose external files are asked for
+    extQueue: seq[string]     ## its external-file cards still to ask about
+    extPicks: Table[string, string]  ## the files chosen so far, by card name
     pickWin: Window
     pickSk: Silky
     pickUi: Ui
@@ -141,6 +146,7 @@ type
     showPreview: bool
     # window management
     onTopApplied: bool
+    screenInhibit: Inhibitor  # keeps the display on while video plays
     title: string
     hintsKey: string
     fitPending: bool
@@ -189,10 +195,21 @@ proc playlistWidth(a: App): float32 =
 proc runLogHeight(a: App): float32 =
   max(RunLogMinHeight, round(a.cfg.runLogHeight).float32)
 
+proc px(a: App, v: IVec2): IVec2 =
+  ## UI units to window pixels (Options > Player > UI scaling).
+  let s = a.sk.uiScale
+  ivec2(int32(round(v.x.float32 * s)), int32(round(v.y.float32 * s)))
+
+proc px(a: App, r: Rect): Rect =
+  let s = a.sk.uiScale
+  rect(r.x * s, r.y * s, r.w * s, r.h * s)
+
+proc minWindow(a: App): IVec2 = a.px(MinWindow)
+
 proc chromeSize(a: App): IVec2 =
-  ## Window space not used by the video frame (windowed mode).
-  ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
-        int32(MenuBarHeight + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0)))
+  ## Window space not used by the video frame (windowed mode), in pixels.
+  a.px(ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
+        int32(MenuBarHeight + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))))
 
 proc naturalSize(a: App): Vec2 =
   var w = a.player.videoW.float32
@@ -206,6 +223,31 @@ proc naturalSize(a: App): Vec2 =
 proc videoAspect(a: App): float =
   let n = a.naturalSize
   if n.y > 0: n.x / n.y else: 0
+
+# --- atlas & UI scaling ----------------------------------------------------
+
+proc glyphSet(): seq[string] =
+  result = AsciiGlyphs
+  for cp in 0xA0 .. 0x17F: result.add $Rune(cp)
+  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸"]:
+    result.add s
+
+proc buildAtlas(scale: float32): (Image, SilkyAtlas) =
+  ## Fonts and icons rasterized at scale (Silky draws them at their UI size).
+  let fontPath = getTempDir() / "majestic-media-player-font.ttf"
+  if not fileExists(fontPath) or getFileSize(fontPath) != FontData.len:
+    writeFile(fontPath, FontData)
+  let b = newAtlasBuilder(2048, 2)
+  let glyphs = glyphSet()
+  proc px(size: int): int = int(round(size.float32 * scale))
+  b.addFont(fontPath, FontMain, 15 * scale, glyphs)
+  b.addFont(fontPath, FontSmall, 13 * scale, glyphs)
+  b.addFont(fontPath, FontTitle, 20 * scale, glyphs)
+  b.addIcons(scale)
+  discard b.addImage("crown96", renderIcon(crownPath, 24, px(96)))
+  discard b.addImage("music96", renderIcon(musicPath, 24, px(96)))
+  discard b.addImage("knob16", renderIcon("M12 4a8 8 0 1 0 0.001 0z", 24, px(16)))
+  (b.atlasImage, b.atlas)
 
 # --- window management ------------------------------------------------------
 
@@ -229,7 +271,7 @@ proc updateAspectHints(a: App) =
   let key = &"{aspect:.4f}/{chrome.x}/{chrome.y}"
   if key != a.hintsKey:
     a.hintsKey = key
-    a.window.setAspectHints(aspect, chrome, MinWindow)
+    a.window.setAspectHints(aspect, chrome, a.minWindow)
 
 proc fitWindowToVideo(a: App) =
   ## Sizes the window so the video shows at its natural size, capped to 85%
@@ -242,15 +284,15 @@ proc fitWindowToVideo(a: App) =
   let s = min(1'f32, min(maxV.x / nat.x, maxV.y / nat.y))
   let v = vec2(round(nat.x * s), round(nat.y * s))
   var size = ivec2(int32(v.x + chrome.x), int32(v.y + chrome.y))
-  size.x = max(size.x, MinWindow.x)
-  size.y = max(size.y, MinWindow.y)
+  size.x = max(size.x, a.minWindow.x)
+  size.y = max(size.y, a.minWindow.y)
   a.window.size = size
 
 proc resizeKeepingVideo(a: App, delta: IVec2) =
   ## Grows/shrinks the window by delta when chrome is toggled, so the video
-  ## frame keeps its size.
+  ## frame keeps its size. delta is in UI units.
   if a.fullscreen or a.window.maximized: return
-  a.window.size = a.window.size + delta
+  a.window.size = a.window.size + a.px(delta)
 
 proc setFullscreen(a: App, on: bool) =
   if on == a.fullscreen: return
@@ -259,7 +301,7 @@ proc setFullscreen(a: App, on: bool) =
   a.window.fullscreen = on
   a.hintsKey = ""
   if on:
-    a.window.setAspectHints(0, ivec2(0, 0), MinWindow)
+    a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
 
 proc applyOnTop(a: App) =
   let want = case a.cfg.onTop
@@ -270,6 +312,9 @@ proc applyOnTop(a: App) =
   if want != a.onTopApplied:
     a.onTopApplied = want
     a.window.setAlwaysOnTop(want)
+
+proc applyKeepAwake(a: App) =
+  a.screenInhibit.set(a.cfg.keepDisplayOn and a.player.playing and a.player.hasRealVideo)
 
 # --- synchronize ------------------------------------------------------------
 # Synchronized players repeat each other's playback controls: whoever acts
@@ -705,8 +750,52 @@ proc seekRelative(a: App, d: float) =
     a.player.h.commandAsync("seek", $d, "relative")
     a.syncSend("seek", $(a.player.timePos + d), "false")
 
+proc entryOf(a: App, path: string): string =
+  ## The bookmarks key filed under path: an entry last seen there, or one
+  ## written by an older version (keyed by path), else "".
+  if path in a.bookmarks: return path
+  for k, e in a.bookmarks:
+    if e.path == path: return k
+
+proc keyKnown(a: App, path, key: string) =
+  ## Files the bookmarks found under path (older versions, or the contents
+  ## changed) under key, and a moved file's bookmarks under its new path.
+  (a.bmPath, a.bmKey) = (path, key)
+  if key in a.bookmarks and a.bookmarks[key].path == path: return
+  if key notin a.bookmarks and a.entryOf(path).len == 0: return
+  a.bookmarks = loadBookmarks()
+  if key notin a.bookmarks:
+    let old = a.entryOf(path)
+    if old.len == 0: return
+    a.bookmarks[key] = a.bookmarks[old]
+    a.bookmarks.del(old)
+  a.bookmarks[key].path = path
+  a.bookmarks.save()
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+
+proc pollMediaKey(a: App) =
+  ## Starts working out the current file's key when it changes, and files
+  ## its bookmarks under it once done.
+  let path = if a.player.loaded: a.player.path else: ""
+  if path.len > 0 and path != a.bmPath and path != a.bmPending:
+    a.bmPending = path
+    requestMediaKey(path)
+  while true:
+    let r = takeMediaKey()
+    if not r.ok: break
+    if r.path == a.bmPending:
+      a.bmPending = ""
+      a.keyKnown(r.path, r.key)
+
+proc bookmarkKey(a: App, path: string): string =
+  ## The key of path's bookmarks. Before the background mediaKey is done, the
+  ## entry filed under the path (when there is one) stands in.
+  if path == a.bmPath: a.bmKey
+  else: a.entryOf(path)
+
 proc fileBookmarks(a: App): seq[Bookmark] =
-  if a.player.loaded: a.bookmarks.getOrDefault(a.player.path) else: @[]
+  if a.player.loaded: a.bookmarks.getOrDefault(a.bookmarkKey(a.player.path)).marks
+  else: @[]
 
 proc chapterStep(a: App, d: int) =
   let p = a.player
@@ -749,11 +838,15 @@ proc nearestBookmark(a: App, t: float): int =
 proc editBookmarks(a: App, path: string, edit: proc (marks: var seq[Bookmark])) =
   ## Applies `edit` to a file's bookmarks on the file's latest contents, so
   ## other players' bookmarks aren't overwritten.
+  # Editing doesn't wait for the background key.
+  if path != a.bmPath: a.keyKnown(path, mediaKey(path))
+  let key = a.bmKey
   a.bookmarks = loadBookmarks()
-  var marks = a.bookmarks.getOrDefault(path)
-  edit(marks)
-  if marks.len > 0: a.bookmarks[path] = marks
-  else: a.bookmarks.del(path)
+  var e = a.bookmarks.getOrDefault(key)
+  edit(e.marks)
+  e.path = path
+  if e.marks.len > 0: a.bookmarks[key] = e
+  else: a.bookmarks.del(key)
   a.bookmarks.save()
 
 proc addBookmark(a: App, t: float) =
@@ -965,6 +1058,52 @@ proc savePlaylistDialog(a: App) =
   a.ask(dkSaveFile, "plsave", "Save Playlist", a.startDir / "Playlist.m3u",
     extraFilters = PlaylistFilters)
 
+const ChapterFilters = @[("Matroska simple chapters", @["txt"])]
+
+proc exportBookmarksDialog(a: App) =
+  if a.fileBookmarks.len == 0: return
+  let name = a.player.path.extractFilename.splitFile.name
+  a.ask(dkSaveFile, "bmexport", "Export Bookmarks",
+    a.startDir / name & ".chapters.txt", extraFilters = ChapterFilters)
+
+proc importBookmarksDialog(a: App) =
+  if not a.player.loaded: return
+  a.ask(dkOpenFile, "bmimport", "Import Bookmarks", exts = @["txt"],
+    filterName = "Matroska simple chapters")
+
+proc exportBookmarks(a: App, path: string) =
+  var p = path
+  if p.splitFile.ext.len == 0: p.add ".txt"
+  try:
+    writeFile(p, a.fileBookmarks.toSimpleChapters)
+    a.osd("Bookmarks exported: " & p.extractFilename)
+  except IOError, OSError:
+    a.osd("Cannot write " & p.extractFilename)
+
+proc importBookmarks(a: App, path: string) =
+  ## Adds the file's chapters to the current file's bookmarks; ones at a
+  ## bookmark's time already only fill in its name when it has none.
+  if not a.player.loaded or a.player.path.len == 0: return
+  var marks: seq[Bookmark]
+  try: marks = readFile(path).parseSimpleChapters
+  except IOError, OSError, ValueError:
+    a.osd("No bookmarks found in " & path.extractFilename)
+    return
+  var added = 0
+  a.editBookmarks(a.player.path, proc (cur: var seq[Bookmark]) =
+    for m in marks:
+      var j = -1
+      for i, b in cur:
+        if abs(b.time - m.time) < 0.05: j = i; break
+      if j >= 0:
+        if cur[j].name.len == 0: cur[j].name = m.name
+        continue
+      var i = 0
+      while i < cur.len and cur[i].time < m.time: inc i
+      cur.insert(m, i)
+      inc added)
+  a.osd(if added == 1: "1 bookmark imported" else: $added & " bookmarks imported")
+
 proc loadPlaylist(a: App, path: string) =
   ## Replaces the playlist with the file's entries and plays the first.
   if a.editLocked: return
@@ -999,6 +1138,8 @@ proc savePlaylist(a: App, path: string) =
   except IOError, OSError:
     a.osd("Cannot save playlist: " & p.extractFilename)
 
+proc askExternal(a: App)  # Run menu, below
+
 proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   if paths.len == 0: return
   case purpose
@@ -1007,6 +1148,13 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "pladd": a.addToPlaylist(paths)
   of "plload": a.loadPlaylist(paths[0])
   of "plsave": a.savePlaylist(paths[0])
+  of "bmexport": a.exportBookmarks(paths[0])
+  of "bmimport": a.importBookmarks(paths[0])
+  of "extfile":
+    if a.extQueue.len > 0:
+      a.extPicks[a.extQueue[0]] = paths[0].absolutePath
+      a.extQueue.delete(0)
+      a.askExternal()
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
   of "audio":
@@ -1104,6 +1252,8 @@ proc newDialogWindow(a: App, title: string, size: IVec2): (Window, Silky, Ui) =
   w.icon = appIcon()
   w.setDialogFor(a.window)
   let sk = newSilky(w, a.atlasImg, a.atlas)
+  sk.uiScale = a.sk.uiScale
+  sk.atlasScale = a.sk.atlasScale
   let ui = newUi(sk, w)
   let touch = proc () = a.dirtyUntil = now() + 1.2
   let input = proc () =
@@ -1126,7 +1276,8 @@ proc ensureOptionsWindow(a: App) =
 
 proc showDialog(a: App, w: Window, size: IVec2) =
   ## Centres a dialog's frame on the main window's frame (both have the
-  ## same decorations), kept on the main window's monitor.
+  ## same decorations), kept on the main window's monitor. size is in UI units.
+  let size = a.px(size)
   var pos = a.window.framePos + (a.window.size - size) div 2
   let m = monitorAt(a.window.pos + a.window.size div 2)
   pos.x = clamp(pos.x, m.pos.x, max(m.pos.x, m.pos.x + m.size.x - size.x))
@@ -1134,6 +1285,28 @@ proc showDialog(a: App, w: Window, size: IVec2) =
   w.placeDialog(pos, size)
   w.visible = true
   w.activate()
+
+proc uiScale(a: App): float32 = float32(clamp(a.cfg.uiScale, 50, 300) / 100)
+
+proc applyUiScale(a: App) =
+  ## Rebuilds the atlas when Options > Player > UI scaling changed; windows
+  ## sized in UI units follow (the main window keeps its size).
+  let s = a.uiScale
+  if s == a.sk.uiScale: return
+  let (img, atlas) = buildAtlas(s)
+  (a.atlasImg, a.atlas) = (img, atlas)
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk]:
+    if sk == nil: continue
+    (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
+    sk.uiScale = s
+    sk.atlasScale = s
+    sk.uploadAtlas()
+  for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize)]:
+    if w != nil and w.visible: a.showDialog(w, size)
+  if a.pickWin != nil and a.pickWin.visible:
+    let (sw, sh) = a.pickDlg.size
+    a.showDialog(a.pickWin, ivec2(sw, sh))
+  a.dirtyUntil = now() + 0.5
 
 proc showRename(a: App, i: int) =
   ## Opens the Rename Bookmark dialog for the current file's bookmark i.
@@ -1190,6 +1363,14 @@ proc editCommandLines(a: App, edit: proc (cmds: var seq[CommandLine])) =
   edit(a.commands)
   a.commands.save()
 
+proc setRunLogShown(a: App, shown: bool) =
+  ## Shows or hides the run log, growing or shrinking the window by its height.
+  if a.cfg.showRunLog == shown: return
+  a.cfg.showRunLog = shown
+  if shown: a.rlFollow = true
+  let h = int32(a.runLogHeight)
+  a.resizeKeepingVideo(ivec2(0, if shown: h else: -h))
+
 proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   ## Runs c with bash in the media file's folder, its cards resolved against
   ## the current file and picks (what the Run window gave each card). Output
@@ -1202,6 +1383,7 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   a.runLog.add e
   a.runLog.trim()
   a.rlFollow = true
+  a.setRunLogShown(true)
   if err.len > 0:
     e.error = err
     a.osd(c.title & ": " & err)
@@ -1215,11 +1397,16 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
     a.osd(c.title & ": cannot run bash")
     stderr.writeLine "run ", c.title, ": ", ex.msg
 
-proc runCommandLine(a: App, c: CommandLine) =
-  ## Runs c, first asking for its bookmarks and values when it has any.
+proc askExternal(a: App) =
+  ## Asks for the next external file of a.extRun, then goes on with the run
+  ## once all are chosen. Cancelling a dialog cancels the run.
+  if a.extQueue.len > 0:
+    a.ask(dkOpenFile, "extfile", a.extRun.title & ": " & a.extQueue[0])
+    return
+  let c = a.extRun
   let cards = c.parts.runCards
   if cards.len == 0:
-    a.execute(c)
+    a.execute(c, a.extPicks)
     return
   let marks = a.fileBookmarks
   let bookmarks = cards.anyIt(it.kind == ckReference)
@@ -1241,6 +1428,14 @@ proc runCommandLine(a: App, c: CommandLine) =
   a.pickUi.navVisible = false
   a.showDialog(a.pickWin, ivec2(sw, sh))
   a.overlay = ovPick
+
+proc runCommandLine(a: App, c: CommandLine) =
+  ## Runs c, first asking for its external files, bookmarks and values when
+  ## it has any.
+  a.extRun = c
+  a.extQueue = c.parts.externalCards
+  a.extPicks = initTable[string, string]()
+  a.askExternal()
 
 proc closePick(a: App) =
   a.overlay = ovNone
@@ -1339,10 +1534,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let w = int32(a.playlistWidth)
     a.resizeKeepingVideo(ivec2(if a.cfg.showPlaylist: w else: -w, 0)))
   view.check("Run Log", "Ctrl+5", cfg.showRunLog, action = proc () =
-    a.cfg.showRunLog = not a.cfg.showRunLog
-    if a.cfg.showRunLog: a.rlFollow = true
-    let h = int32(a.runLogHeight)
-    a.resizeKeepingVideo(ivec2(0, if a.cfg.showRunLog: h else: -h)))
+    a.setRunLogShown(not a.cfg.showRunLog))
   view.sep()
   view.check("Show OSD", "", cfg.showOsd, action = proc () =
     a.cfg.showOsd = not a.cfg.showOsd
@@ -1472,6 +1664,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   bm.item("Remove Bookmark", enabled = a.fileBookmarks.len > 0, action = proc () =
     let i = a.nearestBookmark(a.player.timePos)
     if i >= 0: a.removeBookmark(a.fileBookmarks[i].time))
+  bm.sep()
+  bm.item("Import Bookmarks...", enabled = loaded, action = proc () = a.importBookmarksDialog())
+  bm.item("Export Bookmarks...", enabled = a.fileBookmarks.len > 0,
+    action = proc () = a.exportBookmarksDialog())
   let marks = a.fileBookmarks
   if marks.len > 0:
     bm.sep()
@@ -1904,7 +2100,8 @@ proc drawPreview(a: App, fb: IVec2) =
     if (flags and MpvRenderUpdateFrame) != 0 and a.preview.target.fbo != 0:
       a.preview.render.render(a.preview.target)
   if a.showPreview and a.preview.hasFrame:
-    a.quad.draw(a.preview.target.tex, rectCorners(a.previewQuad.xy, a.previewQuad.wh), fb.vec2)
+    let q = a.px(a.previewQuad)
+    a.quad.draw(a.preview.target.tex, rectCorners(q.xy, q.wh), fb.vec2)
 
 # --- UI panels --------------------------------------------------------------
 
@@ -2016,7 +2213,7 @@ proc seekBar(a: App, r: Rect) =
       imgH = round(pw / (if asp > 0: asp else: 16 / 9))
       boxW = max(boxW, pw + 8)
       a.preview.request(p.path, t)
-      a.preview.target.ensureSize(int(pw), int(imgH))
+      a.preview.target.ensureSize(int(pw * ui.scale), int(imgH * ui.scale))
     let boxH = ts.y + 8 + (if imgH > 0: imgH + 4 else: 0)
     var bx = clamp(ui.mouse.x - boxW / 2, 4, ui.size.x - boxW - 4)
     let by = r.y - boxH - 6
@@ -2550,6 +2747,7 @@ proc renderOptions(a: App, shot: string) =
     w.closeRequested = false
     a.closeOptions(false)
     return
+  a.applyUiScale()
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
   # A text field being edited takes Escape itself.
@@ -2561,7 +2759,7 @@ proc renderOptions(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  let action = a.optionsDlg.draw(ui, a.cfg, rect(vec2(0, 0), size.vec2))
+  let action = a.optionsDlg.draw(ui, a.cfg, rect(vec2(0, 0), ui.size))
   ui.drawTooltip()
   a.optSk.endUi()
   ui.endFrame()
@@ -2597,7 +2795,7 @@ proc renderRename(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  let W = size.x.float32
+  let W = ui.size.x
   ui.textIn("Name", rect(16, 10, W - 32, 22), colTextDim, FontSmall)
   discard ui.textField("ren-name", rect(16, 34, W - 32, 28), a.renText, a.renPlaceholder)
   let ok = ui.textButton("ren-ok", rect(W - 116, 74, 100, 28), "Rename", primary = true)
@@ -2631,7 +2829,7 @@ proc renderCommands(a: App, shot: string) =
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
   let path = if a.player.loaded: a.player.path else: ""
-  let action = a.cmdDlg.draw(ui, rect(vec2(0, 0), size.vec2), path)
+  let action = a.cmdDlg.draw(ui, rect(vec2(0, 0), ui.size), path)
   ui.drawTooltip()
   a.cmdSk.endUi()
   ui.endFrame()
@@ -2675,7 +2873,7 @@ proc renderPick(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), size.vec2), marks)
+  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), ui.size), marks)
   ui.drawTooltip()
   a.pickSk.endUi()
   ui.endFrame()
@@ -2686,7 +2884,7 @@ proc renderPick(a: App, shot: string) =
   of paCancel: a.closePick()
   of paRun:
     let d = a.pickDlg
-    var picks = initTable[string, string]()
+    var picks = a.extPicks
     for i, row in d.rows:
       if row.kind == ckValue: picks[row.name] = d.texts[i]
       elif d.picks[i] >= 0 and d.picks[i] < marks.len:
@@ -2850,6 +3048,7 @@ proc frame(a: App) =
   let fb = w.size
   if fb.x <= 0 or fb.y <= 0: return
 
+  a.applyUiScale()
   ui.beginFrame()
   let (root, ctxRoot) = a.buildMenu()
 
@@ -2857,8 +3056,8 @@ proc frame(a: App) =
   let fs = a.fullscreen
   let bottomH = a.bottomHeight
   let menuH = if fs: 0'f32 else: MenuBarHeight
-  let W = fb.x.float32
-  let H = fb.y.float32
+  let W = ui.size.x
+  let H = ui.size.y
   let plW = if a.cfg.showPlaylist: min(a.playlistWidth, W) else: 0
   # The run log spans the window's width under the menu bar (in full screen,
   # over the top of the video).
@@ -2890,7 +3089,7 @@ proc frame(a: App) =
   glClearColor(colBackground.r.float32 / 255, colBackground.g.float32 / 255,
     colBackground.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  a.drawVideo(videoArea, fb)
+  a.drawVideo(a.px(videoArea), fb)
   a.idleScreen(videoArea)
 
   # Video-frame mouse handling: click = play/pause, drag = move window.
@@ -3069,6 +3268,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.pickDlg.texts[parseInt(st.args[0])] = st.args[1 .. ^1].join(" ")
   of "pickopen": a.pickDlg.openRow = parseInt(arg)
   of "action": a.runMenuPath(arg.split('/'))
+  of "dialogresult": a.handleDialogResult(st.args[0], @[st.args[1 .. ^1].join(" ")])  # purpose path
   of "fs": a.setFullscreen(arg == "1")
   of "subs":  # alignX alignY dx dy scale
     a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
@@ -3089,32 +3289,12 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "size": a.window.size = ivec2(parseInt(st.args[0]).int32, parseInt(st.args[1]).int32)
   of "shot": a.shotPath = arg
   of "quit": a.window.closeRequested = true
+  of "uiscale": a.cfg.uiScale = parseFloat(arg)  # percent, as Options sets it
   of "set": a.player.h.setProp(st.args[0], st.args[1 .. ^1].join(" "))
   of "dump":
     for prop in st.args:
       stderr.writeLine "dump ", prop, " = ", a.player.h.getStr(prop)
   else: stderr.writeLine "script: unknown command ", st.cmd
-
-proc glyphSet(): seq[string] =
-  result = AsciiGlyphs
-  for cp in 0xA0 .. 0x17F: result.add $Rune(cp)
-  for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸"]:
-    result.add s
-
-proc buildAtlas(): (Image, SilkyAtlas) =
-  let fontPath = getTempDir() / "majestic-media-player-font.ttf"
-  if not fileExists(fontPath) or getFileSize(fontPath) != FontData.len:
-    writeFile(fontPath, FontData)
-  let b = newAtlasBuilder(2048, 2)
-  let glyphs = glyphSet()
-  b.addFont(fontPath, FontMain, 15, glyphs)
-  b.addFont(fontPath, FontSmall, 13, glyphs)
-  b.addFont(fontPath, FontTitle, 20, glyphs)
-  b.addIcons()
-  discard b.addImage("crown96", renderIcon(crownPath, 24, 96))
-  discard b.addImage("music96", renderIcon(musicPath, 24, 96))
-  discard b.addImage("knob16", renderIcon("M12 4a8 8 0 1 0 0.001 0z", 24, 16))
-  (b.atlasImage, b.atlas)
 
 proc main() =
   discard setlocale(LC_NUMERIC, "C")
@@ -3135,6 +3315,7 @@ proc main() =
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
   a.bookmarks = loadBookmarks()
+  if a.cfg.seedPresets(): a.cfg.save()
   a.commands = loadCommandLines()
   if a.cfg.rememberTransform:
     let t = a.cfg.transform
@@ -3154,7 +3335,6 @@ proc main() =
   makeContextCurrent(a.window)
   loadExtensions()
   a.window.disableVsync()
-  a.window.setAspectHints(0, ivec2(0, 0), MinWindow)
   if c.rememberWindowPos and c.windowW > 0:
     # Only onto a monitor that still exists.
     let p = ivec2(c.windowX.int32, c.windowY.int32)
@@ -3163,10 +3343,14 @@ proc main() =
        p.x + 40 < m.pos.x + m.size.x and p.y + 40 < m.pos.y + m.size.y:
       a.window.moveFrame(p)
 
-  let (img, atlas) = buildAtlas()
+  let scale = a.uiScale
+  let (img, atlas) = buildAtlas(scale)
   (a.atlasImg, a.atlas) = (img, atlas)
   a.sk = newSilky(a.window, img, atlas)
+  a.sk.uiScale = scale
+  a.sk.atlasScale = scale
   a.ui = newUi(a.sk, a.window)
+  a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
   a.menus = newMenuSystem()
   a.quad = newQuadRenderer()
 
@@ -3202,7 +3386,7 @@ proc main() =
   # becomes one playlist (or one insertion when dropped on the playlist).
   a.window.onFileDrop = proc (path: string, data: string) =
     touch()
-    if a.dropped.len == 0: a.dropAt = a.window.mousePos.vec2
+    if a.dropped.len == 0: a.dropAt = a.window.mousePos.vec2 / a.sk.uiScale
     a.dropped.add path
   a.window.onFocusChange = proc () =
     touch()
@@ -3260,6 +3444,7 @@ proc main() =
     let peerNews = a.pollPeers()
     let changed = a.player.pollEvents() or peerNews
     a.pollProbe()
+    a.pollMediaKey()
     a.preview.pollEvents()
     a.pollDialog()
     a.pollJobs()
@@ -3294,6 +3479,7 @@ proc main() =
       a.menus.close()
       a.dirtyUntil = now() + 0.5
     a.applyOnTop()
+    a.applyKeepAwake()
     a.updateAspectHints()
 
     let t = now()
