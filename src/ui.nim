@@ -95,11 +95,17 @@ proc down*(ui: Ui, b = MouseLeft): bool = ui.window.buttonDown[b]
 proc consumeClick*(ui: Ui) = ui.clickConsumed = true
 
 proc scroll*(ui: Ui): float32 =
-  if ui.scrollConsumed: 0'f32 else: ui.window.scrollDelta.y
+  ## Wheel movement this frame in X11 units: ±10 per notch, + = down.
+  if ui.scrollConsumed: return 0
+  when defined(windows):
+    # Windy reports notches there (WHEEL_DELTA = 1), + = up.
+    -ui.window.scrollDelta.y * 10
+  else:
+    ui.window.scrollDelta.y
 
 proc wheelNotches*(ui: Ui): float32 =
-  ## Wheel notches this frame, + = down. Windy reports ±10 per notch on X11
-  ## (added up when several arrive within one poll).
+  ## Wheel notches this frame, + = down (added up when several arrive within
+  ## one poll).
   ui.scroll() / 10
 
 proc shiftDown(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]

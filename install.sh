@@ -6,6 +6,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Windows (Git Bash): per-user install, no options.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [[ ${1:-} == --uninstall ]]; then exec tools/windows.sh uninstall; fi
+    exec tools/windows.sh install ;;
+esac
+
 prefix="$HOME/.local"
 sudo=""
 action=install

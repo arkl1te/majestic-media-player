@@ -1,8 +1,11 @@
 ## Single-instance support for "Same player for each media file": the running
-## player listens on a Unix socket, and a newly launched one hands its files
-## over (one path per line) and exits.
+## player listens on a local socket (see ipc), and a newly launched one hands
+## its files over (one path per line) and exits.
 
 import std/[net, nativesockets, os, strutils]
+import ipc
+when defined(windows):
+  proc AllowSetForegroundWindow(pid: int32): int32 {.stdcall, importc, dynlib: "user32".}
 
 type InstanceServer* = ref object
   sock: Socket
@@ -11,18 +14,13 @@ type InstanceServer* = ref object
 proc socketPath(): string =
   getEnv("XDG_RUNTIME_DIR", getTempDir()) / "majestic-media-player.sock"
 
-proc connect(path: string): Socket =
-  result = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
-  try:
-    result.connectUnix(path)
-  except CatchableError:  # nobody listening, or the path is too long
-    result.close()
-    result = nil
-
 proc forwardToRunning*(paths: seq[string]): bool =
   ## Sends paths to an already running player. False if none is listening.
-  let s = connect(socketPath())
+  let s = dial(socketPath())
   if s == nil: return false
+  when defined(windows):
+    # We were just launched, so we may raise windows; let the player do it.
+    discard AllowSetForegroundWindow(-1)
   try:
     s.send(paths.join("\n") & "\n")
     result = true
@@ -33,19 +31,16 @@ proc forwardToRunning*(paths: seq[string]): bool =
 proc startServer*(): InstanceServer =
   ## Listens for paths from later launches; nil if another player already does.
   let path = socketPath()
-  let live = connect(path)
+  let live = dial(path)
   if live != nil:
     live.close()
     return nil
   removeFile(path)  # stale socket from a crashed instance
-  let s = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+  var s: Socket
   try:
-    s.bindUnix(path)
-    s.listen()
-    s.getFd.setBlocking(false)
+    s = listenAt(path)
   except CatchableError as e:
     stderr.writeLine "single instance: cannot listen on ", path, ": ", e.msg
-    s.close()
     return nil
   InstanceServer(sock: s, path: path)
 

@@ -2,7 +2,12 @@
 
 import std/json
 
-{.passL: "-lmpv".}
+when defined(windows):
+  const libmpv = "libmpv-2.dll"
+  {.pragma: mpvImport, importc, cdecl, dynlib: libmpv.}
+else:
+  {.passL: "-lmpv".}
+  {.pragma: mpvImport, importc, cdecl.}
 
 type
   MpvHandle* = ptr object
@@ -87,7 +92,7 @@ const
   MpvFrameInfoPresent* = 1'u64
   MpvFrameInfoRedraw* = 2'u64
 
-{.push importc, cdecl.}
+{.push mpvImport.}
 proc mpv_create*(): MpvHandle
 proc mpv_initialize*(ctx: MpvHandle): cint
 proc mpv_terminate_destroy*(ctx: MpvHandle)

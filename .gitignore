@@ -1,2 +1,6 @@
 /vendor/
 /majestic-media-player
+/majestic-media-player.exe
+/libmpv-2.dll
+*.pdb
+*.ilk

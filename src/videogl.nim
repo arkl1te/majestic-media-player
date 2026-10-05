@@ -4,10 +4,24 @@
 import opengl, vmath
 import mpv
 
-proc glXGetProcAddressARB(name: cstring): pointer {.importc, dynlib: "libGL.so.1".}
+when defined(windows):
+  proc wglGetProcAddress(name: cstring): pointer {.stdcall, importc, dynlib: "opengl32".}
+  proc GetProcAddress(m: pointer, name: cstring): pointer {.stdcall, importc, dynlib: "kernel32".}
+  proc LoadLibraryA(name: cstring): pointer {.stdcall, importc, dynlib: "kernel32".}
+  var opengl32: pointer
 
-proc mpvGetProcAddress(ctx: pointer, name: cstring): pointer {.cdecl.} =
-  glXGetProcAddressARB(name)
+  proc mpvGetProcAddress(ctx: pointer, name: cstring): pointer {.cdecl.} =
+    # wglGetProcAddress only knows extensions and GL > 1.1; the rest (and
+    # some drivers' "failure" values 1, 2, 3, -1) mean: ask opengl32.dll.
+    result = wglGetProcAddress(name)
+    if cast[int](result) in [-1, 0, 1, 2, 3]:
+      if opengl32 == nil: opengl32 = LoadLibraryA("opengl32.dll")
+      result = GetProcAddress(opengl32, name)
+else:
+  proc glXGetProcAddressARB(name: cstring): pointer {.importc, dynlib: "libGL.so.1".}
+
+  proc mpvGetProcAddress(ctx: pointer, name: cstring): pointer {.cdecl.} =
+    glXGetProcAddressARB(name)
 
 type
   VideoTarget* = object

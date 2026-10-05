@@ -196,7 +196,7 @@ proc probe(path: string): JsonNode =
   try:
     let p = startProcess(exe, args = ["-v", "quiet", "-print_format", "json",
       "-show_format", "-show_streams", "-show_chapters", "-o", tmp, path],
-      options = {poParentStreams})
+      options = {poParentStreams, poDaemon})  # poDaemon: no console window on Windows
     var waited = 0.0
     while p.peekExitCode == -1 and waited < ProbeTimeout:
       sleep(10)

@@ -426,6 +426,11 @@ proc copyToClipboard(a: App) =
   ## file manager pastes the file itself; streams go as their URL.
   let path = a.player.path
   if not a.player.loaded or path.len == 0: return
+  when defined(windows):
+    if not path.contains("://"):
+      a.window.setClipboardFile(path.absolutePath)
+      a.osd("Copied " & path.extractFilename)
+      return
   if path.contains("://") or not onWayland():
     setClipboardString(path)
   else:
@@ -440,9 +445,13 @@ proc copyToClipboard(a: App) =
       setClipboardString(path)
   a.osd("Copied " & path.extractFilename)
 
-proc clipboardPaths(): seq[string] =
-  ## Files and URLs on the clipboard: a file manager's text/uri-list, or
-  ## plain text holding paths or URLs, one per line.
+proc clipboardPaths(a: App): seq[string] =
+  ## Files and URLs on the clipboard: a file manager's text/uri-list (on
+  ## Windows, Explorer's file list), or plain text holding paths or URLs, one
+  ## per line.
+  when defined(windows):
+    result = a.window.clipboardFiles()
+    if result.len > 0: return
   var text = ""
   if onWayland():
     # Listing types never asks the owner for data, so this cannot stall on
@@ -462,7 +471,7 @@ proc clipboardPaths(): seq[string] =
 
 proc openFromClipboard(a: App) =
   if a.editLocked: return
-  let paths = clipboardPaths()
+  let paths = a.clipboardPaths()
   if paths.len == 0:
     a.osd("Clipboard has no file to open")
     return
@@ -666,10 +675,42 @@ proc spawn(a: App, cmd: string, args: varargs[string]) =
   if findExe(cmd).len == 0:
     stderr.writeLine "not found: ", cmd
     return
+  # poDaemon: no console window flashes up on Windows.
+  const opts = when defined(windows): {poUsePath, poParentStreams, poDaemon}
+               else: {poUsePath, poParentStreams}
   try:
-    a.children.add startProcess(cmd, args = @args, options = {poUsePath, poParentStreams})
+    a.children.add startProcess(cmd, args = @args, options = opts)
   except OSError as e:
     stderr.writeLine "cannot run ", cmd, ": ", e.msg
+
+when defined(windows):
+  proc runPowerAction(a: App) =
+    case a.afterPlayback
+    of apMonitorOff: a.window.monitorOff()
+    of apSleep, apHibernate:
+      if not suspend(a.afterPlayback == apHibernate):
+        a.osd("Windows refused to " &
+          (if a.afterPlayback == apSleep: "sleep" else: "hibernate"))
+    of apShutdown: a.spawn("shutdown", "/s", "/t", "0")
+    of apLogOff: a.spawn("shutdown", "/l")
+    of apLock: lockSession()
+    else: discard
+else:
+  proc runPowerAction(a: App) =
+    case a.afterPlayback
+    of apMonitorOff:
+      if findExe("kscreen-doctor").len > 0: a.spawn("kscreen-doctor", "--dpms", "off")
+      else: a.spawn("xset", "dpms", "force", "off")
+    of apSleep: a.spawn("systemctl", "suspend")
+    of apHibernate: a.spawn("systemctl", "hibernate")
+    of apShutdown: a.spawn("systemctl", "poweroff")
+    of apLogOff:
+      if findExe("qdbus6").len > 0:
+        a.spawn("qdbus6", "org.kde.Shutdown", "/Shutdown", "org.kde.Shutdown.logout")
+      else:
+        a.spawn("loginctl", "terminate-session", getEnv("XDG_SESSION_ID"))
+    of apLock: a.spawn("loginctl", "lock-session")
+    else: discard
 
 proc runAfterPlayback(a: App) =
   case a.afterPlayback
@@ -679,19 +720,8 @@ proc runAfterPlayback(a: App) =
     if f.len > 0:
       a.playlist = @[f]
       a.playIndex(0)
-  of apMonitorOff:
-    if findExe("kscreen-doctor").len > 0: a.spawn("kscreen-doctor", "--dpms", "off")
-    else: a.spawn("xset", "dpms", "force", "off")
   of apExit: a.window.closeRequested = true
-  of apSleep: a.spawn("systemctl", "suspend")
-  of apHibernate: a.spawn("systemctl", "hibernate")
-  of apShutdown: a.spawn("systemctl", "poweroff")
-  of apLogOff:
-    if findExe("qdbus6").len > 0:
-      a.spawn("qdbus6", "org.kde.Shutdown", "/Shutdown", "org.kde.Shutdown.logout")
-    else:
-      a.spawn("loginctl", "terminate-session", getEnv("XDG_SESSION_ID"))
-  of apLock: a.spawn("loginctl", "lock-session")
+  else: a.runPowerAction()
 
 proc afterEof(a: App) =
   if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playlist.len > 0:
@@ -3298,6 +3328,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
 
 proc main() =
   discard setlocale(LC_NUMERIC, "C")
+  when defined(windows): attachStdio()
   let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog(),
     cmdDlg: newCmdDialog(), pickDlg: newPickDialog())
   a.cfg = loadConfig()
@@ -3332,6 +3363,8 @@ proc main() =
     else: ivec2(1024, 640)
   a.window = newWindow(AppName, startSize, vsync = false)
   a.window.icon = appIcon()
+  a.window.initMainWindow()
+  when defined(windows): setDialogOwner(a.window.getHWND)
   makeContextCurrent(a.window)
   loadExtensions()
   a.window.disableVsync()
