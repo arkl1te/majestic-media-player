@@ -1,0 +1,52 @@
+# Builds the Windows release on every push with tools/windows.sh, the same
+# way it's built locally from Git Bash. The .exe + libmpv-2.dll are attached
+# to the run as an artifact; pushing a v* tag also publishes a GitHub Release.
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # only used by the release step
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash  # Git Bash, which windows.sh expects
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner already has Visual Studio with the C++ workload, the
+      # Windows SDK (rc.exe, for the icon) and 7-Zip; only Nim is missing.
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: tools/windows.sh build
+
+      - name: Package
+        id: pkg
+        run: |
+          name="majestic-media-player-$(cat VERSION)-windows-x64"
+          [[ $GITHUB_REF == refs/tags/* ]] || name+="-${GITHUB_SHA::7}"
+          mkdir "$name"
+          cp majestic-media-player.exe libmpv-2.dll "$name/"
+          7z a "$name.zip" "$name" >/dev/null
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}/
+
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.name }}.zip
