@@ -1,4 +1,4 @@
-## Command-line Manager: composes shell commands for the Run menu out of text
+## Commands window: composes shell commands for the Run menu out of text
 ## and cards. A card is a bash variable drawn as a chip inside the command
 ## line; it holds a value, or refers to the current media file, a bookmark of
 ## it or an external file. When the command runs, a file dialog asks for each
@@ -407,7 +407,7 @@ proc referenceList(d: CmdDialog, ui: Ui, r: Rect, card: var CmdPart, path: strin
   ## Flat list of what a card can refer to: the media file's path, or a
   ## bookmark or external file picked when the command runs.
   let rows: array[3, tuple[key, label, detail: string]] = [
-    ("file", (if path.len > 0: path else: "Media file (none open)"), ""),
+    ("file", "Current media file", (if path.len > 0: "" else: "none open")),
     ("bookmark", "Bookmark", "chosen on run"),
     ("external", "External file", "chosen on run")]
   ui.rect(r, colBackground)
@@ -459,7 +459,7 @@ proc referenceList(d: CmdDialog, ui: Ui, r: Rect, card: var CmdPart, path: strin
   ui.hitClip = outerClip
 
 proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
-  ui.groupHeader(r.xy, r.w, "Properties")
+  ui.groupHeader(r.xy, r.w, "Card properties")
   var y = r.y + 30
   let s = d.selected
   if s < 0 or s >= d.toks.len or not d.toks[s].card:
@@ -576,28 +576,32 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
     ui.border(delR, colBorder)
     ui.textIn("Delete", delR, colTextDisabled, h = CenterAlign)
 
-  # Left column: New card, then the selected card's properties.
-  let top = r.y + 76
+  # A separator under the title row, then the two columns.
+  ui.rect(rect(r.x + 1, r.y + 68, W - 2, 1), colBorder)
+  let top = r.y + 80
   let bottom = r.y + H - 58
-  let leftR = rect(r.x + 16, top, 300, bottom - top)
-  if ui.textButton("cl-newcard", rect(leftR.x, leftR.y, 120, 28), "New card"):
-    d.newCard(ui)
-  d.properties(ui, rect(leftR.x, leftR.y + 44, leftR.w, leftR.h - 44), path)
+  const cardsW = 300'f32
+  ui.groupHeader(vec2(r.x + 16, top), W - 32, "Command line")
+  let colTop = top + 26
 
-  # Right column: the command line and what it would run.
-  let rx = leftR.x + leftR.w + 20
-  let rightR = rect(rx, top, r.x + W - 16 - rx, bottom - top)
-  ui.groupHeader(rightR.xy, rightR.w, "Command line")
+  # Left column: the command line and what it would run.
+  let leftR = rect(r.x + 16, colTop, W - 32 - cardsW - 20, bottom - colTop)
   const previewH = 4 * 18'f32 + 26
-  let fieldR = rect(rightR.x, rightR.y + 26, rightR.w, rightR.h - 26 - previewH)
+  let fieldR = rect(leftR.x, leftR.y, leftR.w, leftR.h - previewH)
   d.commandField(ui, fieldR)
   var py = fieldR.y + fieldR.h + 10
-  ui.textIn("Runs as", rect(rightR.x, py, rightR.w, 18), colTextDim, FontSmall)
+  ui.textIn("Runs as", rect(leftR.x, py, leftR.w, 18), colTextDim, FontSmall)
   py += 20
   let shown = d.toks.preview(path)
-  for line in ui.wrapText(shown, rightR.w, 4, FontSmall):
-    ui.textIn(line, rect(rightR.x, py, rightR.w, 18), colText, FontSmall)
+  for line in ui.wrapText(shown, leftR.w, 4, FontSmall):
+    ui.textIn(line, rect(leftR.x, py, leftR.w, 18), colText, FontSmall)
     py += 18
+
+  # Right column: New card, then the selected card's properties.
+  let rightR = rect(leftR.x + leftR.w + 20, colTop, cardsW, bottom - colTop)
+  if ui.textButton("cl-newcard", rect(rightR.x, rightR.y, 120, 28), "New card"):
+    d.newCard(ui)
+  d.properties(ui, rect(rightR.x, rightR.y + 44, rightR.w, rightR.h - 44), path)
 
   # Buttons; the reason for a refused Apply on their left.
   ui.rect(rect(r.x + 1, r.y + H - 50, W - 2, 1), colBorder)

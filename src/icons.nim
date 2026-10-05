@@ -49,6 +49,66 @@ proc ringIcon(size: int): Image =
   ctx.lineWidth = 1.5 * k
   ctx.strokeCircle(circle(vec2(size / 2, size / 2), size / 2 - 1.5 * k))
 
+proc tri(path: Path, a, b, c: Vec2) =
+  path.moveTo(a); path.lineTo(b); path.lineTo(c); path.closePath()
+
+proc mouseIcon*(size: int, button, motion: string): Image =
+  ## Blender-style mouse for the status bar's hints: outlined body with the
+  ## used button ("left", "right" or "middle") filled. `motion` ("v" or "h")
+  ## adds a double arrow to its right for wheel and drag gestures.
+  let k = size / 16
+  let w = if motion.len > 0: int(round(23 * k)) else: size
+  result = newImage(w, size)
+  let white = color(1, 1, 1, 1)
+  let body = newPath()
+  body.roundedRect(rect(3.5 * k, 1 * k, 9 * k, 14 * k), 4.5 * k, 4.5 * k, 4 * k, 4 * k)
+  let wheel = newPath()
+  wheel.roundedRect(rect(6.75 * k, 2.75 * k, 2.5 * k, 4 * k), 1.25 * k, 1.25 * k, 1.25 * k, 1.25 * k)
+  if button in ["left", "right"]:
+    let fill = newImage(w, size)
+    let part = newPath()
+    part.rect(if button == "left": rect(0, 0, 8 * k, 7.5 * k) else: rect(8 * k, 0, 8 * k, 7.5 * k))
+    fill.fillPath(part, white)
+    let mask = newImage(w, size)
+    mask.fillPath(body, white)
+    fill.draw(mask, blendMode = MaskBlend)
+    # Keep the wheel's outline readable on top of the filled button.
+    let gap = newPath()
+    gap.roundedRect(rect(6 * k, 2 * k, 4 * k, 5.5 * k), 2 * k, 2 * k, 2 * k, 2 * k)
+    let cut = newImage(w, size)
+    cut.fillPath(gap, white)
+    fill.draw(cut, blendMode = SubtractMaskBlend)
+    result.draw(fill)
+  let lw = 1.2 * k
+  result.strokePath(body, white, strokeWidth = lw)
+  let lines = newPath()
+  lines.moveTo(3.5 * k, 7.5 * k); lines.lineTo(12.5 * k, 7.5 * k)
+  lines.moveTo(8 * k, 1 * k); lines.lineTo(8 * k, 2.75 * k)
+  lines.moveTo(8 * k, 6.75 * k); lines.lineTo(8 * k, 7.5 * k)
+  result.strokePath(lines, white, strokeWidth = lw)
+  if button == "middle": result.fillPath(wheel, white)
+  result.strokePath(wheel, white, strokeWidth = lw)
+  if motion.len > 0:
+    let arrow = newPath()
+    if motion == "v":
+      arrow.rect(rect(17.4 * k, 4 * k, 1.2 * k, 8 * k))
+      arrow.tri(vec2(18 * k, 1 * k), vec2(20.5 * k, 4.5 * k), vec2(15.5 * k, 4.5 * k))
+      arrow.tri(vec2(18 * k, 15 * k), vec2(20.5 * k, 11.5 * k), vec2(15.5 * k, 11.5 * k))
+    else:
+      arrow.rect(rect(17 * k, 7.4 * k, 3 * k, 1.2 * k))
+      arrow.tri(vec2(14.5 * k, 8 * k), vec2(17.5 * k, 5.5 * k), vec2(17.5 * k, 10.5 * k))
+      arrow.tri(vec2(22.5 * k, 8 * k), vec2(19.5 * k, 5.5 * k), vec2(19.5 * k, 10.5 * k))
+    result.fillPath(arrow, white)
+
+# Status bar hint key -> (atlas image, button, motion).
+const mouseIcons* = {
+  "LMB": ("mouse-lmb16", "left", ""),
+  "RMB": ("mouse-rmb16", "right", ""),
+  "MMB": ("mouse-mmb16", "middle", ""),
+  "Wheel": ("mouse-wheel16", "middle", "v"),
+  "Drag": ("mouse-drag16", "left", "h"),
+}
+
 proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
   ## Names keep the nominal size; images are rasterized at size * scale.
   proc px(size: int): int = int(round(size.float32 * scale))
@@ -57,6 +117,8 @@ proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
       let img = renderIcon(spec[1], spec[0], px(size))
       discard builder.addImage(name & $size, img)
   discard builder.addImage("ring16", ringIcon(px(16)))
+  for (_, spec) in mouseIcons:
+    discard builder.addImage(spec[0], mouseIcon(px(16), spec[1], spec[2]))
 
 proc appIcon*(): Image =
   ## Window icon: accent crown on a dark rounded tile.

@@ -97,7 +97,7 @@ type
     renTime: float
     renText: string
     renPlaceholder: string    ## its default label, shown when renText is empty
-    cmdDlg: CmdDialog         ## Command-line Manager, its window created on first use
+    cmdDlg: CmdDialog         ## Commands window, its window created on first use
     cmdWin: Window
     cmdSk: Silky
     cmdUi: Ui
@@ -1367,13 +1367,13 @@ proc latestCommandLine(a: App): CommandLine =
   if a.commands.len > 0: a.commands[^1] else: CommandLine()
 
 proc showCommands(a: App) =
-  ## Opens the Command-line Manager on the command line created last.
+  ## Opens the Commands window on the command line created last.
   a.menus.close()
   a.commands = loadCommandLines()
   a.cmdDlg.saved = a.commands
   a.cmdDlg.load(a.latestCommandLine)
   if a.cmdWin == nil:
-    (a.cmdWin, a.cmdSk, a.cmdUi) = a.newDialogWindow("Command-line Manager", CommandsSize)
+    (a.cmdWin, a.cmdSk, a.cmdUi) = a.newDialogWindow("Commands", CommandsSize)
   a.cmdUi.focusId = "cl-title"
   a.cmdUi.focusFresh = true
   a.cmdUi.navVisible = false
@@ -1392,6 +1392,13 @@ proc editCommandLines(a: App, edit: proc (cmds: var seq[CommandLine])) =
   a.commands = loadCommandLines()
   edit(a.commands)
   a.commands.save()
+
+proc setPlaylistShown(a: App, shown: bool) =
+  ## Shows or hides the playlist, growing or shrinking the window by its width.
+  if a.cfg.showPlaylist == shown: return
+  a.cfg.showPlaylist = shown
+  let w = int32(a.playlistWidth)
+  a.resizeKeepingVideo(ivec2(if shown: w else: -w, 0))
 
 proc setRunLogShown(a: App, shown: bool) =
   ## Shows or hides the run log, growing or shrinking the window by its height.
@@ -1560,9 +1567,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.cfg.showStatus = not a.cfg.showStatus
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showStatus: StatusHeight else: -StatusHeight))))
   view.check("Playlist", "Ctrl+4", cfg.showPlaylist, action = proc () =
-    a.cfg.showPlaylist = not a.cfg.showPlaylist
-    let w = int32(a.playlistWidth)
-    a.resizeKeepingVideo(ivec2(if a.cfg.showPlaylist: w else: -w, 0)))
+    a.setPlaylistShown(not a.cfg.showPlaylist))
   view.check("Run Log", "Ctrl+5", cfg.showRunLog, action = proc () =
     a.setRunLogShown(not a.cfg.showRunLog))
   view.sep()
@@ -1742,9 +1747,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     elif peer.master != 0 and peer.pid notin a.syncMembers: label.add "  · synchronized elsewhere"
     syn.check(label, checked = peer.pid in a.syncMembers, action = bindAct(toggle, peer.pid))
 
-  # Run: the Command-line Manager and the command lines it saved.
+  # Run: the Commands window and the command lines it saved.
   let run = root.sub("Run")
-  run.item("Command-line Manager...", action = proc () = a.showCommands())
+  run.item("Commands...", action = proc () = a.showCommands())
   run.sep()
   if a.commands.len == 0:
     run.item("No command lines", enabled = false)
@@ -2070,6 +2075,17 @@ proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
   base.y *= a.xf.scaleY
   (area.xy + area.wh / 2 + a.xf.pan, base)
 
+proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
+  ## Ctrl+Wheel: zooms by the Resize step per notch (up = in), keeping the
+  ## point under the cursor in place. `area` and `at` are window pixels.
+  let step = 1 + a.cfg.sizeStep.float32 / 100
+  let z = clamp(a.xf.zoom * pow(step, -notches), 0.05, 50)
+  let k = z / a.xf.zoom
+  let c = area.xy + area.wh / 2
+  a.xf.pan = at + (c + a.xf.pan - at) * k - c
+  a.xf.zoom = z
+  a.xfChanged(&"Zoom: {int(round(z * 100))}%")
+
 proc pollVideoFrame(a: App) =
   ## Picks up newly queued mpv frames and decides whether one is due.
   if a.frameFlag:
@@ -2327,7 +2343,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     result = @[@[("O", "Load Subtitle")]]
   elif c and not s and not al:
     result = @[@[("←", "Previous Chapter"), ("→", "Next Chapter")],
-      @[("M", "Mute")],
+      @[("M", "Mute"), ("Wheel", "Zoom At Cursor")],
       @[("O", "Open File"), ("V", "Open From Clipboard"), ("C", "Copy to Clipboard"),
         ("X", "Close")]]
     if all:
@@ -2354,7 +2370,14 @@ proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## over the controls so the layout beneath doesn't move.
   let ui = a.ui
   let capH = r.h - 8
-  proc capW(key: string): float32 = max(capH, ui.textSize(key, FontSmall).x + 10)
+  proc mouseIcon(key: string): string =
+    ## Mouse inputs (LMB, RMB, MMB, Wheel, Drag) draw as an icon, not a key cap.
+    for (k, spec) in mouseIcons:
+      if k == key: return spec[0]
+  proc capW(key: string): float32 =
+    let icon = mouseIcon(key)
+    if icon.len > 0: ui.sk.getImageSize(icon).x
+    else: max(capH, ui.textSize(key, FontSmall).x + 10)
   proc pairW(h: KeyHint): float32 = capW(h.key) + 5 + ui.textSize(h.label, FontSmall).x
   const PairGap = 14'f32
   const GroupGap = 25'f32
@@ -2391,9 +2414,13 @@ proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
       let (ri, hx) = pos[gi][i]
       let ry = top + ri.float32 * r.h
       let cap = rect(hx, ry + (r.h - capH) / 2, capW(h.key), capH)
-      ui.rect(cap, colPanelRaised)
-      ui.border(cap, colBorder)
-      ui.textIn(h.key, cap, colText, FontSmall, h = CenterAlign)
+      let icon = mouseIcon(h.key)
+      if icon.len > 0:
+        ui.icon(icon, cap.xy + cap.wh / 2, colText)
+      else:
+        ui.rect(cap, colPanelRaised)
+        ui.border(cap, colBorder)
+        ui.textIn(h.key, cap, colText, FontSmall, h = CenterAlign)
       let lw = ui.textSize(h.label, FontSmall).x
       ui.textIn(h.label, rect(cap.x + cap.w + 5, ry, lw + 2, r.h), colTextDim, FontSmall)
 
@@ -2506,7 +2533,9 @@ proc playlistPanel(a: App, r: Rect) =
       max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
   let header = rect(r.x, r.y, r.w, 30)
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
-  ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 40, 30), colText)
+  ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 70, 30), colText)
+  if ui.iconButton("pl-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", "Close (Ctrl+4)"):
+    a.setPlaylistShown(false)
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
   if a.playlistLocked:
     a.plListRect = Rect()
@@ -2612,9 +2641,11 @@ proc runLogPanel(a: App, r: Rect) =
   let running = a.runLog.countIt(it.running)
   ui.icon("terminal16", vec2(r.x + 18, header.y + header.h / 2), colAccent)
   ui.textIn(if running > 0: &"Run log ({running} running)" else: "Run log",
-    rect(r.x + 32, header.y, r.w - 120, header.h), colText)
-  # Header buttons, right to left: Clear (finished runs), Stop (running ones).
-  var bx = r.x + r.w - 10
+    rect(r.x + 32, header.y, r.w - 150, header.h), colText)
+  # Header buttons, right to left: Close, Clear (finished runs), Stop (running ones).
+  if ui.iconButton("rl-close", rect(r.x + r.w - 30, header.y + 2, 24, 24), "close16", "Close (Ctrl+5)"):
+    a.setRunLogShown(false)
+  var bx = r.x + r.w - 38
   let headerButton = proc (label, tip: string): bool =
     let b = rect(bx - 60, header.y + 4, 60, header.h - 8)
     bx -= 66
@@ -2841,7 +2872,7 @@ proc renderRename(a: App, shot: string) =
     a.closeRename()
 
 proc renderCommands(a: App, shot: string) =
-  ## Draws the Command-line Manager window and carries out its buttons.
+  ## Draws the Commands window window and carries out its buttons.
   if a.overlay != ovCommands: return
   let w = a.cmdWin
   let ui = a.cmdUi
@@ -3032,7 +3063,9 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
-      ("Volume", "Wheel"), ("Toggle seek snapping", "Shift+Drag seek bar")])]]
+      ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
+      ("Restore zoom / panning", "Middle-click video"),
+      ("Toggle seek snapping", "Shift+Drag seek bar")])]]
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
@@ -3136,8 +3169,11 @@ proc frame(a: App) =
       a.ctxMenu = cmVideo
       a.menus.openContext(ui.mouse)
     if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
-      a.volumeStep(ui.scroll() < 0)
+      if w.ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
+      else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
+    if ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
+      a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
   if a.videoPress:
     if not ui.down():
       a.videoPress = false
