@@ -112,7 +112,7 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string]): 
     if err.len > 0: return ("", err)
     if p.name notin assigned:
       assigned.add p.name
-      result.script.add p.name & "=" & quoteShell(value) & "\n"
+      result.script.add p.name & "=" & quoteShellPosix(value) & "\n"
     let v = "${" & p.name & "}"
     body.add(if inSingle: "'\"" & v & "\"'" elif inDouble: v else: "\"" & v & "\"")
   result.script.add body
@@ -125,7 +125,7 @@ proc preview(toks: seq[CmdPart], path: string): string =
     elif t.isBookmark: result.add "[" & t.name & ": bookmark]"
     else:
       let (value, err) = t.resolve(path, initTable[string, string]())
-      result.add(if err.len > 0: "[" & t.name & "?]" else: quoteShell(value))
+      result.add(if err.len > 0: "[" & t.name & "?]" else: quoteShellPosix(value))
 
 # --- dialog state ------------------------------------------------------------
 

@@ -2,7 +2,11 @@
 ## output (stdout and stderr together) as lines; a carriage return starts its
 ## line over, so progress meters like ffmpeg's stay on one line.
 
-import std/[os, osproc, posix, times, sequtils, strutils]
+import std/[os, osproc, times, sequtils, strutils]
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 
 const
   MaxRunLines = 5000  ## per run; the oldest go first
@@ -60,19 +64,49 @@ proc stripAnsi(s: string): string =
       result.add s[i]
       inc i
 
+proc bashExe(): string =
+  ## bash to run scripts with. On Windows, Git for Windows' one: the bash.exe
+  ## in System32 is WSL's, which sees the files under different paths.
+  when defined(windows):
+    var tries = @[getEnv("MMP_BASH")]
+    let git = findExe("git")
+    if git.len > 0:
+      tries.add git.parentDir.parentDir / "bin" / "bash.exe"  # Git\cmd\git.exe
+      tries.add git.parentDir / "bash.exe"                    # Git\bin\git.exe
+    for root in [getEnv("ProgramFiles"), getEnv("ProgramW6432"),
+                 getEnv("LOCALAPPDATA") / "Programs"]:
+      if root.len > 0: tries.add root / "Git" / "bin" / "bash.exe"
+    for t in tries:
+      if t.len > 0 and fileExists(t): return t
+    raise newException(OSError, "bash not found; install Git for Windows or set MMP_BASH")
+  else:
+    "bash"
+
 proc start*(e: RunEntry, script: string) =
   ## Runs script with bash in e.dir, its output piped to us. No stdin: tools
-  ## like ffmpeg would otherwise read our terminal's keys.
-  e.p = startProcess("bash", e.dir, ["-c", "exec </dev/null\n" & script],
-    options = {poUsePath, poStdErrToStdOut})
-  let fd = e.p.outputHandle.cint
-  discard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) or O_NONBLOCK)
+  ## like ffmpeg would otherwise read our terminal's keys. poDaemon: no
+  ## console window pops up on Windows.
+  e.p = startProcess(bashExe(), e.dir, ["-c", "exec </dev/null\n" & script],
+    options = {poUsePath, poStdErrToStdOut, poDaemon})
+  when not defined(windows):
+    let fd = e.p.outputHandle.cint
+    discard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) or O_NONBLOCK)
+
+proc readSome(e: RunEntry, buf: var array[4096, char]): int =
+  ## Reads what the pipe holds without blocking; <= 0 when it holds nothing.
+  when defined(windows):
+    let h = e.p.outputHandle
+    var avail, got: int32
+    if not peekNamedPipe(h, nil, 0, nil, avail.addr) or avail <= 0: return 0
+    if readFile(h, buf[0].addr, min(avail, buf.len.int32), got.addr, nil) == 0: return 0
+    got
+  else:
+    read(e.p.outputHandle.cint, buf[0].addr, buf.len)
 
 proc readAvailable(e: RunEntry): bool =
   var buf: array[4096, char]
-  let fd = e.p.outputHandle.cint
   while true:
-    let n = read(fd, buf[0].addr, buf.len)
+    let n = e.readSome(buf)
     if n <= 0: break
     var s = newString(n)
     copyMem(s[0].addr, buf[0].addr, n)
@@ -94,7 +128,7 @@ proc poll*(e: RunEntry): bool =
     e.p = nil
     result = true
 
-proc descendants(pid: int): seq[int] =
+proc descendants(pid: int): seq[int] {.used.} =
   ## Every process below pid, from /proc.
   var parents: seq[(int, int)]  # (pid, parent pid)
   for kind, path in walkDir("/proc"):
@@ -119,8 +153,12 @@ proc stop*(e: RunEntry) =
   if e.p == nil: return
   e.stopped = true
   let pid = e.p.processID
-  for child in descendants(pid): discard kill(child.Pid, SIGTERM)
-  discard kill(pid.Pid, SIGTERM)
+  when defined(windows):
+    # No SIGTERM to pass down: end the whole tree.
+    discard execCmdEx("taskkill /T /F /PID " & $pid, options = {poUsePath, poDaemon})
+  else:
+    for child in descendants(pid): discard kill(child.Pid, SIGTERM)
+    discard kill(pid.Pid, SIGTERM)
 
 proc trim*(log: var seq[RunEntry]) =
   var i = 0

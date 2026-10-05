@@ -62,8 +62,37 @@ it prints plain status lines instead.
 Dependencies are pinned in `deps.lock` and cloned by `tools/fetch_deps.sh`, so
 builds don't depend on whatever is in `~/.nimble`.
 
+### Windows
+
+From Git Bash (comes with [Git for Windows](https://gitforwindows.org)), with
+[Nim](https://nim-lang.org) 2.2+ and Visual Studio or its Build Tools (C++
+workload) installed:
+
+```sh
+git clone https://github.com/arkl1te/majestic-media-player.git
+cd majestic-media-player
+./install.sh
+```
+
+This fetches the pinned dependencies and a prebuilt libmpv (unpacked with
+[7-Zip](https://7-zip.org)), builds `majestic-media-player.exe` and installs it
+with `libmpv-2.dll` to `%LOCALAPPDATA%\Programs\Majestic Media Player`, plus a
+Start menu shortcut. `./install.sh --uninstall` removes it again.
+
+| Command | What it does |
+|---|---|
+| `tools/windows.sh build` | Build `majestic-media-player.exe` in the source tree |
+| `tools/windows.sh run [files]` | Build and run it |
+| `tools/windows.sh debug` | Unoptimized build with stack traces |
+| `tools/windows.sh install` / `uninstall` | Same as `./install.sh` / `--uninstall` |
+
+The Run menu runs its command lines with Git for Windows' bash (set
+`MMP_BASH` to use another).
+
 ## Notes
 
+- Windowing helpers Windy lacks live in `src/xwin_x11.nim` and
+  `src/xwin_win32.nim`, behind the same interface (`src/xwin.nim`).
 - Windy (Silky's windowing layer) is X11-only on Linux, so the player runs
   through XWayland on a Wayland session. Window dragging, always-on-top and
   aspect-locked resizing use EWMH/ICCCM hints, which KWin honours.
@@ -73,15 +102,23 @@ builds don't depend on whatever is in `~/.nimble`.
 - vsync is disabled on purpose: with NVIDIA under XWayland, a vsync'd
   `glXSwapBuffers` can block for seconds when the window is hidden. Video frames
   are paced from mpv's frame timing instead; the compositor prevents tearing.
-- Settings and recent files live in `~/.config/majestic-media-player/config.json`;
+- On Windows, menus are never-activated popup windows sharing the main GL
+  context the same way; moving the window by the video is done by the player
+  itself, so playback doesn't stall during a drag.
+- Settings and recent files live in `~/.config/majestic-media-player/config.json`
+  (`%APPDATA%\majestic-media-player\config.json` on Windows);
   remembered playback positions (View ▸ Options ▸ Player) in `positions.json` next to it.
 - With "Same player for each media file" (the default), a running player listens
   on `$XDG_RUNTIME_DIR/majestic-media-player.sock` and files opened from the
-  file manager are handed to it instead of starting a second window.
+  file manager are handed to it instead of starting a second window. On
+  Windows it listens on a loopback TCP port, written to
+  `%TEMP%\majestic-media-player.sock`.
 - Options ▸ Formats writes file associations to `~/.config/mimeapps.list`.
   Associations are per MIME type, so extensions that share one (mp4, m4v, f4v)
   are checked together. Unchecking removes the player from the default list,
-  and the previous default takes over again.
+  and the previous default takes over again. On Windows they go to the
+  registry under `HKEY_CURRENT_USER`; an app the user picked in Settings ▸
+  Default apps still wins there, and the Formats page says so.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary.
 
 ## Source layout
@@ -93,10 +130,11 @@ builds don't depend on whatever is in `~/.nimble`.
 | `src/videogl.nim` | mpv → texture rendering and the transformed video quad |
 | `src/menutree.nim` | Menu bar / popup / context-menu system |
 | `src/options.nim` | Options window (page tree and pages) |
-| `src/assoc.nim`, `src/instance.nim` | File associations, single-instance hand-over |
+| `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
+| `src/instance.nim`, `src/peers.nim`, `src/ipc.nim` | Single-instance hand-over, Synchronize links, local sockets |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
-| `src/xwin.nim` | X11 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
-| `src/config.nim`, `src/dialogs.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs, palette, vector icons |
+| `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
+| `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity, Windows common dialogs), palette, vector icons |
 
 ## Debugging
 

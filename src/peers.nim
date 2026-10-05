@@ -1,10 +1,11 @@
-## Peer links for Synchronize: every player listens on its own Unix socket in
-## a shared runtime folder, finds the others by listing it, and keeps one
-## connection per pair (the lower pid connects). Messages are lines of
+## Peer links for Synchronize: every player listens on its own local socket
+## (see ipc) in a shared runtime folder, finds the others by listing it, and
+## keeps one connection per pair (the lower pid connects). Messages are lines of
 ## tab-separated fields; hello/title/status are handled here, the rest is
 ## handed to the app.
 
-import std/[net, nativesockets, os, posix, sequtils, strutils, times]
+import std/[net, nativesockets, os, sequtils, strutils, times]
+import ipc
 
 type
   Peer* = ref object
@@ -27,8 +28,6 @@ type
     lastScan: float
     title, master: string     ## last announced, repeated to new peers
     gone*: seq[int]           ## peers lost since the last poll
-
-var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 
 proc escape(s: string): string =
   s.multiReplace(("\\", "\\\\"), ("\t", "\\t"), ("\n", "\\n"))
@@ -56,22 +55,7 @@ proc syncDir(): string =
 
 proc write(p: Peer, data: string): bool =
   ## Whole message or nothing usable: false once the peer is unreachable.
-  var off = 0
-  while off < data.len:
-    let n = posix.send(p.sock.getFd, data[off].unsafeAddr, data.len - off, MSG_NOSIGNAL)
-    if n <= 0:
-      if n < 0 and errno == EINTR: continue
-      return false
-    off += n
-  true
-
-proc dial(path: string): Socket =
-  result = newSocket(Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP)
-  try:
-    result.connectUnix(path)
-  except CatchableError:
-    result.close()
-    result = nil
+  p.sock.sendAll(data)
 
 proc greet(n: PeerNet, p: Peer): bool =
   p.write(encode(["hello", $n.pid])) and p.write(encode(["title", n.title])) and
@@ -85,14 +69,11 @@ proc startPeerNet*(): PeerNet =
   let pid = getCurrentProcessId()
   let path = dir / $pid & ".sock"
   removeFile(path)
-  let s = newSocket(Domain.AF_UNIX, SockType.SOCK_STREAM, Protocol.IPPROTO_IP)
+  var s: Socket
   try:
-    s.bindUnix(path)
-    s.listen()
-    s.getFd.setBlocking(false)
+    s = listenAt(path)
   except CatchableError as e:
     stderr.writeLine "synchronize: cannot listen on ", path, ": ", e.msg
-    s.close()
     return nil
   PeerNet(pid: pid, dir: dir, path: path, server: s, master: "0")
 
@@ -135,7 +116,7 @@ proc scan(n: PeerNet) =
     if pid <= n.pid or n.find(pid) != nil: continue
     let s = dial(f)
     if s == nil:
-      if posix.kill(Pid(pid), 0) != 0 and errno == ESRCH: removeFile(f)
+      if not processAlive(pid): removeFile(f)
       continue
     let p = Peer(pid: pid, sock: s)
     if n.greet(p): n.peers.add p
@@ -143,17 +124,7 @@ proc scan(n: PeerNet) =
 
 proc readLines(p: Peer): (seq[string], bool) =
   ## Complete lines received so far; false once the connection closed.
-  var chunk: array[4096, char]
-  while true:
-    let r = posix.recv(p.sock.getFd, chunk[0].addr, chunk.len, MSG_DONTWAIT)
-    if r > 0:
-      let old = p.buf.len
-      p.buf.setLen old + r
-      copyMem(p.buf[old].addr, chunk[0].addr, r)
-    elif r == 0: return (@[], false)
-    elif errno == EINTR: continue
-    elif errno == EAGAIN or errno == EWOULDBLOCK: break
-    else: return (@[], false)
+  if not p.sock.recvAvailable(p.buf): return (@[], false)
   var lines: seq[string]
   var start = 0
   while (let nl = p.buf.find('\n', start); nl >= 0):

@@ -52,14 +52,17 @@ type
     hasFrame*: bool
 
 var
-  frameReady: Atomic[bool]
-  previewReady: Atomic[bool]
+  # int, not bool: with MSVC, std/atomics' exchange is a 64-bit interlocked
+  # exchange whatever the type, so on a bool it zeroes the 7 bytes after it
+  # (other globals).
+  frameReady: Atomic[int]
+  previewReady: Atomic[int]
 
-proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(true)
-proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(true)
+proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
+proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
 
-proc takeFrameReady*(): bool = frameReady.exchange(false)
-proc takePreviewReady*(): bool = previewReady.exchange(false)
+proc takeFrameReady*(): bool = frameReady.exchange(0) != 0
+proc takePreviewReady*(): bool = previewReady.exchange(0) != 0
 
 proc newPlayer*(volume: float, muted, osd: bool): Player =
   result = Player(volume: volume, muted: muted)

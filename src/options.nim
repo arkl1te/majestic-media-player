@@ -308,8 +308,13 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
   if waiting > 0:
     if ui.textButton("o-apply", applyR, "Apply associations", primary = true):
       let err = d.assoc.applyAssociations()
-      d.status = if err.len > 0: "Could not write mimeapps.list: " & err
-                 else: "Associations applied."
+      let kept = d.assoc.userOverrides()
+      d.status =
+        if err.len > 0: "Could not save associations: " & err
+        elif kept.len > 0:
+          "Applied. Windows keeps your own default app for ." & kept.join(", .") &
+            "; change it in Settings > Default apps."
+        else: "Associations applied."
       if err.len == 0: d.assocApplied = true
   else:
     ui.rect(applyR, colPanelRaised)
