@@ -348,24 +348,31 @@ proc rememberMain() =
   mainContext = glCurrentContext()
   mainDc = glCurrentDc()
 
-proc beginDraw*(p: PopupWindow) =
+proc makeCurrentOn(dc: HDC): bool =
+  ## A failed switch leaves no context current: rebind the main window's.
+  result = glMakeCurrent(dc, mainContext) != 0
+  if not result: discard glMakeCurrent(mainDc, mainContext)
+
+proc beginDraw*(p: PopupWindow): bool =
   ## Points the current GL context at the popup; GL state carries over.
+  ## False when that failed: skip the popup this frame (no endDraw).
   rememberMain()
   if not p.formatSet:
     p.formatSet = true
     matchPixelFormat(p.dc)
-  discard glMakeCurrent(p.dc, mainContext)
+  makeCurrentOn(p.dc)
 
 proc endDraw*(p: PopupWindow, main: Window) =
   ## Presents the popup and makes the main window current again.
   discard SwapBuffers(p.dc)
   discard glMakeCurrent(main.hdc, mainContext)
 
-proc beginDrawOn*(target: Window) =
+proc beginDrawOn*(target: Window): bool =
   ## Points the current (main window's) GL context at another window of the
   ## same pixel format, so it draws with the main window's GL resources.
+  ## False when that failed: skip drawing target this frame (no endDrawOn).
   rememberMain()
-  discard glMakeCurrent(target.hdc, mainContext)
+  makeCurrentOn(target.hdc)
 
 proc endDrawOn*(target, main: Window) =
   ## Presents target and makes the main window current again.

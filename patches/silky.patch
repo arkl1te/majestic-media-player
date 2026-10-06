@@ -183,3 +183,44 @@ index aa6bf25..052f836 100644
      vec2(uv.x.float32, uv.y.float32),
      vec2(uv.width.float32, uv.height.float32),
      color,
+diff --git a/src/silky/drawers/ogl.nim b/src/silky/drawers/ogl.nim
+index 254300f..dc2ff31 100644
+--- a/src/silky/drawers/ogl.nim
++++ b/src/silky/drawers/ogl.nim
+@@ -50,6 +50,11 @@ type
+     layers*: array[2, seq[DrawerVertex]]
+     currentLayer*: int
+     layerStack*: seq[int]
++    tiles*: seq[IVec2]
++      ## When set, endFrame draws the frame once per entry, with the
++      ## viewport's lower left corner there, calling beforeTile and afterTile
++      ## around each: a frame bigger than the framebuffer drawn in pieces.
++    beforeTile*, afterTile*: proc (i: int)
+ 
+ func size(componentType: GLenum): Positive =
+   ## Returns the byte size of a GL component type.
+@@ -611,6 +616,9 @@ proc endFrame*(
+ ) =
+   ## Flushes the queued quads through OpenGL.
+   if quadCount == 0:
++    for i in 0 ..< drawer.tiles.len:
++      if drawer.beforeTile != nil: drawer.beforeTile(i)
++      if drawer.afterTile != nil: drawer.afterTile(i)
+     return
+ 
+   # Own the viewport: the shader maps quads to clip space assuming
+@@ -643,7 +651,13 @@ proc endFrame*(
+   drawer.shader.bindUniforms()
+ 
+   glBindVertexArray(drawer.vao)
+-  glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++  if drawer.tiles.len == 0:
++    glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++  for i, origin in drawer.tiles:
++    if drawer.beforeTile != nil: drawer.beforeTile(i)
++    glViewport(origin.x, origin.y, GLsizei(size.x), GLsizei(size.y))
++    glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++    if drawer.afterTile != nil: drawer.afterTile(i)
+ 
+   glBindVertexArray(0)
+   glUseProgram(0)

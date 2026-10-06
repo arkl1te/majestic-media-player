@@ -1,7 +1,7 @@
 ## Small immediate-mode widget layer on top of Silky's drawing primitives.
 
 import std/[strformat, strutils, math]
-import silky, vmath, bumpy, chroma, pixie
+import silky, vmath, bumpy, chroma, pixie, opengl
 import theme, xwin
 
 type
@@ -41,6 +41,55 @@ type
 
   EditEvent* = enum
     eeChanged, eeFocused, eeCommitted
+
+proc readFramebuffer*(size: IVec2): Image =
+  result = newImage(size.x, size.y)
+  glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, result.data[0].addr)
+  result.flipVertical()
+
+when not defined(windows):
+  var offPixels: seq[uint8]  ## BGRA, top row first: the last offscreen frame
+
+  proc beginOffscreen*(sk: Silky, fb, size: IVec2, background: ColorRGBX) =
+    ## Makes sk's next frame, size big, draw into the current (main window's)
+    ## back buffer, fb big, in as many tiles as it takes, each read back into
+    ## offscreenPixels for putPixels. Only right after the main swap, when
+    ## that buffer is free to scribble on. See xwin_x11's putPixelsOn for why.
+    offPixels.setLen(max(0, size.x * size.y * 4))
+    sk.drawer.tiles.setLen 0
+    var rects: seq[tuple[x, y, w, h: int32]]
+    if fb.x > 0 and fb.y > 0:
+      for ty in countup(0'i32, size.y - 1, fb.y):
+        for tx in countup(0'i32, size.x - 1, fb.x):
+          let r = (x: tx, y: ty, w: min(fb.x, size.x - tx), h: min(fb.y, size.y - ty))
+          rects.add r
+          # Lower left corner that puts the tile's rows at the buffer's bottom.
+          sk.drawer.tiles.add ivec2(-r.x, r.y + r.h - size.y)
+    var tile = newSeq[uint8](min(size.x, fb.x).max(0) * min(size.y, fb.y).max(0) * 4)
+    let c = background.color
+    sk.drawer.beforeTile = proc (i: int) =
+      glClearColor(c.r, c.g, c.b, 1)
+      glClear(GL_COLOR_BUFFER_BIT)
+    sk.drawer.afterTile = proc (i: int) =
+      let r = rects[i]
+      glPixelStorei(GL_PACK_ALIGNMENT, 1)
+      glReadPixels(0, 0, r.w, r.h, GL_BGRA, GL_UNSIGNED_BYTE, tile[0].addr)
+      for y in 0 ..< r.h:  # GL rows run bottom-up
+        copyMem(offPixels[((r.y + y) * size.x + r.x) * 4].addr,
+                tile[(r.h - 1 - y) * r.w * 4].addr, r.w * 4)
+
+  proc endOffscreen*(sk: Silky) =
+    sk.drawer.tiles.setLen 0
+    sk.drawer.beforeTile = nil
+    sk.drawer.afterTile = nil
+
+  proc offscreenPixels*(): lent seq[uint8] = offPixels
+
+  proc offscreenImage*(size: IVec2): Image =
+    ## The last offscreen frame as an image (for screenshots).
+    result = newImage(size.x, size.y)
+    for i in 0 ..< min(result.data.len, offPixels.len div 4):
+      result.data[i] = rgbx(offPixels[i * 4 + 2], offPixels[i * 4 + 1], offPixels[i * 4], 255)
 
 proc newUi*(sk: Silky, window: Window): Ui =
   Ui(sk: sk, window: window, fakeMouse: vec2(-1, -1))

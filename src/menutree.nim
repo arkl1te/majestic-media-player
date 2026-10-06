@@ -306,9 +306,10 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
     a()
 
 proc renderPopups*(m: MenuSystem, ui: Ui,
-                   onDrawn: proc (level: int, size: IVec2) = nil) =
+                   onDrawn: proc (level: int, image: Image) = nil) =
   ## Shows one window per open level and draws it. Call outside the main
-  ## window's beginUi/endUi; onDrawn runs while a popup's buffer is current.
+  ## window's beginUi/endUi, right after its swap; onDrawn gets each popup's
+  ## image (for screenshots).
   ## While open, menus grab the pointer: presses anywhere then reach the main
   ## window, where captureInput closes the menus if they fall outside them.
   if m.levels.len > 0 and not m.grabbed:
@@ -320,11 +321,22 @@ proc renderPopups*(m: MenuSystem, ui: Ui,
     let size = lv.rect.wh * ui.scale
     w.show(ivec2(int32(round(screen.x)), int32(round(screen.y))),
       ivec2(int32(ceil(size.x)), int32(ceil(size.y))))
-    w.beginDraw()
-    ui.sk.beginUi(ui.window, w.size)
-    m.drawPopup(ui, lv, i)
-    ui.sk.endUi()
-    if onDrawn != nil: onDrawn(i, w.size)
-    w.endDraw(ui.window)
+    when defined(windows):
+      if not w.beginDraw(): continue  # retried next frame
+      ui.sk.beginUi(ui.window, w.size)
+      m.drawPopup(ui, lv, i)
+      ui.sk.endUi()
+      if onDrawn != nil: onDrawn(i, readFramebuffer(w.size))
+      w.endDraw(ui.window)
+    else:
+      # Drawn in the main window's buffer and put into the popup by X: no GL
+      # buffers of its own (see xwin_x11's putPixelsOn).
+      ui.sk.beginOffscreen(ui.window.size, w.size, colPopup)
+      ui.sk.beginUi(ui.window, w.size)
+      m.drawPopup(ui, lv, i)
+      ui.sk.endUi()
+      ui.sk.endOffscreen()
+      w.putPixels(offscreenPixels())
+      if onDrawn != nil: onDrawn(i, offscreenImage(w.size))
   for i in m.levels.len ..< m.windows.len:
     m.windows[i].hide()

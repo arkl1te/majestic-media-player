@@ -3,7 +3,7 @@
 ## the override-redirect popup windows menus are drawn into.
 ## Windy runs on X11 (XWayland under a Wayland session), so these apply there.
 
-import std/importutils
+import std/[importutils, strutils, tables, hashes, times]
 import windy, vmath, pixie, chroma
 
 {.passL: "-lX11".}
@@ -66,6 +66,13 @@ type
     minAspect, maxAspect: array[2, cint]
     baseWidth, baseHeight: cint
     winGravity: cint
+
+  XErrorEvent = object
+    kind: cint
+    display: XDisplay
+    resourceId: XID
+    serial: culong
+    errorCode, requestCode, minorCode: uint8
 
 const
   ClientMessage = 33.cint
@@ -131,9 +138,6 @@ proc XGetWindowProperty(d: XDisplay, w: XID, prop: Atom, offset, length: clong,
   nitems, bytesAfter: ptr culong, data: ptr pointer): cint {.importc, cdecl.}
 proc XFree(data: pointer): cint {.importc, cdecl.}
 proc XSetTransientForHint(d: XDisplay, w, parent: XID): cint {.importc, cdecl.}
-proc glXGetCurrentContext(): pointer {.importc, dynlib: "libGL.so.1".}
-proc glXMakeCurrent(d: XDisplay, drawable: XID, ctx: pointer): cint {.importc, dynlib: "libGL.so.1".}
-proc glXSwapBuffers(d: XDisplay, drawable: XID) {.importc, dynlib: "libGL.so.1".}
 
 proc xid(window: Window): XID =
   privateAccess(Window)
@@ -154,9 +158,28 @@ proc disableVsync(drawable: XID) =
   let mesa = cast[SwapIntervalMesa](glXGetProcAddressARB("glXSwapIntervalMESA"))
   if mesa != nil: discard mesa(0)
 
+proc XSetErrorHandler(handler: proc (d: XDisplay, e: ptr XErrorEvent): cint {.cdecl.}): pointer {.importc, cdecl.}
+
+var xErrors: int
+
+proc logXError(d: XDisplay, e: ptr XErrorEvent): cint {.cdecl.} =
+  ## Windy's handler raises from inside Xlib, so any X error (a BadAlloc from
+  ## XWayland, say) killed the app, and NVIDIA's GLX then crashed in exit().
+  ## X errors are asynchronous reports of one failed request: log and go on.
+  ## A failing request can repeat every frame, so only the first few are logged.
+  inc xErrors
+  if xErrors <= 20:
+    try:
+      stderr.writeLine "X11 error ", e.errorCode, " (request ", e.requestCode,
+        ".", e.minorCode, ", resource 0x", e.resourceId.int.toHex, ")",
+        (if xErrors == 20: "; further X errors not logged" else: "")
+    except CatchableError: discard
+  0
+
 proc initMainWindow*(window: Window) =
-  ## Nothing to set up on X11 (the Windows port hooks its window here).
-  discard
+  ## Replaces Windy's fatal X error handler (it installs it when opening the
+  ## display, before the main window exists).
+  discard XSetErrorHandler(logXError)
 
 proc disableVsync*(window: Window) =
   ## Drivers (NVIDIA in particular) default to swap interval 1 even when Windy
@@ -371,18 +394,24 @@ type
     ## because both use the same visual.
     xid: XID
     pos, size*: IVec2
-    mapped, vsyncOff: bool
+    mapped: bool
 
   PopupInput* = object
     activity*: bool          ## any pointer or expose event arrived
     leftPressed*, leftReleased*, anyPressed*: bool
 
-var mainContext: pointer
+type PutState = object
+  gc: pointer
+  size: IVec2
+  hash: Hash
+  at: float
+
+var putStates: Table[XID, PutState]  ## see putPixelsOn
 
 proc newPopupWindow*(background: ColorRGBX): PopupWindow =
   let d = glXGetCurrentDisplay()
   var vi: XVisualInfo
-  # Same visual Windy uses for its windows, so the main GL context can draw here.
+  # Same visual Windy uses for its windows (see putPixelsOn).
   discard XMatchVisualInfo(d, XDefaultScreen(d), 24, TrueColor, vi.addr)
   let root = XDefaultRootWindow(d)
   let c = background  # opaque, so premultiplied == straight
@@ -409,7 +438,7 @@ proc show*(p: PopupWindow, pos, size: IVec2) =
   if not p.mapped:
     p.mapped = true
     discard XMapRaised(d, p.xid)
-    # Map before the first (direct-rendered) swap, or that frame can be lost.
+    putStates.del p.xid  # a fresh mapping starts out blank
     discard XSync(d, 0)
 
 proc hide*(p: PopupWindow) =
@@ -419,38 +448,45 @@ proc hide*(p: PopupWindow) =
   discard XUnmapWindow(d, p.xid)
   discard XFlush(d)
 
-proc beginDraw*(p: PopupWindow) =
-  ## Points the current GL context at the popup; GL state carries over.
-  let d = glXGetCurrentDisplay()
-  mainContext = glXGetCurrentContext()
-  discard glXMakeCurrent(d, p.xid, mainContext)
-  if not p.vsyncOff:
-    p.vsyncOff = true
-    disableVsync(p.xid)
+proc XCreateGC(d: XDisplay, drawable: XID, mask: culong, values: pointer): pointer {.importc, cdecl.}
+proc XCreateImage(d: XDisplay, visual: pointer, depth: cuint, format, offset: cint, data: pointer,
+                  w, h: cuint, pad, bytesPerLine: cint): pointer {.importc, cdecl.}
+proc XPutImage(d: XDisplay, drawable: XID, gc, image: pointer, srcX, srcY, dstX, dstY: cint,
+               w, h: cuint): cint {.importc, cdecl.}
 
-proc endDraw*(p: PopupWindow, main: Window) =
-  ## Presents the popup and makes the main window current again.
+proc putPixelsOn(xid: XID, size: IVec2, bgra: openArray[uint8]) =
+  ## Shows a size big image (BGRA, top row first) in window xid by core X
+  ## drawing. Menus and dialogs are drawn this way rather than by pointing
+  ## the GL context at their windows: that makes the driver allocate GL
+  ## buffers for each, and with VRAM full (a game running) NVIDIA fails it
+  ## with BadAlloc and leaves the context dead. Unchanged images are put
+  ## again only now and then, in case the server dropped the contents.
+  if size.x <= 0 or size.y <= 0 or bgra.len < size.x * size.y * 4: return
   let d = glXGetCurrentDisplay()
-  glXSwapBuffers(d, p.xid)
-  discard glXMakeCurrent(d, main.xid, mainContext)
+  if d == nil: return
+  let st = putStates.mgetOrPut(xid, PutState()).addr
+  let h = hash(bgra.toOpenArray(0, size.x * size.y * 4 - 1))
+  let t = epochTime()
+  if st.gc != nil and st.size == size and st.hash == h and t - st.at < 0.25: return
+  if st.gc == nil: st.gc = XCreateGC(d, xid, 0, nil)
+  (st.size, st.hash, st.at) = (size, h, t)
+  var vi: XVisualInfo  # the visual Windy and newPopupWindow use
+  discard XMatchVisualInfo(d, XDefaultScreen(d), 24, TrueColor, vi.addr)
+  const ZPixmap = 2.cint
+  let img = XCreateImage(d, vi.visual, 24, ZPixmap, 0, bgra[0].unsafeAddr,
+    size.x.cuint, size.y.cuint, 32, size.x * 4)
+  if img == nil: return
+  discard XPutImage(d, xid, st.gc, img, 0, 0, 0, 0, size.x.cuint, size.y.cuint)
+  discard XFlush(d)
+  discard XFree(img)  # the struct only; the pixels stay the caller's
 
-var vsyncOffFor: seq[XID]
+proc putPixels*(p: PopupWindow, bgra: openArray[uint8]) =
+  ## Shows a p.size image (BGRA, top row first) in the popup.
+  putPixelsOn(p.xid, p.size, bgra)
 
-proc beginDrawOn*(target: Window) =
-  ## Points the current (main window's) GL context at another window of the
-  ## same visual, so it draws with the main window's GL resources.
-  let d = glXGetCurrentDisplay()
-  mainContext = glXGetCurrentContext()
-  discard glXMakeCurrent(d, target.xid, mainContext)
-  if target.xid notin vsyncOffFor:
-    vsyncOffFor.add target.xid
-    disableVsync(target.xid)
-
-proc endDrawOn*(target, main: Window) =
-  ## Presents target and makes the main window current again.
-  let d = glXGetCurrentDisplay()
-  glXSwapBuffers(d, target.xid)
-  discard glXMakeCurrent(d, main.xid, mainContext)
+proc putPixels*(window: Window, size: IVec2, bgra: openArray[uint8]) =
+  ## Shows a size big image (BGRA, top row first) in the window.
+  putPixelsOn(window.xid, size, bgra)
 
 proc pollInput*(popups: openArray[PopupWindow], input: var PopupInput) =
   ## Drains the popups' X events (Windy only reads its own windows' events)

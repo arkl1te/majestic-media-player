@@ -76,6 +76,7 @@ type
     xf: VideoTransform
     subs: SubLayout
     subsKey: string           ## mpv subtitle placement last pushed
+    osdFit: tuple[key: string, target, x, y: (int, int), subMarginX: int, props: string]
     afterPlayback: AfterPlayback
     overlay: Overlay
     optionsDlg: OptionsDialog
@@ -1909,6 +1910,13 @@ const
   SubScaleStep = 0.1'f32     ## Shift+Numpad +/-
   SubMarginX = 19            ## mpv's sub-margin-x / sub-margin-y defaults
   SubMarginY = 34
+  OsdMargin = 16'f32         ## mpv's osd-margin-x / osd-margin-y defaults
+  OsdOutline = 1.65'f32      ## osd-outline-size
+  OsdBarW = 75'f32           ## osd-bar-w / -h (percent), -align-x / -y
+  OsdBarH = 3.125'f32
+  OsdBarAlign = (x: 0'f32, y: 0.5'f32)
+  OsdBarOutline = 0.5'f32    ## osd-bar-outline-size
+  OsdBarMarkerMin = 1.6'f32  ## osd-bar-marker-min-size
 
 proc alignSubs(a: App, x, y: int) =
   ## Re-aligning drops the nudge: it was relative to the old anchor.
@@ -1939,24 +1947,173 @@ proc subPadding(a: App): tuple[l, r, t, b: float32] =
     result.t = max(0, -2 * o.y)
     result.b = max(0, 2 * o.y)
 
-proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32]) =
-  ## Pushes the placement for a video drawn `video` pixels big. The anchored
+proc marginFill(a: App, target: (int, int), mx, my: (int, int)): (float32, float32) =
+  ## video-scale-x/y that stretch mpv's aspect-fitted video over the whole
+  ## box left inside the margins: mpv only honors the margins with
+  ## keepaspect, and keepaspect would otherwise undo the frame's own aspect
+  ## (Stretch, Increase Width...). Mirrors aspect_calc_panscan, plus half a
+  ## pixel so mpv's truncation lands on the box edge.
+  let (dw, dh) = (a.player.videoW.float32, a.player.videoH.float32)
+  if dw <= 0 or dh <= 0: return (1'f32, 1'f32)
+  let boxW = target[0] - mx[0] - mx[1]
+  let boxH = target[1] - my[0] - my[1]
+  var fw = boxW
+  var fh = int(boxW.float32 / dw * dh)
+  if fh > boxH or fh < a.player.videoH:
+    let tw = int(boxH.float32 / dh * dw)
+    if tw <= boxW:
+      fh = boxH
+      fw = tw
+  ((boxW.float32 + 0.5) / max(1, fw).float32, (boxH.float32 + 0.5) / max(1, fh).float32)
+
+const OsdPlayResY = 288.0  ## mpv's canvas height for the OSD and text subtitles
+
+proc lrint(x: float): float =
+  ## C's lrint under the default rounding mode: halves go to the even side.
+  let f = floor(x)
+  if x - f > 0.5 or (x - f == 0.5 and (int64(f) and 1) != 0): f + 1 else: f
+
+proc subMarginPx(marginX, w, h, cw, ch: int): float =
+  ## Pixels between a left/right-anchored text subtitle and the target's edge
+  ## for --sub-margin-x=marginX, in a w x h target holding a cw x ch video:
+  ## mpv truncates the margin to 288-high units, rescales it to its
+  ## video-aspect PlayResX (sd_ass configure_ass) and libass maps those
+  ## units over the video fitted into the target (fit_width).
+  let resX = float(int(OsdPlayResY * (float(cw) / float(ch))))
+  let units = lrint(float(int(float(marginX) * OsdPlayResY / 720)) * resX / 384)
+  let fit = if cw * h >= ch * w: float(w) else: float(cw) * float(h) / float(ch)
+  units * fit / resX
+
+proc unitsOpt(units: int): int =
+  ## Smallest margin option mpv truncates to `units` 288-high units.
+  int(ceil(float(units) * 720 / OsdPlayResY + 0.1))
+
+proc osdLayout(alignX, marginX: int, target: (int, int), mx, my: (int, int)):
+    tuple[target, x, y: (int, int), subMarginX: int, props: string] =
+  ## The OSD is laid out on the whole (padded) target: counter-scale and
+  ## re-place it so it keeps the look and spot it has on the unpadded video.
+  ## Its canvas is 288 units high (PlayResX = 288 * aspect, truncated) and
+  ## mpv truncates its margins to whole units, ~2 pixels or more, so a padded
+  ## target gets extra pixels on both sides of each axis, chosen so whole
+  ## units land on the spot. They leave centered subtitles in place; anchored
+  ## ones get their sub-margin-x redone to stay put. Returns the grown target
+  ## and margins, the subtitles' margin option and the OSD property settings.
+  let (cw, ch) = (target[0] - mx[0] - mx[1], target[1] - my[0] - my[1])
+  result = (target, mx, my, marginX, "")
+  if cw <= 0 or ch <= 0: return
+  let (vw, vh) = (float(cw), float(ch))
+  proc playResX(w, h: float): float = float(int(OsdPlayResY * (w / h)))
+  const marginUnits = int(OsdMargin * OsdPlayResY / 720)  # mpv's own text margin
+  # Where the text sits on the unpadded video, in target pixels.
+  let textX = float(marginUnits) * vw / playResX(vw, vh)
+  let textY = float(marginUnits) * vh / OsdPlayResY
+  # Where the anchored subtitles sit, from the video's left edge.
+  proc subX(m, w, h, left: int): float =
+    let px = subMarginPx(m, w, h, cw, ch)
+    (if alignX == 0: px else: float(w) - px) - float(left)
+  let subRef = subX(marginX, target[0], target[1], mx[0])
+  let padded = mx[0] + mx[1] + my[0] + my[1] > 0
+  # Each extra pixel moves the spot by one but also grows the units the
+  # margin is made of, so the farther the margin, the more pixels it takes
+  # to sweep a whole unit; anchored subtitles' units add their own period.
+  let (w0, h0) = (float(target[0]), float(target[1]))
+  let (ux0, uy0) = (w0 / playResX(w0, h0), h0 / OsdPlayResY)
+  let slowX = max(0.08, 1 - 2 * (textX + float(mx[0])) / ux0 / playResX(w0, h0))
+  let slowY = max(0.08, 1 - 2 * (textY + float(my[0])) / uy0 / OsdPlayResY)
+  let spanX = if not padded: 0 else: min(400, max(64, max(int(24 * uy0), int(32 / slowX))))
+  let spanY = if not padded or my[0] + my[1] == 0: 0 else: min(400, max(32, int(32 / slowY)))
+  var best = (score: Inf, ex: 0, ey: 0, ml: marginUnits, mv: marginUnits, sm: marginX)
+  for ey in 0 .. spanY:
+    for ex in 0 .. spanX:
+      let left = mx[0] + ex
+      let (w, h) = (target[0] + 2 * ex, target[1] + 2 * ey)
+      let (ux, uy) = (float(w) / playResX(float(w), float(h)), float(h) / OsdPlayResY)  # pixels per unit
+      let (x, y) = (textX + float(left), textY + float(my[0] + ey))
+      let (ml, mv) = (int(round(x / ux)), int(round(y / uy)))
+      var err = max(abs(float(ml) * ux - x), abs(float(mv) * uy - y))
+      var sm = marginX
+      if alignX != 1 and ex > 0:
+        # Redo the subtitles' margin for the moved edge: try the unit counts
+        # around the one that would put them back.
+        let need = (if alignX == 0: subRef + float(left) else: float(w - left) - subRef)
+        var subErr = Inf
+        let perUnit = subMarginPx(unitsOpt(8), w, h, cw, ch) / 8  # pixels per 288-high unit, roughly
+        let k = int(need / perUnit)
+        for kk in max(0, k - 2) .. k + 2:
+          let m = unitsOpt(kk)
+          let e = abs(subX(m, w, h, left) - subRef)
+          if e < subErr: (subErr, sm) = (e, m)
+        err = max(err, 2 * subErr)  # the subtitles are what's being watched
+      let score = err + 0.001 * float(ex + ey)  # equal fits: less padding
+      if score < best.score: best = (score, ex, ey, ml, mv, sm)
+  let (ex, ey) = (best.ex, best.ey)
+  result.target = (target[0] + 2 * ex, target[1] + 2 * ey)
+  result.x = (mx[0] + ex, mx[1] + ex)
+  result.y = (my[0] + ey, my[1] + ey)
+  result.subMarginX = best.sm
+  let (w, h) = (float(result.target[0]), float(result.target[1]))
+  let (resX0, resX) = (playResX(vw, vh), playResX(w, h))
+  let f = vh / h  # undoes the taller canvas's bigger units
+  let barOutline = OsdBarOutline * f
+  let barW = OsdBarW * vw / w
+  let barH = max(0.1, OsdBarH * f)
+  proc align(a, frame0, unit0, offset, frame, unit: float, obj, border: float): float =
+    ## osd-bar-align that puts the bar where `a` puts it on the unpadded
+    ## video (mirrors mpv's get_align; frames in units, units in pixels).
+    let (obj0, border0) = (obj * unit / unit0, border * unit / unit0)
+    let pos0 = border0 + (frame0 - 2 * border0 - obj0) / 2 * (1 + a)
+    let pos = (pos0 * unit0 + offset) / unit
+    let free = (frame - 2 * border - obj) / 2
+    if free <= 0: a else: clamp((pos - border - free) / free, -1.0, 1.0)
+  let barX = align(OsdBarAlign.x, resX0, vw / resX0, float(result.x[0]), resX, w / resX,
+                   resX * barW / 100, barOutline)
+  let barY = align(OsdBarAlign.y, OsdPlayResY, vh / OsdPlayResY, float(result.y[0]), OsdPlayResY,
+                   h / OsdPlayResY, OsdPlayResY * barH / 100, barOutline)
+  let (scale, outline, markerMin) = (f, OsdOutline * f, OsdBarMarkerMin * f)
+  result.props = &"osd-scale={scale:.6f}|osd-margin-x={unitsOpt(best.ml)}|" &
+    &"osd-margin-y={unitsOpt(best.mv)}|osd-outline-size={outline:.6f}|" &
+    &"osd-bar-w={barW:.6f}|osd-bar-h={barH:.6f}|osd-bar-align-x={barX:.6f}|" &
+    &"osd-bar-align-y={barY:.6f}|osd-bar-outline-size={barOutline:.6f}|" &
+    &"osd-bar-marker-min-size={markerMin:.6f}"
+
+proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32],
+                    target: (int, int)): tuple[x, y: (int, int), target: (int, int)] =
+  ## Pushes the placement for a video drawn `video` pixels big into a
+  ## `target` pixels big render target, returning the margins (target
+  ## pixels) mpv keeps the video out of and the target size, which the OSD
+  ## placement may grow by a few pixels. The anchored
   ## cases use mpv's own margins, in scaled pixels: 720 of them span the
   ## height, and text subtitles' 384x288 canvas makes 960 span the width.
   let s = a.subs
   let full = video + vec2(pad.l + pad.r, pad.t + pad.b)
   let (kx, ky) = (full.x / 960, full.y / 720)
-  let marginX =
+  let marginX0 =
     case s.alignX
     of 0: max(0, int(round(SubMarginX + s.offset.x / kx)))
     of 2: max(0, int(round(SubMarginX - s.offset.x / kx)))
     else: SubMarginX
   let marginY = if s.alignY == 0: max(0, int(round(SubMarginY + s.offset.y / ky))) else: SubMarginY
   let pos = if s.alignY == 2: clamp(100 + s.offset.y / video.y * 100, 0'f32, 150'f32) else: 100'f32
+  # Whole target pixels per margin; the ratios carry an extra half pixel so
+  # mpv's truncation (calc_margin) lands on exactly these.
+  let mx0 = (int(round(pad.l / full.x * target[0].float32)), int(round(pad.r / full.x * target[0].float32)))
+  let my0 = (int(round(pad.t / full.y * target[1].float32)), int(round(pad.b / full.y * target[1].float32)))
+  let fitKey = &"{s.alignX}|{s.alignY}|{marginX0}|{target}|{mx0}|{my0}"
+  if a.osdFit.key != fitKey:
+    let (t, x, y, m, props) = osdLayout(s.alignX, marginX0, target, mx0, my0)
+    a.osdFit = (fitKey, t, x, y, m, props)
+  let (target, mx, my, osd) = (a.osdFit.target, a.osdFit.x, a.osdFit.y, a.osdFit.props)
+  let marginX = a.osdFit.subMarginX
   # Subtitles scale with the target height; keep padding from growing them.
-  let scale = s.scale * video.y / full.y
+  let scale = s.scale * float32(target[1] - my[0] - my[1]) / target[1].float32
+  proc ratio(m, size: int): float32 = (if m > 0: (m.float32 + 0.5) / size.float32 else: 0)
+  let ratios = (l: ratio(mx[0], target[0]), r: ratio(mx[1], target[0]),
+                t: ratio(my[0], target[1]), b: ratio(my[1], target[1]))
+  let padded = mx[0] + mx[1] + my[0] + my[1] > 0
+  result = (mx, my, target)
+  let (fillX, fillY) = if padded: a.marginFill(target, mx, my) else: (1'f32, 1'f32)
   let key = &"{s.alignX}|{s.alignY}|{marginX}|{marginY}|{pos:.3f}|{scale:.4f}|" &
-    &"{pad.l / full.x:.5f}|{pad.r / full.x:.5f}|{pad.t / full.y:.5f}|{pad.b / full.y:.5f}"
+    &"{ratios.l:.5f}|{ratios.r:.5f}|{ratios.t:.5f}|{ratios.b:.5f}|{fillX:.6f}|{fillY:.6f}|{osd}"
   if key == a.subsKey: return
   a.subsKey = key
   let h = a.player.h
@@ -1966,10 +2123,18 @@ proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32]) =
   h.setProp("sub-margin-y", $marginY)
   h.setProp("sub-pos", pos)
   h.setProp("sub-scale", scale)
-  h.setProp("video-margin-ratio-left", pad.l / full.x)
-  h.setProp("video-margin-ratio-right", pad.r / full.x)
-  h.setProp("video-margin-ratio-top", pad.t / full.y)
-  h.setProp("video-margin-ratio-bottom", pad.b / full.y)
+  h.setProp("video-margin-ratio-left", ratios.l)
+  h.setProp("video-margin-ratio-right", ratios.r)
+  h.setProp("video-margin-ratio-top", ratios.t)
+  h.setProp("video-margin-ratio-bottom", ratios.b)
+  # Unpadded, keepaspect stays off: the target already has the frame's aspect.
+  h.setProp("keepaspect", padded)
+  h.setProp("video-scale-x", fillX)
+  h.setProp("video-scale-y", fillY)
+  for kv in osd.split('|'):
+    if kv.len > 0:
+      let p = kv.split('=')
+      h.setProp(p[0], p[1])
 
 proc digitPressed(pressed: ButtonView): int =
   ## Top-row digit pressed this frame (0-9), or -1.
@@ -2187,23 +2352,25 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   # The target is padded around the video to move centered subtitles.
   let pad = a.subPadding()
   let full = size + vec2(pad.l + pad.r, pad.t + pad.b)
-  a.applySubLayout(size, pad)
   # Render at the on-screen size (mpv does the high-quality scaling); cap the
   # texture so extreme zoom doesn't allocate huge buffers.
   let cap = min(1'f32, 4096 / max(full.x, full.y))
-  let tw = max(1, int(round(full.x * cap)))
-  let th = max(1, int(round(full.y * cap)))
+  let (mx, my, (tw, th)) = a.applySubLayout(size, pad,
+    (max(1, int(round(full.x * cap))), max(1, int(round(full.y * cap)))))
   let resized = tw != a.player.target.w or th != a.player.target.h
   a.player.target.ensureSize(tw, th)
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
-  # Shift the padded quad so the video part stays where the video belongs.
-  let sh = vec2((pad.r - pad.l) / 2, (pad.b - pad.t) / 2)
+  # Size and shift the padded quad so the texels mpv filled with video land
+  # exactly on the video's own rect (margins are whole texels, `full` isn't).
+  let k = vec2(size.x / max(1, tw - mx[0] - mx[1]).float32, size.y / max(1, th - my[0] - my[1]).float32)
+  let quadSize = vec2(tw.float32 * k.x, th.float32 * k.y)
+  let sh = vec2((mx[1] - mx[0]).float32 * k.x / 2, (my[1] - my[0]).float32 * k.y / 2)
   let rad = a.xf.rotation * PI.float32 / 180
   let shift = vec2(sh.x * cos(rad) - sh.y * sin(rad), sh.x * sin(rad) + sh.y * cos(rad))
-  a.quad.draw(a.player.target.tex, transformedCorners(center + shift, full, a.xf.rotation), fb.vec2)
+  a.quad.draw(a.player.target.tex, transformedCorners(center + shift, quadSize, a.xf.rotation), fb.vec2)
   glDisable(GL_SCISSOR_TEST)
 
 proc drawPreview(a: App, fb: IVec2) =
@@ -2867,10 +3034,25 @@ proc overlayFrame(a: App, title: string, size: Vec2): Rect =
     ui.consumeClick()
   r
 
-proc readFramebuffer(size: IVec2): Image =
-  result = newImage(size.x, size.y)
-  glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, result.data[0].addr)
-  result.flipVertical()
+proc beginDialogDraw(a: App, w: Window, sk: Silky, size: IVec2): bool =
+  ## Starts drawing a dialog window's frame (after the main window's swap).
+  ## On X11 it is drawn in the main window's buffer and put into the dialog
+  ## by X, so it needs no GL buffers of its own (see xwin_x11's putPixelsOn).
+  when defined(windows): w.beginDrawOn()
+  else:
+    sk.beginOffscreen(a.window.size, size, colPanel)
+    true
+
+proc dialogImage(size: IVec2): Image =
+  ## The dialog frame just drawn (for screenshots).
+  when defined(windows): readFramebuffer(size) else: offscreenImage(size)
+
+proc endDialogDraw(a: App, w: Window, sk: Silky, size: IVec2) =
+  ## Presents the dialog frame begun by beginDialogDraw.
+  when defined(windows): w.endDrawOn(a.window)
+  else:
+    sk.endOffscreen()
+    w.putPixels(size, offscreenPixels())
 
 proc renderOptions(a: App, shot: string) =
   ## Draws the Options window. Like the menu popups, call after the main
@@ -2887,7 +3069,7 @@ proc renderOptions(a: App, shot: string) =
   if size.x <= 0 or size.y <= 0: return
   # A text field being edited takes Escape itself.
   let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0
-  w.beginDrawOn()
+  if not a.beginDialogDraw(w, a.optSk, size): return  # retried next frame
   ui.beginFrame()
   a.optSk.beginUi(w, size)
   glViewport(0, 0, size.x, size.y)
@@ -2898,8 +3080,8 @@ proc renderOptions(a: App, shot: string) =
   ui.drawTooltip()
   a.optSk.endUi()
   ui.endFrame()
-  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-options.png")
-  w.endDrawOn(a.window)
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-options.png")
+  a.endDialogDraw(w, a.optSk, size)
   case action
   of oaOk: a.closeOptions(true)
   of oaCancel: a.closeOptions(false)
@@ -2923,7 +3105,7 @@ proc renderRename(a: App, shot: string) =
   if size.x <= 0 or size.y <= 0: return
   let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
   let esc = w.buttonPressed[KeyEscape]
-  w.beginDrawOn()
+  if not a.beginDialogDraw(w, a.renSk, size): return  # retried next frame
   ui.beginFrame()
   a.renSk.beginUi(w, size)
   glViewport(0, 0, size.x, size.y)
@@ -2937,8 +3119,8 @@ proc renderRename(a: App, shot: string) =
   ui.drawTooltip()
   a.renSk.endUi()
   ui.endFrame()
-  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-rename.png")
-  w.endDrawOn(a.window)
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-rename.png")
+  a.endDialogDraw(w, a.renSk, size)
   if ok or enter:
     a.renameBookmark(a.renPath, a.renTime, a.renText.strip)
     a.closeRename()
@@ -2956,7 +3138,7 @@ proc renderCommands(a: App, shot: string) =
     return
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
-  w.beginDrawOn()
+  if not a.beginDialogDraw(w, a.cmdSk, size): return  # retried next frame
   ui.beginFrame()
   a.cmdSk.beginUi(w, size)
   glViewport(0, 0, size.x, size.y)
@@ -2968,8 +3150,8 @@ proc renderCommands(a: App, shot: string) =
   ui.drawTooltip()
   a.cmdSk.endUi()
   ui.endFrame()
-  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-commands.png")
-  w.endDrawOn(a.window)
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-commands.png")
+  a.endDialogDraw(w, a.cmdSk, size)
   let d = a.cmdDlg
   case action
   of caNone: discard
@@ -3001,7 +3183,7 @@ proc renderPick(a: App, shot: string) =
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
   let marks = a.fileBookmarks
-  w.beginDrawOn()
+  if not a.beginDialogDraw(w, a.pickSk, size): return  # retried next frame
   ui.beginFrame()
   a.pickSk.beginUi(w, size)
   glViewport(0, 0, size.x, size.y)
@@ -3012,8 +3194,8 @@ proc renderPick(a: App, shot: string) =
   ui.drawTooltip()
   a.pickSk.endUi()
   ui.endFrame()
-  if shot.len > 0: readFramebuffer(size).writeFile(shot.changeFileExt("") & "-pick.png")
-  w.endDrawOn(a.window)
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-pick.png")
+  a.endDialogDraw(w, a.pickSk, size)
   case action
   of paNone: discard
   of paCancel: a.closePick()
@@ -3351,8 +3533,8 @@ proc frame(a: App) =
   # Menu popups live in their own windows. Draw them only after the main swap:
   # pointing the context at another drawable discards the main back buffer.
   a.menus.renderPopups(ui, if shot.len == 0: nil else:
-    proc (level: int, size: IVec2) =
-      readFramebuffer(size).writeFile(shot.changeFileExt("") & &"-menu{level}.png"))
+    proc (level: int, image: Image) =
+      image.writeFile(shot.changeFileExt("") & &"-menu{level}.png"))
   a.renderOptions(shot)
   a.renderRename(shot)
   a.renderCommands(shot)
