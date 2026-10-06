@@ -10,6 +10,7 @@
 # release below, unpacked with 7-Zip.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source tools/progress.sh
 
 BIN=majestic-media-player.exe
 LIBMPV_URL=https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261005/mpv-dev-x86_64-20261005-git-c152964208.7z
@@ -31,16 +32,16 @@ fetch_libmpv() {
   if [[ -f $LIBMPV_DIR/libmpv-2.dll && $(cat "$LIBMPV_DIR/.url" 2>/dev/null) == "$LIBMPV_URL" ]]; then
     return
   fi
-  echo "Fetching libmpv..."
   rm -rf "$LIBMPV_DIR"
   mkdir -p "$LIBMPV_DIR"
-  curl -fL --progress-bar -o "$LIBMPV_DIR/mpv-dev.7z" "$LIBMPV_URL"
+  pb_download "libmpv" "$LIBMPV_URL" "$LIBMPV_DIR/mpv-dev.7z"
   local sz
   sz=$(find_7z)
   (cd "$LIBMPV_DIR" && "$sz" x -y mpv-dev.7z >/dev/null)
   rm "$LIBMPV_DIR/mpv-dev.7z"
   [[ -f $LIBMPV_DIR/libmpv-2.dll ]] || { echo "libmpv-2.dll missing from the archive" >&2; exit 1; }
   echo "$LIBMPV_URL" > "$LIBMPV_DIR/.url"
+  pb_finish "libmpv ready."
 }
 
 resources() {

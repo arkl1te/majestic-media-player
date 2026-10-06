@@ -53,10 +53,12 @@ make install DESTDIR=pkgdir PREFIX=/usr  # staged install for packaging
 
 `make uninstall` (with the same `PREFIX`) removes it again.
 
-In a terminal, `make` shows a progress bar for the current step (each
-dependency being cloned, then Nim's module checking, C compilation and
-linking) and an overall bar underneath. When the output is piped or logged,
-it prints plain status lines instead.
+`make` prints one line per step (each dependency being cloned, then Nim's
+module checking, C compilation and linking), each with the time elapsed since
+the build started, a progress bar and the amount downloaded or compiled, so
+finished steps stay on screen. In a terminal the current step's line and an
+overall bar underneath update live; when the output is piped or logged, each
+line is printed once its step is done.
 
 `kdialog` provides the native file dialogs (`zenity` works as a fallback).
 Dependencies are pinned in `deps.lock` and cloned by `tools/fetch_deps.sh`, so

@@ -17,7 +17,8 @@ if [[ ! -f vendor/.stamp || deps.lock -nt vendor/.stamp || tools/fetch_deps.sh -
   STAGE_LO=40 STAGE_HI=100
 fi
 
-# Compile. Nim reports one [Processing] hint per module it checks and one
+# Compile: one line each for checking modules, C compilation and linking.
+# Nim reports one [Processing] hint per module it checks and one
 # "CC:" line per C file it compiles, then [Link]; everything else that isn't a
 # hint (warnings, errors) is passed through.
 stats="vendor/.build-stats-$(printf '%s' "$*" | cksum | cut -d' ' -f1)"
@@ -28,6 +29,9 @@ out=$(printf '%s\n' "$@" | sed -n 's/^-o://p' | tail -1)
 cmd=("$1" "$2" --hint:Processing:on --processing:filenames --hint:CC:on --hint:Link:on
      --hint:SuccessX:off --hint:Conf:off "${@:3}")
 proc=0 cc=0 phase=0
+# The per-phase totals are estimates, so a phase is only known to be complete
+# once the next one starts.
+end_phase() { [[ $PB_TASK == "$1" ]] || pb_task "$PB_TASK" 100 "$PB_TASK_INFO"; }
 PB_STATUS=$(mktemp)
 
 (( PB_TTY )) || pb_log "Compiling..."
@@ -37,14 +41,16 @@ while IFS= read -r line; do
   if [[ $line == *"[Processing]" ]]; then
     (( ++proc ))
     task=$(( proc * 100 / total_proc )); (( task > 99 )) && task=99
-    pb_task "Checking modules" "$task"
+    pb_task "Checking modules" "$task" "$proc modules"
     pb_total "Overall (compiling)" "$(stage_pct $(( task * 60 / 100 )))"
   elif [[ $line == CC:* ]]; then
+    end_phase "C compiler"
     (( ++cc ))
     task=$(( cc * 100 / total_cc )); (( task > 99 )) && task=99
-    pb_task "C compiler (${line#CC: })" "$task"
+    pb_task "C compiler" "$task" "$cc files"
     pb_total "Overall (compiling)" "$(stage_pct $(( 60 + task * 37 / 100 )))"
   elif [[ $line == *"[Link]" ]]; then
+    end_phase "Linking"
     pb_task "Linking" 50
     pb_total "Overall (compiling)" "$(stage_pct 97)"
   elif [[ $line != Hint:* && $line != *") Hint: "* ]]; then
@@ -61,6 +67,6 @@ fi
 # Only full builds give meaningful totals; incremental ones compile fewer C files.
 (( cc * 2 > total_cc )) || cc=$total_cc
 echo "$proc $cc" > "$stats"
-pb_task "Done" 100
+pb_task "Linking" 100
 pb_total "Overall" 100
 pb_finish "Built ${out:-binary}."

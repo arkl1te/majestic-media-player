@@ -50,3 +50,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.pkg.outputs.name }}.zip
+          append_body: true
+          body: |
+            ### Windows
+            Download `${{ steps.pkg.outputs.name }}.zip`, unpack it anywhere and run `majestic-media-player.exe`.
+
+            ### Linux
+            Linux builds from source, so it links against your system's mpv. Download **Source code (tar.gz)** below, then:
+
+            ```sh
+            tar -xzf majestic-media-player-*.tar.gz
+            cd majestic-media-player-*/
+            ./install.sh
+            ```
+
+            On Arch / CachyOS, missing packages are installed with `pacman`; on other distributions install `nim` (2.2+), `git`, a C compiler, `make`, `mpv` (libmpv) and `libx11` first. The player is installed to `~/.local` (`./install.sh --system` for `/usr/local`).
+
+            **Updating:** do the same with the newer release. It installs over the old version; your settings, bookmarks and resume positions in `~/.config/majestic-media-player/` are kept. The extracted folder can be deleted afterwards.

@@ -132,6 +132,13 @@ type
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
+    rotDrag: bool             ## Alt+Middle drag is turning the frame
+    rotPivot: Vec2            ## window pixels the frame turns around
+    rotStart: VideoTransform  ## transform when the drag began
+    rotRef: float32           ## cursor angle around the pivot the turn counts from
+    rotRefSet: bool
+    rotPressPos: Vec2         ## window pixels where the press began
+    rotMoved: bool            ## past the click threshold; a click resets rotation
     lastMouse: Vec2
     lastMouseMove: float
     pointerShape: PointerShape
@@ -682,6 +689,21 @@ proc spawn(a: App, cmd: string, args: varargs[string]) =
     a.children.add startProcess(cmd, args = @args, options = opts)
   except OSError as e:
     stderr.writeLine "cannot run ", cmd, ": ", e.msg
+
+proc showInFolder(a: App, path: string) =
+  ## Opens the file manager on path's folder with the file selected.
+  if path.contains("://"): return
+  let path = path.absolutePath
+  when defined(windows):
+    a.spawn("explorer.exe", "/select," & path)
+  else:
+    # FileManager1 (Dolphin, Nautilus, ...) selects the file; else just open the folder.
+    if findExe("dbus-send").len > 0 and execCmdEx("dbus-send --session --print-reply " &
+        "--dest=org.freedesktop.FileManager1 /org/freedesktop/FileManager1 " &
+        "org.freedesktop.FileManager1.ShowItems array:string:" & quoteShell(path.fileUri) &
+        " string:").exitCode == 0:
+      return
+    a.spawn("xdg-open", path.parentDir)
 
 when defined(windows):
   proc runPowerAction(a: App) =
@@ -1526,8 +1548,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   file.item("Open File...", "Ctrl+O", enabled = not locked, action = proc () = a.openFileDialog())
   let recent = file.sub("Open Recent", enabled = a.cfg.recentFiles.len > 0 and not locked)
   let openOne = proc (path: string) = a.openPaths(@[path])
+  let removeOne = proc (path: string) =
+    let i = a.cfg.recentFiles.find(path)
+    if i >= 0: a.cfg.recentFiles.delete(i)
+    if a.cfg.recentFiles.len == 0: a.menus.close()
   for r in a.cfg.recentFiles:
-    recent.item(r.extractFilename, action = bindAct(openOne, r))
+    recent.item(r.extractFilename, action = bindAct(openOne, r),
+      remove = bindAct(removeOne, r))
   if a.cfg.recentFiles.len > 0:
     recent.sep()
     recent.item("Clear List", action = proc () = a.cfg.recentFiles.setLen 0)
@@ -1821,9 +1848,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let sel = a.plSelected
     let hasSel = sel >= 0 and sel < n
     let edit = not locked
-    pl.item("Add Media File...", enabled = edit, action = proc () =
-      a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
-        filterName = "Media files"))
+    if hasSel:
+      let path = a.playlist[sel]
+      pl.item("Open Containing Directory", enabled = not path.contains("://"),
+        action = proc () = a.showInFolder(path))
+      pl.sep()
+    else:
+      pl.item("Add Media File...", enabled = edit, action = proc () =
+        a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
+          filterName = "Media files"))
     pl.item("Remove Media File", "Delete", enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.sep()
@@ -2085,6 +2118,41 @@ proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
   a.xf.pan = at + (c + a.xf.pan - at) * k - c
   a.xf.zoom = z
   a.xfChanged(&"Zoom: {int(round(z * 100))}%")
+
+proc beginRotate(a: App, area: Rect, at: Vec2, atCursor: bool) =
+  ## Alt+Middle press: the frame turns around its center, or around the
+  ## cursor (Ctrl). `area` and `at` are window pixels.
+  a.rotDrag = true
+  a.rotStart = a.xf
+  a.rotRefSet = false
+  a.rotPressPos = at
+  a.rotMoved = false
+  a.rotPivot = if atCursor: at else: area.xy + area.wh / 2 + a.xf.pan
+
+proc rotateDrag(a: App, area: Rect, at: Vec2, snap: bool) =
+  ## Alt+Middle drag: turns the frame by the angle the cursor sweeps around
+  ## the pivot; Shift snaps the rotation to multiples of the Rotate step.
+  if not a.rotMoved:
+    if (at - a.rotPressPos).length <= 4: return
+    a.rotMoved = true
+  let v = at - a.rotPivot
+  if v.length < 8: return  # too close to the pivot for a steady angle
+  let ang = arctan2(v.y, v.x) * 180 / PI.float32
+  if not a.rotRefSet:
+    a.rotRef = ang; a.rotRefSet = true
+    return
+  var r = floorMod(a.rotStart.rotation + ang - a.rotRef, 360)
+  if snap:
+    let step = max(1'f32, a.cfg.rotateStep.float32)
+    r = floorMod(round(r / step) * step, 360)
+  else: r = round(r * 10) / 10
+  let d = (r - a.rotStart.rotation) * PI.float32 / 180
+  let c = area.xy + area.wh / 2
+  let o = c + a.rotStart.pan - a.rotPivot
+  a.xf.pan = a.rotPivot + vec2(o.x * cos(d) - o.y * sin(d), o.x * sin(d) + o.y * cos(d)) - c
+  if r != a.xf.rotation:
+    a.xf.rotation = r
+    a.xfChanged(&"Rotation: {r:g}°")
 
 proc pollVideoFrame(a: App) =
   ## Picks up newly queued mpv frames and decides whether one is due.
@@ -2352,11 +2420,17 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
         @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
           ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")]]
   elif al and not c and not s:
-    result = @[@[("Enter", "Fullscreen")], @[("I", "Screenshot")]]
+    result = @[@[("Enter", "Fullscreen")], @[("I", "Screenshot")], @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]]
     if all:
       result.add @[("Num4", "Rotate " & rot & " CCW"), ("Num5", "Reset Rotation"),
         ("Num6", "Rotate " & rot & " CW")]
     result.add @[("X", "Exit")]
+  elif al and s and not c:
+    result = @[@[("MDrag", "Rotate In " & rot & " Steps")]]
+  elif c and al and not s:
+    result = @[@[("MDrag", "Rotate Around Cursor")]]
+  elif c and al and s:
+    result = @[@[("MDrag", "Rotate Around Cursor In " & rot & " Steps")]]
   elif s and not c and not al:
     result = @[@[(",", "Slower Playback"), (".", "Faster Playback")],
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
@@ -3065,6 +3139,9 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
+      ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
+      ("Reset rotation", "Alt+Middle-click video"),
+      ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
       ("Toggle seek snapping", "Shift+Drag seek bar")])]]
 
 proc shortcutsOverlay(a: App) =
@@ -3172,8 +3249,16 @@ proc frame(a: App) =
       if w.ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
       else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
-    if ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
+    if ui.pressed(MouseMiddle) and w.alt:
+      a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
+    elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
       a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
+  if a.rotDrag:
+    if not ui.down(MouseMiddle):
+      a.rotDrag = false
+      if not a.rotMoved:  # Alt+Middle-click
+        a.xf.rotation = 0; a.xfChanged("Rotation: 0°")
+    else: a.rotateDrag(a.px(videoArea), ui.mouse * a.sk.uiScale, w.shift)
   if a.videoPress:
     if not ui.down():
       a.videoPress = false

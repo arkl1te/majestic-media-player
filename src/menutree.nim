@@ -19,6 +19,7 @@ type
     checked*, enabled*: bool
     children*: seq[MenuNode]
     action*: proc ()
+    remove*: proc ()          ## set: a cross at the row's right end runs it
 
   MenuMode = enum
     mmClosed, mmBar, mmContext
@@ -42,6 +43,7 @@ type
     boundsValid: bool
     grabbed: bool             ## holds the pointer grab taken while open
     pendingAction: proc ()
+    pendingRemove: proc ()
 
 proc newMenuSystem*(): MenuSystem = MenuSystem()
 
@@ -54,9 +56,9 @@ proc sub*(parent: MenuNode, label: string, enabled = true): MenuNode =
   parent.children.add result
 
 proc item*(parent: MenuNode, label: string, shortcut = "", enabled = true,
-           action: proc () = nil) =
+           action: proc () = nil, remove: proc () = nil) =
   parent.children.add MenuNode(label: label, shortcut: shortcut, kind: mkAction,
-    enabled: enabled, action: action)
+    enabled: enabled, action: action, remove: remove)
 
 proc check*(parent: MenuNode, label: string, shortcut = "", checked: bool,
             enabled = true, action: proc () = nil) =
@@ -162,6 +164,10 @@ proc popupSize(ui: Ui, node: MenuNode): Vec2 =
   let w = checkW + labelW + (if scW > 0: shortcutGap + scW else: 0) + arrowW + padX
   vec2(ceil(max(w, 160)), ceil(h))
 
+proc removeRect(row: Rect): Rect =
+  ## The cross of a removable row, in the space submenu arrows use.
+  rect(row.x + row.w - arrowW - 2, row.y + 2, arrowW, row.h - 4)
+
 iterator rows(node: MenuNode, r: Rect): (int, Rect) =
   ## Each child's row inside a popup at r (separators get a short row).
   var y = r.y + 4
@@ -205,8 +211,11 @@ proc layoutPopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
       if m.path.len > depth and m.path[depth] == i:
         openChild = i
         openRow = row
-    elif hov and released and c.action != nil:
-      m.pendingAction = c.action
+    elif hov and released:
+      if c.remove != nil and m.mouse.inside(removeRect(row)):
+        m.pendingRemove = c.remove
+      elif c.action != nil:
+        m.pendingAction = c.action
 
   if openChild >= 0:
     m.layoutPopup(ui, node.children[openChild], openRow, depth + 1, false, released)
@@ -235,6 +244,11 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
     if c.shortcut.len > 0:
       ui.textIn(c.shortcut, rect(row.x, row.y, row.w - arrowW, row.h),
         if c.enabled: colTextDim else: colTextDisabled, h = RightAlign)
+    if c.remove != nil and c.enabled:
+      let xr = removeRect(row)
+      let xHov = mouse.inside(xr)
+      if xHov: ui.rect(xr, colPressed)
+      ui.icon("close16", xr.xy + xr.wh / 2, if xHov: colText else: colTextDim)
     if c.kind == mkSub:
       ui.icon("arrow16", vec2(row.x + row.w - arrowW / 2, row.y + row.h / 2), fg)
 
@@ -280,6 +294,11 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   of mmContext:
     m.layoutPopup(ui, contextRoot, rect(m.contextPos, vec2(0, 0)), 0, true, released)
   of mmClosed: discard
+  if m.pendingRemove != nil:
+    # Removing keeps the menu open, so several entries can go in a row.
+    let rm = m.pendingRemove
+    m.pendingRemove = nil
+    rm()
   if m.pendingAction != nil:
     let a = m.pendingAction
     m.pendingAction = nil

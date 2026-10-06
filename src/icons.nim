@@ -107,6 +107,7 @@ const mouseIcons* = {
   "MMB": ("mouse-mmb16", "middle", ""),
   "Wheel": ("mouse-wheel16", "middle", "v"),
   "Drag": ("mouse-drag16", "left", "h"),
+  "MDrag": ("mouse-mdrag16", "middle", "h"),
 }
 
 proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
