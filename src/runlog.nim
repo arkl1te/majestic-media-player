@@ -22,6 +22,7 @@ type
     code*: int          ## exit code; -1 while running
     error*: string      ## why it did not start
     stopped*: bool      ## ended by the Stop button
+    reveal*: seq[string]  ## files whose folders open once it succeeds
     cr: bool            ## a carriage return came: the next text replaces the line
 
 proc running*(e: RunEntry): bool = e.p != nil

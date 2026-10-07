@@ -3,67 +3,103 @@
   "title": "Create cut",
   "parts": [
    {
-    "text": "ffmpeg -ss ",
+    "text": "ffmpeg -y -ss ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "from",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -to ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "to",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -i ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "video",
     "kind": "reference",
-    "content": "file"
+    "content": "file",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -pix_fmt yuv420p -movflags +faststart ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "output",
     "kind": "value",
-    "content": "~/output.mp4"
+    "content": "~/output.mp4",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": true
    },
    {
     "text": " ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    }
   ]
  },
@@ -75,77 +111,121 @@
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "video",
     "kind": "reference",
-    "content": "file"
+    "content": "file",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " \"$t/media\" && ffmpeg -ss ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "from",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -to ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "to",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -copyts -i ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "video",
     "kind": "reference",
-    "content": "file"
+    "content": "file",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -vf \"subtitles=$t/media,setpts=PTS-STARTPTS\" -af \"asetpts=PTS-STARTPTS\" -pix_fmt yuv420p -movflags +faststart ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "output",
     "kind": "value",
-    "content": "~/output.mp4"
+    "content": "~/output.mp4",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": true
    },
    {
     "text": "; rm -r \"$t\"",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    }
   ]
  },
@@ -157,127 +237,187 @@
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "from",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -to ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "to",
     "kind": "reference",
-    "content": "bookmark"
+    "content": "bookmark",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -i ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "video",
     "kind": "reference",
-    "content": "file"
+    "content": "file",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -vf crop=",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "width",
     "kind": "value",
-    "content": "",
+    "content": "320",
     "rect": 1,
-    "dim": "width"
+    "dim": "width",
+    "path": false,
+    "reveal": false
    },
    {
     "text": ":",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "height",
     "kind": "value",
-    "content": "",
+    "content": "200",
     "rect": 1,
-    "dim": "height"
+    "dim": "height",
+    "path": false,
+    "reveal": false
    },
    {
     "text": ":",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "x",
     "kind": "value",
-    "content": "",
+    "content": "100",
     "rect": 1,
-    "dim": "x"
+    "dim": "x",
+    "path": false,
+    "reveal": false
    },
    {
     "text": ":",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "y",
     "kind": "value",
-    "content": "",
+    "content": "100",
     "rect": 1,
-    "dim": "y"
+    "dim": "y",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " -pix_fmt yuv420p -movflags +faststart ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "output",
     "kind": "value",
-    "content": "~/output.mp4"
+    "content": "~/output.mp4",
+    "rect": 0,
+    "dim": "none",
+    "path": true,
+    "reveal": false
    },
    {
     "text": " ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    }
   ]
  },
@@ -289,28 +429,44 @@
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "video",
     "kind": "reference",
-    "content": "file"
+    "content": "file",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": " --chapters ",
     "card": false,
     "name": "",
     "kind": "value",
-    "content": ""
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    },
    {
     "text": "",
     "card": true,
     "name": "chapters",
     "kind": "reference",
-    "content": "external"
+    "content": "external",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
    }
   ]
  }

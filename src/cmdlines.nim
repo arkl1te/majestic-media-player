@@ -4,7 +4,9 @@
 ## it or an external file. When the command runs, a file dialog asks for each
 ## external file, then the Run window asks for the bookmarks and lets the
 ## values be changed. Value cards can be numbers of a rectangle (its width,
-## height, x or y) that the Run window lets be drawn over the video.
+## height, x or y) that the Run window lets be drawn over the video, or a
+## file path it lets be browsed for with a save dialog; a path card can have
+## its folder opened once the command succeeds.
 
 import std/[strutils, sequtils, os, math, tables]
 import silky, vmath, bumpy, pixie
@@ -12,7 +14,7 @@ import ui, theme, config
 
 type
   CmdAction* = enum
-    caNone, caApply, caDelete, caCancel
+    caNone, caApply, caOk, caDelete, caCancel
 
   CmdDialog* = ref object
     saved*: seq[CommandLine]  ## the saved command lines, for the title list
@@ -30,7 +32,7 @@ type
     listOpen: bool            ## title list dropped down
     listScroll: int           ## its first row shown
     error: string             ## why the last Apply was refused
-    applyRequested*: bool     ## debug scripting: press Apply next frame
+    applyRequested*: bool     ## debug scripting: press OK next frame
 
 const
   LineH = 26'f32              ## command line row
@@ -76,6 +78,8 @@ proc isExternal(p: CmdPart): bool =
   p.card and p.kind == ckReference and p.content == "external"
 
 proc isRect*(p: CmdPart): bool = p.card and p.kind == ckValue and p.rect > 0
+
+proc isPath*(p: CmdPart): bool = p.card and p.kind == ckValue and p.path
 
 proc digitsOnly*(s: string): string =
   for c in s:
@@ -173,7 +177,7 @@ proc commandLine*(d: CmdDialog): CommandLine =
 
 proc validate(d: CmdDialog): string =
   let title = d.title.strip
-  if title.len == 0: return "Give the command line a title."
+  if title.len == 0: return "Give the command line a name."
   for c in d.saved:
     if c.title == title and c.title != d.origTitle:
       return "Another command line is already called “" & title & "”."
@@ -185,7 +189,8 @@ proc validate(d: CmdDialog): string =
       return "Choose what card " & t.name & " refers to."
     for u in d.toks[0 ..< i]:
       if u.card and u.name == t.name and (u.kind != t.kind or u.content != t.content or
-                                          u.rect != t.rect or u.dim != t.dim):
+                                          u.rect != t.rect or u.dim != t.dim or
+                                          u.path != t.path or u.reveal != t.reveal):
         return "Two different cards are named " & t.name & "."
 
 proc insertTok(d: CmdDialog, t: CmdPart, at: int) =
@@ -200,7 +205,7 @@ proc deleteTok(d: CmdDialog, at: int) =
 proc isSpace(t: CmdPart): bool = not t.card and t.text == " "
 
 proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0,
-              dim = rdNone) =
+              dim = rdNone, path = false, reveal = false) =
   ## Inserts a card at the caret, spaced from its neighbours, and selects it;
   ## the caret goes after the space that follows it.
   var at = clamp(d.caret, 0, d.toks.len)
@@ -208,7 +213,7 @@ proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0
     d.insertTok(CmdPart(text: " "), at)
     inc at
   d.insertTok(CmdPart(card: true, name: name, kind: kind, content: content, rect: rect,
-    dim: dim), at)
+    dim: dim, path: path, reveal: reveal), at)
   # Typing carries on after a space.
   if at + 1 == d.toks.len or not d.toks[at + 1].isSpace:
     d.insertTok(CmdPart(text: " "), at + 1)
@@ -515,7 +520,7 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
       continue
     let chip = rect(tr.x + 1, tr.y + 3, tr.w - 2, tr.h - 6)
     ui.rect(chip, if t.kind == ckReference: colCardRef elif t.isRect: colCardRect
-                  else: colCardValue)
+                  elif t.isPath: colCardPath else: colCardValue)
     let bad = not validName(t.name) or t.kind == ckReference and t.content.len == 0
     # The other cards of the selected card's rectangle are outlined dashed.
     let sibling = t.isRect and d.selected >= 0 and d.selected < d.toks.len and
@@ -625,6 +630,8 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
     d.toks[s].content = "file"
     d.toks[s].rect = 0
     d.toks[s].dim = rdNone
+    d.toks[s].path = false
+    d.toks[s].reveal = false
     d.refScroll = 0
   y += 34
   ui.textIn("Content", rect(r.x, y, labelW, 26), colText)
@@ -640,15 +647,29 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
       d.toks[s].content, path)
     return
   let contents = [(key: "text", label: "Text", detail: ""),
-                  (key: "rect", label: "Rectangle", detail: "drawn on run")]
-  var content = if d.toks[s].isRect: "rect" else: "text"
-  if d.choiceList(ui, "cl-kind", rect(r.x + labelW, y, fw, RowH * 2 + 2), contents, content):
+                  (key: "rect", label: "Rectangle", detail: "drawn on run"),
+                  (key: "path", label: "Path", detail: "browsed for on run")]
+  var content = if d.toks[s].isRect: "rect" elif d.toks[s].isPath: "path" else: "text"
+  if d.choiceList(ui, "cl-kind", rect(r.x + labelW, y, fw, RowH * 3 + 2), contents, content):
+    d.toks[s].path = content == "path"
+    if not d.toks[s].path: d.toks[s].reveal = false
     if content == "rect": d.makeRect(s)
     else:
       d.toks[s].rect = 0
       d.toks[s].dim = rdNone
-  y += RowH * 2 + 10
+  y += RowH * 3 + 10
   ui.textIn("Default", rect(r.x, y, labelW, 26), colText)
+  if d.toks[s].isPath:
+    discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "path")
+    ui.textIn("Can be changed or browsed for on run.", rect(r.x + labelW, y + 28, fw, 18),
+      colTextDim, FontSmall)
+    ui.textIn("~ is home; else from the media's folder.", rect(r.x + labelW, y + 46, fw, 18),
+      colTextDim, FontSmall)
+    discard ui.checkbox("cl-reveal", vec2(r.x + labelW, y + 70), "Open containing folder",
+      d.toks[s].reveal)
+    ui.textIn("once the command succeeds.", rect(r.x + labelW + 24, y + 92, fw - 24, 18),
+      colTextDim, FontSmall)
+    return
   if not d.toks[s].isRect:
     discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "text")
     ui.textIn("Can be changed on run.", rect(r.x + labelW, y + 28, fw, 18), colTextDim, FontSmall)
@@ -700,16 +721,31 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
   let W = r.w
   let H = r.h
 
-  # Title, with the saved command lines dropped down from the arrow.
-  ui.textIn("Title", rect(r.x + 16, r.y + 10, 200, 20), colTextDim, FontSmall)
+  # Name, with the saved command lines dropped down from the arrow.
+  ui.textIn("Name", rect(r.x + 16, r.y + 10, 200, 20), colTextDim, FontSmall)
   let titleR = rect(r.x + 16, r.y + 32, W - 32 - 34 - 88 * 2, 28)
   let arrowR = rect(titleR.x + titleR.w + 4, titleR.y, 30, 28)
   let newR = rect(arrowR.x + arrowR.w + 8, titleR.y, 80, 28)
   let delR = rect(newR.x + newR.w + 8, titleR.y, 80, 28)
   const ListMax = 10
-  let listRows = d.saved.len
-  let listR = rect(titleR.x, titleR.y + titleR.h + 2, titleR.w + 34,
-    min(listRows, ListMax).float32 * RowH + 2)
+  # Presets first, then the user's own behind a separator (-1).
+  var entries: seq[int]
+  for presets in [true, false]:
+    var first = true
+    for i, c in d.saved:
+      if c.isPreset != presets: continue
+      if first and entries.len > 0: entries.add -1
+      first = false
+      entries.add i
+  let listRows = entries.len
+  proc entryH(e: int): float32 = (if e < 0: MenuSeparatorHeight else: RowH)
+  # Tall enough for its tallest stretch of rows, so scrolling keeps its size.
+  var listH = 0'f32
+  for s in 0 .. max(0, listRows - ListMax):
+    var h = 0'f32
+    for e in entries[s ..< min(listRows, s + ListMax)]: h += entryH(e)
+    listH = max(listH, h)
+  let listR = rect(titleR.x, titleR.y + titleR.h + 2, titleR.w + 34, listH + 2)
   let overList = d.listOpen and ui.mouse.inside(listR)
   var escUsed = false
   if d.listOpen:
@@ -773,25 +809,25 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
     d.newCard(ui)
   d.properties(ui, rect(rightR.x, rightR.y + 44, rightR.w, rightR.h - 44), path)
 
-  # Buttons; the reason for a refused Apply on their left.
+  # Buttons; the reason for a refused Apply or OK on their left.
   ui.rect(rect(r.x + 1, r.y + H - 50, W - 2, 1), colBorder)
   let by = r.y + H - 40
   if d.error.len > 0:
-    ui.textIn(ui.ellipsize(d.error, W - 260), rect(r.x + 16, by, W - 260, 30), colError)
+    ui.textIn(ui.ellipsize(d.error, W - 360), rect(r.x + 16, by, W - 360, 30), colError)
+  let apply = ui.textButton("cl-apply", rect(r.x + W - 312, by, 92, 30), "Apply")
   let cancel = ui.textButton("cl-cancel", rect(r.x + W - 212, by, 92, 30), "Cancel")
-  var apply = ui.textButton("cl-apply", rect(r.x + W - 112, by, 92, 30), "Apply",
-    primary = true)
+  var ok = ui.textButton("cl-ok", rect(r.x + W - 112, by, 92, 30), "OK", primary = true)
   if d.applyRequested:
     d.applyRequested = false
-    apply = true
-  # Enter applies unless a focused button took it.
+    ok = true
+  # Enter is OK unless a focused button took it.
   if keys and not ui.enterUsed and
      (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]):
-    apply = true
+    ok = true
   if cancel or keys and not escUsed and w.buttonPressed[KeyEscape]: result = caCancel
-  elif apply:
+  elif apply or ok:
     d.error = d.validate
-    if d.error.len == 0: result = caApply
+    if d.error.len == 0: result = (if ok: caOk else: caApply)
 
   # The dropped-down title list, over everything.
   if d.listOpen:
@@ -800,9 +836,14 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
     ui.rect(rect(listR.xy + vec2(3, 4), listR.wh), colShadow)
     ui.rect(listR, colPopup)
     ui.border(listR, colBorder)
+    var y = listR.y + 1
     for n in 0 ..< min(listRows, ListMax):
-      let i = n + d.listScroll
-      let rr = rect(listR.x + 1, listR.y + 1 + n.float32 * RowH, listR.w - 2, RowH)
+      let i = entries[n + d.listScroll]
+      let rr = rect(listR.x + 1, y, listR.w - 2, entryH(i))
+      y += rr.h
+      if i < 0:
+        ui.rect(rect(rr.x + 8, rr.y + rr.h / 2, rr.w - 16, 1), colBorder)
+        continue
       let hov = ui.hover(rr)
       if hov: ui.rect(rr, colHover)
       let label = d.saved[i].title
@@ -824,7 +865,7 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
 
 type
   PickAction* = enum
-    paNone, paRun, paCancel, paDraw
+    paNone, paRun, paCancel, paDraw, paBrowse
 
   PickDialog* = ref object
     ## Shown when a command line with value or bookmark cards runs: one row
@@ -837,6 +878,7 @@ type
     crossed*: seq[bool]       ## rectangle rows: a drawn rectangle leaves them alone
     drawing*: int             ## rectangle being drawn over the video, else 0
     drawRequest*: int         ## with paDraw: the rectangle to draw
+    browseRow*: int           ## with paBrowse: the path row to browse for
     openRow*: int             ## row whose dropdown is open, else -1
     listScroll: int
     runRequested*: bool       ## debug scripting: press Run next frame
@@ -955,6 +997,12 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
         if lit: colRect elif d.crossed[i]: colTextDisabled else: colTextDim)
       ui.tip(ir, if d.crossed[i]: "Kept as typed; right-click to let the drawn rectangle set it"
                  else: "Draw the rectangle on the video; right-click to keep this value")
+      continue
+    if row.isPath:
+      discard ui.textField(id, rect(dr.x, dr.y, dr.w - 32, dr.h), d.texts[i], "path")
+      if ui.iconButton(id & "-browse", iconRect(dr), "folder20", "Choose where to save"):
+        result = paBrowse
+        d.browseRow = i
       continue
     if not row.isBookmark:
       discard ui.textField(id, dr, d.texts[i], "empty")

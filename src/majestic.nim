@@ -1322,6 +1322,11 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "plsave": a.savePlaylist(paths[0])
   of "bmexport": a.exportBookmarks(paths[0])
   of "bmimport": a.importBookmarks(paths[0])
+  of "pickpath":  # Run window, a path row's folder button
+    let d = a.pickDlg
+    if a.overlay == ovPick and d.browseRow >= 0 and d.browseRow < d.texts.len:
+      d.texts[d.browseRow] = paths[0]
+      a.pickWin.activate()
   of "extfile":
     if a.extQueue.len > 0:
       a.extPicks[a.extQueue[0]] = paths[0].absolutePath
@@ -1554,15 +1559,25 @@ proc setRunLogShown(a: App, shown: bool) =
   let h = int32(a.runLogHeight)
   a.resizeKeepingVideo(ivec2(0, if shown: h else: -h))
 
+proc runDir(a: App): string =
+  ## Where command lines run: the media file's folder, else home.
+  let path = if a.player.loaded: a.player.path else: ""
+  if path.len > 0 and not path.contains("://"): path.parentDir else: getHomeDir()
+
 proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   ## Runs c with bash in the media file's folder, its cards resolved against
   ## the current file and picks (what the Run window gave each card). Output
   ## goes to the run log (and our stdout).
   let path = if a.player.loaded: a.player.path else: ""
   let (script, err) = c.parts.compose(path, picks)
-  let dir =
-    if path.len > 0 and not path.contains("://"): path.parentDir else: getHomeDir()
+  let dir = a.runDir
   let e = newRunEntry(c.title, dir)
+  for p in c.parts:
+    if not (p.isPath and p.reveal): continue
+    let v = p.resolve(path, picks).value
+    if v.len == 0: continue
+    let f = if v.isAbsolute: v else: dir / v
+    if f notin e.reveal: e.reveal.add f
   a.runLog.add e
   a.runLog.trim()
   a.rlFollow = true
@@ -1636,6 +1651,8 @@ proc pollJobs(a: App) =
       a.osd(if e.stopped: e.title & " stopped"
         elif e.code == 0: e.title & " finished"
         else: &"{e.title} failed (exit code {e.code})")
+      if e.code == 0 and not e.stopped:
+        for f in e.reveal: a.showInFolder(f)
 
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
@@ -1908,12 +1925,18 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   # Run: the Commands window and the command lines it saved.
   let run = root.sub("Run")
   run.item("Commands...", action = proc () = a.showCommands())
-  run.sep()
   if a.commands.len == 0:
+    run.sep()
     run.item("No command lines", enabled = false)
   let runOne = proc (c: CommandLine) = a.runCommandLine(c)
-  for c in a.commands:
-    run.item(c.title, action = bindAct(runOne, c))
+  # Presets first, then the user's own, each group behind a separator.
+  for presets in [true, false]:
+    var first = true
+    for c in a.commands:
+      if c.isPreset != presets: continue
+      if first: run.sep()
+      first = false
+      run.item(c.title, action = bindAct(runOne, c))
 
   # Help
   let help = root.sub("Help")
@@ -3565,14 +3588,18 @@ proc renderCommands(a: App, shot: string) =
   case action
   of caNone: discard
   of caCancel: a.closeCommands()
-  of caApply:
+  of caApply, caOk:
     let (orig, c) = (d.origTitle, d.commandLine)
     a.editCommandLines(proc (cmds: var seq[CommandLine]) =
       let i = cmds.mapIt(it.title).find(orig)
       if orig.len > 0 and i >= 0: cmds[i] = c
       else: cmds.add c)
     if orig.len > 0: moveValues(orig, c.title)
-    a.closeCommands()
+    if action == caOk: a.closeCommands()
+    else:
+      # Keep editing, now as the saved entry.
+      d.saved = a.commands
+      d.origTitle = c.title
   of caDelete:
     let orig = d.origTitle
     a.editCommandLines(proc (cmds: var seq[CommandLine]) =
@@ -3580,6 +3607,16 @@ proc renderCommands(a: App, shot: string) =
     moveValues(orig, "")
     d.saved = a.commands
     d.load(a.latestCommandLine)
+
+proc browsePickPath(a: App, i: int) =
+  ## Save dialog for path row i of the Run window, starting at its path.
+  let d = a.pickDlg
+  if i < 0 or i >= d.rows.len: return
+  var start = d.texts[i].strip
+  if start.startsWith("~"): start = start.expandTilde
+  if start.len == 0: start = a.runDir
+  elif not start.isAbsolute: start = a.runDir / start
+  a.ask(dkSaveFile, "pickpath", d.cmd.title & ": " & d.rows[i].name, start)
 
 proc renderPick(a: App, shot: string) =
   ## Draws the Run window; Run executes the command line with the bookmarks
@@ -3611,6 +3648,7 @@ proc renderPick(a: App, shot: string) =
   of paNone: discard
   of paCancel: a.closePick()
   of paDraw: a.beginRectDraw(a.pickDlg.drawRequest)
+  of paBrowse: a.browsePickPath(a.pickDlg.browseRow)
   of paRun:
     a.endRectDraw(true, refocus = false)
     let d = a.pickDlg
@@ -4124,6 +4162,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "cmdrect":  # name rect dim [default]: a rectangle card at the caret
     a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 3: st.args[3] else: "",
       parseInt(st.args[1]), parseEnum[RectDim](st.args[2]))
+  of "cmdpath":  # name reveal(0|1) [default]: a path card at the caret
+    a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "",
+      path = true, reveal = st.args[1] == "1")
   of "cmdapply": a.cmdDlg.applyRequested = true
   of "run": a.runMenuPath(@["Run", arg])
   of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
@@ -4134,6 +4175,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.pickDlg.texts[parseInt(st.args[0])] = st.args[1 .. ^1].join(" ")
   of "pickopen": a.pickDlg.openRow = parseInt(arg)
   of "pickdraw": a.beginRectDraw(a.pickDlg.rows[parseInt(arg)].rect)  # row: its rectangle icon
+  of "pickbrowse": a.browsePickPath(parseInt(arg))  # row: its folder button
   of "pickcross": a.pickDlg.crossed[parseInt(arg)] = not a.pickDlg.crossed[parseInt(arg)]
   of "rectset":  # x y w h: the rectangle being drawn
     if a.rectEdit != nil:

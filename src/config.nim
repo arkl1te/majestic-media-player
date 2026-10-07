@@ -385,6 +385,8 @@ type
     content*: string
     rect*: int                    ## value cards: the rectangle drawn on run (1, 2, ...),
     dim*: RectDim                 ## and which of its numbers; 0 for text
+    path*: bool                   ## value cards: a file path, browsed for with a save dialog on run,
+    reveal*: bool                 ## and its folder opened once the command succeeds
 
   CommandLine* = object
     title*: string
@@ -472,6 +474,12 @@ proc rememberValues*(c: CommandLine, values: Table[string, RunValue]) =
   all.save()
 
 const PresetCommandLines = staticRead("../assets/presets/commandlines.json")
+
+let presetTitles = PresetCommandLines.fromJson(seq[CommandLine]).mapIt(it.title)
+
+proc isPreset*(c: CommandLine): bool =
+  ## True when c carries the title of a shipped command line.
+  c.title in presetTitles
 
 proc seedPresets*(c: var Config): bool =
   ## Adds the shipped command lines the user hasn't been offered yet, each
