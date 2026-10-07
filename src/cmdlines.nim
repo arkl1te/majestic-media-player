@@ -1,8 +1,9 @@
 ## Commands window: composes shell commands for the Run menu out of text
 ## and cards. A card is a bash variable drawn as a chip inside the command
-## line; it holds a value, or refers to the current media file, a bookmark of
-## it or an external file. When the command runs, a file dialog asks for each
-## external file, then the Run window asks for the bookmarks and lets the
+## line; it holds a value, or refers to the current media file, a timestamp
+## of it or an external file. When the command runs, a file dialog asks for
+## each external file, then the Run window asks for the timestamps (the
+## start, the current time, the end, a bookmark or a chapter) and lets the
 ## values be changed. Value cards can be numbers of a rectangle (its width,
 ## height, x or y) that the Run window lets be drawn over the video, or a
 ## file path it lets be browsed for with a save dialog; a path card can have
@@ -55,12 +56,17 @@ proc chars(s: string): seq[string] =
     result.add s[i ..< j]
     i = j
 
+proc isTimestamp*(p: CmdPart): bool =
+  ## Timestamp cards; earlier versions had bookmark cards in their place.
+  p.card and p.kind == ckReference and
+    (p.content.startsWith("timestamp") or p.content.startsWith("bookmark"))
+
 proc toTokens(parts: seq[CmdPart]): seq[CmdPart] =
   for p in parts:
     if p.card:
       result.add p
-      # Earlier versions referred to bookmarks by number.
-      if p.content.startsWith("bookmark:"): result[^1].content = "bookmark"
+      # Earlier versions had bookmark cards, at first by number.
+      if p.isTimestamp: result[^1].content = "timestamp"
     else:
       for ch in p.text.chars: result.add CmdPart(text: ch)
 
@@ -71,8 +77,6 @@ proc toParts(toks: seq[CmdPart]): seq[CmdPart] =
 
 # --- resolving cards ---------------------------------------------------------
 
-proc isBookmark(p: CmdPart): bool =
-  p.card and p.kind == ckReference and p.content.startsWith("bookmark")
 
 proc isExternal(p: CmdPart): bool =
   p.card and p.kind == ckReference and p.content == "external"
@@ -92,16 +96,16 @@ proc externalCards*(parts: seq[CmdPart]): seq[string] =
     if p.isExternal and p.name notin result: result.add p.name
 
 proc runCards*(parts: seq[CmdPart]): seq[CmdPart] =
-  ## The cards the Run window asks about (values and bookmarks), each name
+  ## The cards the Run window asks about (values and timestamps), each name
   ## once, in order.
   for p in parts:
-    if p.card and (p.kind == ckValue or p.isBookmark) and not result.anyIt(it.name == p.name):
+    if p.card and (p.kind == ckValue or p.isTimestamp) and not result.anyIt(it.name == p.name):
       result.add p
 
 proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[value, err: string] =
   ## A card's value now, or why it has none. picks holds what the Run window
-  ## gave each card: the chosen bookmark's time, the chosen external file, or
-  ## a value replacing the card's own.
+  ## gave each card: a timestamp's time, the chosen external file, or a
+  ## value replacing the card's own.
   case p.kind
   of ckValue:
     let v = picks.getOrDefault(p.name, p.content)
@@ -110,9 +114,10 @@ proc resolve*(p: CmdPart, path: string, picks: Table[string, string]): tuple[val
     if p.content == "file":
       if path.len > 0: result.value = path
       else: result.err = "No media file is open"
-    elif p.isBookmark:
+    elif p.isTimestamp:
       if p.name in picks: result.value = picks[p.name]
-      else: result.err = "No bookmark chosen for " & p.name
+      elif path.len == 0: result.err = "No media file is open"
+      else: result.err = "No known time chosen for " & p.name
     elif p.isExternal:
       if p.name in picks: result.value = picks[p.name]
       else: result.err = "No file chosen for " & p.name
@@ -146,10 +151,10 @@ proc compose*(parts: seq[CmdPart], path: string, picks: Table[string, string]): 
 
 proc preview(toks: seq[CmdPart], path: string): string =
   ## The command line as it would run now, values in place of the cards;
-  ## bookmarks and external files are only known once chosen on run.
+  ## timestamps and external files are only known on run.
   for t in toks:
     if not t.card: result.add t.text
-    elif t.isBookmark: result.add "[" & t.name & ": bookmark]"
+    elif t.isTimestamp: result.add "[" & t.name & ": timestamp]"
     elif t.isExternal: result.add "[" & t.name & ": external file]"
     else:
       let (value, err) = t.resolve(path, initTable[string, string]())
@@ -637,11 +642,11 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
   ui.textIn("Content", rect(r.x, y, labelW, 26), colText)
   let fw = r.w - labelW
   if d.toks[s].kind == ckReference:
-    # What a card can refer to: the media file's path, or a bookmark or
+    # What a card can refer to: the media file's path, or a timestamp or
     # external file picked when the command runs.
     let rows = [
       (key: "file", label: "Current media file", detail: (if path.len > 0: "" else: "none open")),
-      (key: "bookmark", label: "Bookmark", detail: "chosen on run"),
+      (key: "timestamp", label: "Timestamp", detail: "chosen on run"),
       (key: "external", label: "External file", detail: "chosen on run")]
     discard d.choiceList(ui, "cl-ref", rect(r.x + labelW, y, fw, RowH * 3 + 2), rows,
       d.toks[s].content, path)
@@ -861,26 +866,34 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
     return
   discard ui.tabNavigate()
 
-# --- Run window: bookmarks and values for one run ---------------------------------
+# --- Run window: timestamps and values for one run --------------------------------
 
 type
   PickAction* = enum
     paNone, paRun, paCancel, paDraw, paBrowse
 
+  TimeChoice* = object
+    ## An entry of a timestamp row's list: a time, or a separator.
+    label*: string
+    time*: float              ## seconds, < 0 when unknown
+    which*: string            ## "start", "current" or "end"; "" for a bookmark or chapter
+    sep*: bool
+
   PickDialog* = ref object
-    ## Shown when a command line with value or bookmark cards runs: one row
-    ## per card, its name and a dropdown of the media file's bookmarks or a
-    ## field holding the card's value.
+    ## Shown when a command line with value or timestamp cards runs: one row
+    ## per card, its name and a dropdown of times (the start, the current
+    ## time, the end, the media file's bookmarks and chapters) or a field
+    ## holding the card's value.
     cmd*: CommandLine
     rows*: seq[CmdPart]       ## the cards asked about
-    picks*: seq[int]          ## bookmark rows: the bookmark index chosen
+    picks*: seq[int]          ## timestamp rows: the index of the time chosen
     texts*: seq[string]       ## value rows: the value to run with
     crossed*: seq[bool]       ## rectangle rows: a drawn rectangle leaves them alone
     drawing*: int             ## rectangle being drawn over the video, else 0
     drawRequest*: int         ## with paDraw: the rectangle to draw
     browseRow*: int           ## with paBrowse: the path row to browse for
     openRow*: int             ## row whose dropdown is open, else -1
-    listScroll: int
+    listScroll: float32       ## the open list, in pixels
     runRequested*: bool       ## debug scripting: press Run next frame
 
 const
@@ -888,31 +901,48 @@ const
   PickRowH = 36'f32
   PickLabelW = 150'f32
 
+proc timeChoices*(pos, duration: float, marks, chapters: seq[Bookmark]): seq[TimeChoice] =
+  ## What a timestamp row picks from: the start, the current time and the
+  ## end, then the bookmarks, then the chapters (named), each group after a
+  ## separator.
+  result = @[TimeChoice(label: "Start", which: "start"),
+    TimeChoice(label: "Current time", time: pos, which: "current"),
+    TimeChoice(label: "End", time: (if duration > 0: duration else: -1), which: "end")]
+  for group in [marks, chapters]:
+    if group.len > 0: result.add TimeChoice(sep: true)
+    for i, b in group: result.add TimeChoice(label: b.label(i), time: b.time)
+
 proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
 
-proc start*(d: PickDialog, c: CommandLine, marks: seq[Bookmark],
+proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
     last = initTable[string, RunValue]()) =
   ## Prepares the window for c. Cards start at what they were last run with
-  ## (last): a value, or the bookmark at the same time (the same file), else
-  ## at the same position. Otherwise values start at the card's own and the
-  ## n-th bookmark card at bookmark n, so a command using bookmarks in order
-  ## needs no changes for a file marked in order.
+  ## (last): a value, the start, current time or end, or the bookmark or
+  ## chapter at the same time (the same file). Otherwise values start at the
+  ## card's own and the n-th timestamp card at the n-th bookmark (chapters
+  ## after them), so a command using bookmarks in order needs no changes for
+  ## a file marked in order; past them, at the current time.
   d.cmd = c
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
   d.texts = newSeq[string](d.rows.len)
   d.crossed = newSeq[bool](d.rows.len)
   d.drawing = 0
+  var marks: seq[int]
+  for k, ch in choices:
+    if not ch.sep and ch.which.len == 0: marks.add k
   var n = 0
   for i, row in d.rows:
-    if row.isBookmark:
-      d.picks[i] = max(0, min(n, marks.len - 1))
+    if row.isTimestamp:
+      d.picks[i] = if n < marks.len: marks[n] else: 1
       inc n
       if row.name in last:
         let v = last[row.name]
-        let same = marks.mapIt(abs(it.time - v.time) < 0.0005).find(true)
-        if same >= 0: d.picks[i] = same
-        elif v.mark >= 0 and v.mark < marks.len: d.picks[i] = v.mark
+        for k, ch in choices:
+          if not ch.sep and (if v.which.len > 0: ch.which == v.which
+                             else: ch.which.len == 0 and abs(ch.time - v.time) < 0.0005):
+            d.picks[i] = k
+            break
     else:
       d.texts[i] = if row.name in last: last[row.name].value else: row.content
       d.crossed[i] = row.isRect and row.name in last and last[row.name].crossed
@@ -920,38 +950,57 @@ proc start*(d: PickDialog, c: CommandLine, marks: seq[Bookmark],
   d.listScroll = 0
 
 proc size*(d: PickDialog): tuple[w, h: int32] =
-  (480'i32, int32(max(200'f32, PickTop + d.rows.len.float32 * PickRowH + 70)))
+  ## Taller with timestamp rows, for room to drop their lists down.
+  let minH = if d.rows.anyIt(it.isTimestamp): 320'f32 else: 200'f32
+  (480'i32, int32(max(minH, PickTop + d.rows.len.float32 * PickRowH + 70)))
 
-proc markText(marks: seq[Bookmark], i: int): (string, string) =
-  if i >= 0 and i < marks.len: (marks[i].label(i), fmtTime(marks[i].time, millis = true))
-  else: ("", "")
+proc choiceText(ch: TimeChoice): (string, string) =
+  (ch.label, if ch.time < 0: "unknown" else: fmtTime(ch.time, millis = true))
+
+proc entryH(ch: TimeChoice): float32 = (if ch.sep: MenuSeparatorHeight else: RowH)
+
+proc entryY(choices: seq[TimeChoice], k: int): float32 =
+  ## Top of entry k in the list, from the list's top.
+  for ch in choices[0 ..< min(k, choices.len)]: result += ch.entryH
+
+proc stepChoice(choices: seq[TimeChoice], k, dir: int): int =
+  ## The next entry from k in direction dir, skipping separators; k at the end.
+  result = k
+  var j = k + dir
+  while j >= 0 and j < choices.len:
+    if not choices[j].sep: return j
+    j += dir
 
 proc dropRect(r: Rect, i: int): Rect =
   rect(r.x + 16 + PickLabelW, r.y + PickTop + i.float32 * PickRowH, r.w - 32 - PickLabelW, 28)
 
-proc listRect(r: Rect, i, count: int): tuple[r: Rect, rows: int] =
+proc listRect(r: Rect, i: int, contentH: float32): Rect =
   ## The open dropdown's list: below its field, or above when there is more
-  ## room there; it scrolls when the window is too short for all rows.
+  ## room there; it scrolls when the window is too short for all entries.
   let dr = dropRect(r, i)
   let below = r.y + r.h - (dr.y + dr.h) - 6
   let above = dr.y - r.y - 6
-  let space = max(below, above)
-  let rows = max(1, min(count, int((space - 2) / RowH)))
-  let h = rows.float32 * RowH + 2
+  let h = min(contentH, max(below, above) - 2) + 2
   let y = if below >= h or below >= above: dr.y + dr.h + 2 else: dr.y - 2 - h
-  (rect(dr.x, y, dr.w, h), rows)
+  rect(dr.x, y, dr.w, h)
 
-proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
+proc centerOn(d: PickDialog, r: Rect, i: int, choices: seq[TimeChoice]) =
+  ## Scrolls row i's list to have its chosen entry in the middle.
+  let lr = listRect(r, i, choices.entryY(choices.len))
+  d.listScroll = choices.entryY(d.picks[i]) + RowH / 2 - (lr.h - 2) / 2
+
+proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction =
+  ## choices is what timestamp rows pick from (timeChoices).
   let w = ui.window
   let noField = ui.focusId.len == 0  # else Escape belongs to the value field
-  let count = marks.len
+  let contentH = choices.entryY(choices.len)
   var escUsed = false
 
   # An open list takes the pointer; a press elsewhere closes it.
-  var lr: tuple[r: Rect, rows: int]
+  var lr: Rect
   if d.openRow >= 0:
-    lr = listRect(r, d.openRow, count)
-    let over = ui.mouse.inside(lr.r)
+    lr = listRect(r, d.openRow, contentH)
+    let over = ui.mouse.inside(lr)
     if w.buttonPressed[KeyEscape]:
       d.openRow = -1
       escUsed = true
@@ -960,10 +1009,10 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
       ui.consumeClick()
     elif over:
       if ui.scroll() != 0:
-        d.listScroll += int(sgn(ui.scroll()))
+        d.listScroll += ui.scroll() * RowH
         ui.scrollConsumed = true
       ui.captured = true
-    d.listScroll = clamp(d.listScroll, 0, max(0, count - lr.rows))
+    d.listScroll = clamp(d.listScroll, 0, max(0'f32, contentH - (lr.h - 2)))
   let open = d.openRow
 
   ui.textIn(ui.ellipsize("Variables of " & d.cmd.title & " for this run.", r.w - 32, FontSmall),
@@ -1004,29 +1053,28 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
         result = paBrowse
         d.browseRow = i
       continue
-    if not row.isBookmark:
+    if not row.isTimestamp:
       discard ui.textField(id, dr, d.texts[i], "empty")
       continue
+    d.picks[i] = clamp(d.picks[i], 0, choices.high)
     let hov = ui.hover(dr)
     let focused = ui.tabStop(id, dr)
     if hov and ui.pressed():
       ui.consumeClick()
       ui.navId = id
       d.openRow = if open == i: -1 else: i
-      if d.openRow >= 0:
-        # Start with the chosen bookmark in view.
-        d.listScroll = d.picks[i] - listRect(r, i, count).rows div 2
+      # Start with the chosen time in view.
+      if d.openRow >= 0: d.centerOn(r, i, choices)
     if focused and ui.focusId.len == 0 and d.openRow < 0:
-      if w.buttonPressed[KeyUp]: d.picks[i] = max(0, d.picks[i] - 1)
-      if w.buttonPressed[KeyDown]: d.picks[i] = min(count - 1, d.picks[i] + 1)
+      if w.buttonPressed[KeyUp]: d.picks[i] = choices.stepChoice(d.picks[i], -1)
+      if w.buttonPressed[KeyDown]: d.picks[i] = choices.stepChoice(d.picks[i], 1)
       if w.buttonPressed[KeySpace]:
         d.openRow = i
-        d.listScroll = d.picks[i] - listRect(r, i, count).rows div 2
-    d.picks[i] = clamp(d.picks[i], 0, count - 1)
+        d.centerOn(r, i, choices)
     ui.rect(dr, colBackground)
     ui.border(dr, if open == i: colAccent elif hov: colTextDim else: colBorder)
     if focused: ui.focusRing(dr)
-    let (label, time) = markText(marks, d.picks[i])
+    let (label, time) = choiceText(choices[d.picks[i]])
     let tw = ui.textSize(time, FontSmall).x
     ui.textIn(ui.ellipsize(label, dr.w - tw - 52), rect(dr.x + 8, dr.y, dr.w - tw - 52, dr.h),
       colText)
@@ -1053,18 +1101,26 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
   if d.openRow >= 0 and d.openRow == open:
     ui.captured = false
     ui.sk.pushLayer(PopupsLayer)
-    ui.rect(rect(lr.r.xy + vec2(3, 4), lr.r.wh), colShadow)
-    ui.rect(lr.r, colPopup)
-    ui.border(lr.r, colAccent)
-    for n in 0 ..< lr.rows:
-      let k = n + d.listScroll
-      if k >= count: break
-      let rr = rect(lr.r.x + 1, lr.r.y + 1 + n.float32 * RowH, lr.r.w - 2, RowH)
+    ui.rect(rect(lr.xy + vec2(3, 4), lr.wh), colShadow)
+    ui.rect(lr, colPopup)
+    ui.border(lr, colAccent)
+    let inner = rect(lr.x + 1, lr.y + 1, lr.w - 2, lr.h - 2)
+    let outerClip = ui.hitClip
+    ui.hitClip = inner
+    ui.sk.pushClipRect(inner)
+    var y = inner.y - d.listScroll
+    for k, ch in choices:
+      let rr = rect(inner.x, y, inner.w, ch.entryH)
+      y += rr.h
+      if rr.y + rr.h < inner.y or rr.y > inner.y + inner.h: continue
+      if ch.sep:
+        ui.rect(rect(rr.x + 8, rr.y + rr.h / 2, rr.w - 16, 1), colBorder)
+        continue
       let hov = ui.hover(rr)
       let sel = k == d.picks[open]
       if sel: ui.rect(rr, colAccent)
       elif hov: ui.rect(rr, colHover)
-      let (label, time) = markText(marks, k)
+      let (label, time) = choiceText(ch)
       let tw = ui.textSize(time, FontSmall).x
       ui.textIn(ui.ellipsize(label, rr.w - tw - 30), rect(rr.x + 8, rr.y, rr.w - tw - 30, RowH),
         if sel: colOnAccent else: colText)
@@ -1074,10 +1130,12 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
         ui.consumeClick()
         d.picks[open] = k
         d.openRow = -1
-    if count > lr.rows:
-      let th = max(16'f32, lr.r.h * lr.rows.float32 / count.float32)
-      let ty = lr.r.y + (lr.r.h - th) * (d.listScroll / max(1, count - lr.rows))
-      ui.rect(rect(lr.r.x + lr.r.w - 4, ty, 3, th), colTrack)
+    ui.sk.popClipRect()
+    ui.hitClip = outerClip
+    if contentH > inner.h:
+      let th = max(16'f32, inner.h * inner.h / contentH)
+      let ty = inner.y + (inner.h - th) * (d.listScroll / (contentH - inner.h))
+      ui.rect(rect(lr.x + lr.w - 4, ty, 3, th), colTrack)
     ui.sk.popLayer()
 
   if result == paNone: discard ui.tabNavigate()

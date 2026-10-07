@@ -370,7 +370,7 @@ proc save*(b: Bookmarks) =
 type
   CardKind* = enum
     ckValue = "value"             ## content is the text itself
-    ckReference = "reference"     ## content is a key: "file" or "bookmark:N"
+    ckReference = "reference"     ## content is a key: "file", "timestamp" or "external"
 
   RectDim* = enum
     ## Which number of a rectangle a value card holds.
@@ -416,8 +416,8 @@ type
   RunValue* = object
     default*: string              ## the card's own content when this was given
     value*: string                ## value cards: the value
-    mark*: int = -1               ## bookmark cards: index of the bookmark chosen,
-    time*: float                  ## and its time
+    which*: string                ## timestamp cards: "start", "current" or "end" chosen,
+    time*: float                  ## else the time of the bookmark or chapter chosen
     crossed*: bool                ## rectangle cards: a drawn rectangle leaves it alone
 
   RunValues* = Table[string, Table[string, RunValue]]  ## title -> card name -> value

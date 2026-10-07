@@ -113,7 +113,7 @@ type
     rlFollow: bool            ## keep the run log scrolled to its newest line
     rlResizeFrom: (float32, float32)     ## pointer y and height when the drag began
     rlThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
-    pickDlg: PickDialog       ## Run window: bookmarks and values for a run
+    pickDlg: PickDialog       ## Run window: timestamps and values for a run
     extRun: CommandLine       ## the command line whose external files are asked for
     extQueue: seq[string]     ## its external-file cards still to ask about
     extPicks: Table[string, string]  ## the files chosen so far, by card name
@@ -955,6 +955,16 @@ proc fileBookmarks(a: App): seq[Bookmark] =
   if a.player.loaded: a.bookmarks.getOrDefault(a.bookmarkKey(a.player.path)).marks
   else: @[]
 
+proc fileChapters(a: App): seq[Bookmark] =
+  ## The current file's chapters, named as on the seek bar.
+  if a.player.loaded:
+    for i, c in a.player.chapters:
+      result.add Bookmark(time: c.time, name: (if c.title.len > 0: c.title else: &"Chapter {i + 1}"))
+
+proc timeChoices(a: App): seq[TimeChoice] =
+  ## What the Run window's timestamp rows pick from, at the current time.
+  timeChoices(a.player.timePos, a.player.duration, a.fileBookmarks, a.fileChapters)
+
 proc chapterStep(a: App, d: int) =
   let p = a.player
   if not p.loaded: return
@@ -1606,17 +1616,11 @@ proc askExternal(a: App) =
   if cards.len == 0:
     a.execute(c, a.extPicks)
     return
-  let marks = a.fileBookmarks
-  let bookmarks = cards.anyIt(it.kind == ckReference)
-  let err =
-    if bookmarks and not a.player.loaded: "No media file is open"
-    elif bookmarks and marks.len == 0: "The media file has no bookmarks"
-    else: ""
-  if err.len > 0:
-    a.osd(c.title & ": " & err)
+  if cards.anyIt(it.isTimestamp) and not a.player.loaded:
+    a.osd(c.title & ": No media file is open")
     return
   a.menus.close()
-  a.pickDlg.start(c, marks, c.lastValues)
+  a.pickDlg.start(c, a.timeChoices, c.lastValues)
   let (sw, sh) = a.pickDlg.size
   if a.pickWin == nil:
     (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh))
@@ -1628,7 +1632,7 @@ proc askExternal(a: App) =
   a.overlay = ovPick
 
 proc runCommandLine(a: App, c: CommandLine) =
-  ## Runs c, first asking for its external files, bookmarks and values when
+  ## Runs c, first asking for its external files, timestamps and values when
   ## it has any.
   a.extRun = c
   a.extQueue = c.parts.externalCards
@@ -3619,8 +3623,8 @@ proc browsePickPath(a: App, i: int) =
   a.ask(dkSaveFile, "pickpath", d.cmd.title & ": " & d.rows[i].name, start)
 
 proc renderPick(a: App, shot: string) =
-  ## Draws the Run window; Run executes the command line with the bookmarks
-  ## chosen.
+  ## Draws the Run window; Run executes the command line with the times and
+  ## values chosen.
   if a.overlay != ovPick: return
   let w = a.pickWin
   let ui = a.pickUi
@@ -3630,7 +3634,7 @@ proc renderPick(a: App, shot: string) =
     return
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
-  let marks = a.fileBookmarks
+  let choices = a.timeChoices
   if not a.beginDialogDraw(w, a.pickSk, size): return  # retried next frame
   ui.beginFrame()
   a.pickSk.beginUi(w, size)
@@ -3638,7 +3642,7 @@ proc renderPick(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
-  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), ui.size), marks)
+  let action = a.pickDlg.draw(ui, rect(vec2(0, 0), ui.size), choices)
   ui.drawTooltip()
   a.pickSk.endUi()
   ui.endFrame()
@@ -3658,9 +3662,11 @@ proc renderPick(a: App, shot: string) =
       if row.kind == ckValue:
         picks[row.name] = d.texts[i]
         used[row.name] = RunValue(value: d.texts[i], crossed: d.crossed[i])
-      elif d.picks[i] >= 0 and d.picks[i] < marks.len:
-        picks[row.name] = fmtTime(marks[d.picks[i]].time, millis = true)
-        used[row.name] = RunValue(mark: d.picks[i], time: marks[d.picks[i]].time)
+        continue
+      if d.picks[i] < 0 or d.picks[i] >= choices.len: continue
+      let ch = choices[d.picks[i]]
+      if ch.time >= 0: picks[row.name] = fmtTime(ch.time, millis = true)
+      used[row.name] = RunValue(which: ch.which, time: ch.time)
     d.cmd.rememberValues(used)
     a.closePick()
     a.execute(d.cmd, picks)
@@ -4168,7 +4174,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "cmdapply": a.cmdDlg.applyRequested = true
   of "run": a.runMenuPath(@["Run", arg])
   of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
-  of "pick":  # row bookmark: choose a bookmark (0-based) in the Run window
+  of "pick":  # row index: choose a time (0-based, separators count) in the Run window
     a.pickDlg.picks[parseInt(st.args[0])] = parseInt(st.args[1])
   of "pickrun": a.pickDlg.runRequested = true
   of "picktext":  # row text: a value for this run
