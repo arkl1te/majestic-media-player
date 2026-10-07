@@ -91,6 +91,7 @@ type
     cfgBefore: Config         ## config when Options opened, restored on Cancel
     settingsKey: string       ## player-facing settings last pushed to mpv
     positions: Positions      ## remembered playback positions
+    subScales: SubScales      ## remembered subtitle sizes, per file
     bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
     bmPath, bmKey: string     ## the current file and its mediaKey, once known
     bmPending: string         ## the file whose mediaKey is being worked out
@@ -448,6 +449,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
     elif a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0)
     else: 0.0
   a.clearLoopMarks()
+  a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
   a.player.load(path, a.resumedAt)
   a.applyLoop()
   a.cfg.addRecent(path)
@@ -2035,7 +2037,14 @@ proc moveSubs(a: App, d: Vec2) =
   a.osd(&"Subtitle offset: {int(a.subs.offset.x)}, {int(a.subs.offset.y)}")
 
 proc scaleSubs(a: App, dir: float32) =
-  a.subs.scale = clamp(a.subs.scale + dir * SubScaleStep, 0.2'f32, 5'f32)
+  a.subs.scale = clamp(round((a.subs.scale + dir * SubScaleStep) * 10) / 10, 0.2'f32, 5'f32)
+  let path = a.player.path
+  if a.player.loaded and path.len > 0:
+    # Reloaded first so sizes other players remembered meanwhile survive.
+    a.subScales = loadSubScales()
+    if a.subs.scale == 1: a.subScales.del(path)
+    else: a.subScales.remember(path, a.subs.scale)
+    a.subScales.save()
   a.osd(&"Subtitle size: {int(round(a.subs.scale * 100))}%")
 
 proc subPadding(a: App): tuple[l, r, t, b: float32] =
@@ -3948,6 +3957,7 @@ proc main() =
   # Debug scripts only see other players in a folder of their own.
   if not scripted or existsEnv("MMP_SYNC_DIR"): a.peers = startPeerNet()
   a.positions = loadPositions()
+  a.subScales = loadSubScales()
   a.bookmarks = loadBookmarks()
   if a.cfg.seedPresets(): a.cfg.save()
   a.commands = loadCommandLines()

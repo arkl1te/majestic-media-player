@@ -165,14 +165,36 @@ proc save*(p: Positions) =
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
-proc remember*(p: var Positions, path: string, t: float) =
+proc remember*[T](p: var OrderedTable[string, T], path: string, v: T) =
   ## Most recent last, so the oldest entries go first when trimming.
   p.del(path)
-  p[path] = t
+  p[path] = v
   while p.len > MaxPositions:
     for k in p.keys:
       p.del(k)
       break
+
+# --- remembered subtitle sizes -----------------------------------------------
+
+type SubScales* = OrderedTable[string, float32]  ## path -> sub scale
+
+proc subScalesPath(): string = configDir() / "subscales.json"
+
+proc loadSubScales*(): SubScales =
+  let path = subScalesPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(SubScales)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(s: SubScales) =
+  let path = subScalesPath()
+  try:
+    createDir(path.parentDir)
+    writeFile(path, s.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
 # --- bookmarks ---------------------------------------------------------------
 
