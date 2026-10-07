@@ -142,6 +142,9 @@ type
     rotRef: float32           ## cursor angle around the pivot the turn counts from
     rotRefSet: bool
     rotPressPos: Vec2         ## window pixels where the press began
+    panDrag: bool             ## Shift+Middle drag is panning the zoomed frame
+    panFrom: Vec2             ## window pixels where the pan drag began
+    panStart: Vec2            ## pan when the drag began
     # 360° video camera, degrees
     lookYaw, lookPitch: float32
     lookFov: float32 = SphereFov
@@ -2387,6 +2390,38 @@ proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
   a.xf.zoom = z
   a.xfChanged(&"Zoom: {int(round(z * 100))}%")
 
+proc frameBounds(a: App, area: Rect): Vec2 =
+  ## Size of the (rotated) frame's bounding box, window pixels.
+  let size = a.videoGeometry(area).size
+  let rad = a.xf.rotation * PI.float32 / 180
+  vec2(abs(size.x * cos(rad)) + abs(size.y * sin(rad)),
+    abs(size.x * sin(rad)) + abs(size.y * cos(rad)))
+
+proc panLimit(a: App, area: Rect): Vec2 =
+  ## How far the pan may go from the center on each axis so the frame's
+  ## edges don't cross into the window: a frame larger than the window
+  ## keeps covering it, a smaller one stays inside it.
+  let b = a.frameBounds(area)
+  vec2(abs(b.x - area.w) / 2, abs(b.y - area.h) / 2)
+
+proc canPan(a: App, area: Rect): bool =
+  ## Zoomed in far enough that part of the frame lies outside the window.
+  let b = a.frameBounds(area)
+  a.xf.zoom > 1 and (b.x > area.w + 0.5 or b.y > area.h + 0.5)
+
+proc panDragTo(a: App, area: Rect, at: Vec2) =
+  ## Shift+Middle drag: the frame follows the pointer, stopping where its
+  ## edges meet the window's. A pan already past that (Numpad moves) doesn't
+  ## jump back, it just can't go further out. `area` and `at` are window pixels.
+  let lim = a.panLimit(area)
+  let want = a.panStart + at - a.panFrom
+  let p = vec2(
+    clamp(want.x, min(-lim.x, a.panStart.x), max(lim.x, a.panStart.x)),
+    clamp(want.y, min(-lim.y, a.panStart.y), max(lim.y, a.panStart.y)))
+  if p != a.xf.pan:
+    a.xf.pan = p
+    a.xfChanged(&"Pan: {int(p.x)}, {int(p.y)}")
+
 proc resetLook(a: App) =
   a.lookYaw = 0; a.lookPitch = 0; a.lookFov = SphereFov
 
@@ -2786,7 +2821,8 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
       @[("Num1-9", "Align Subtitles"), ("Arrows", "Move Subtitles"),
         ("Num+", "Bigger Subtitles"), ("Num-", "Smaller Subtitles")],
-      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]]
+      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping"),
+        ("MDrag", "Pan Zoomed Video")]]
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
@@ -3520,6 +3556,7 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
+      ("Pan zoomed video", "Shift+Middle-drag video"),
       ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
       ("Reset rotation", "Alt+Middle-click video"),
       ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
@@ -3640,6 +3677,10 @@ proc frame(a: App) =
       a.resetLook(); a.osd("View reset")
     elif ui.pressed(MouseMiddle) and w.alt:
       a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
+    elif ui.pressed(MouseMiddle) and w.shift and a.canPan(a.px(videoArea)):
+      a.panDrag = true
+      a.panFrom = ui.mouse * a.sk.uiScale
+      a.panStart = a.xf.pan
     elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
       a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
   if a.rotDrag:
@@ -3648,6 +3689,9 @@ proc frame(a: App) =
       if not a.rotMoved:  # Alt+Middle-click
         a.xf.rotation = 0; a.xfChanged("Rotation: 0°")
     else: a.rotateDrag(a.px(videoArea), ui.mouse * a.sk.uiScale, w.shift)
+  if a.panDrag:
+    if not ui.down(MouseMiddle): a.panDrag = false
+    else: a.panDragTo(a.px(videoArea), ui.mouse * a.sk.uiScale)
   if a.videoPress:
     if not ui.down():
       a.videoPress = false
