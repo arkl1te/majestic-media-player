@@ -2,7 +2,7 @@
 ## tree view) and the selected page on the right. Edits apply to the config
 ## live; the caller snapshots it beforehand so Cancel can undo them.
 
-import std/[strutils, strformat, math]
+import std/[os, strutils, strformat, math]
 import silky, vmath, bumpy, chroma, pixie
 import ui, theme, config, assoc
 
@@ -10,6 +10,7 @@ type
   OptionsPage* = enum
     opPlayer = "Player"
     opFormats = "Formats"
+    opPaths = "Paths"
     opPlayback = "Playback"
     opSubtitles = "Subtitles"
     opMisc = "Miscellaneous"
@@ -17,9 +18,13 @@ type
   OptionsAction* = enum
     oaNone, oaOk, oaCancel
 
+  PathRequest* = enum
+    ## Paths page buttons the caller carries out (file dialogs, file manager).
+    prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings
+
   OptionsDialog* = ref object
     page*: OptionsPage
-    playerOpen: bool            ## Player node expanded (shows Formats)
+    playerOpen: bool            ## Player node expanded (shows Formats, Paths)
     scroll: float32             ## page content scroll
     assoc: seq[AssocItem]
     assocLoaded: bool
@@ -28,6 +33,7 @@ type
     listCursor: int             ## Formats list row moved with the keyboard
     status: string              ## Formats page: outcome of the last Apply
     assocApplied*: bool         ## associations were written; the caller clears it
+    request*: PathRequest       ## Paths page button pressed; the caller clears it
 
   Pane = object
     ## Layout cursor for a page.
@@ -35,7 +41,9 @@ type
     started: bool               ## a group header was placed already
 
 const
-  Tree = [(opPlayer, 0), (opFormats, 1), (opPlayback, 0), (opSubtitles, 0), (opMisc, 0)]
+  Tree = [(opPlayer, 0), (opFormats, 1), (opPaths, 1), (opPlayback, 0), (opSubtitles, 0),
+          (opMisc, 0)]
+  PlayerChildren = {opFormats, opPaths}
   TreeWidth = 180'f32
   TreeRow = 22'f32
   TreeIndent = 16'f32
@@ -57,7 +65,7 @@ proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   d.page = p
   d.scroll = 0
   ui.focusId = ""
-  if p == opFormats: d.playerOpen = true
+  if p in PlayerChildren: d.playerOpen = true
 
 # --- tree ---------------------------------------------------------------------
 
@@ -100,7 +108,9 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
       if p != opPlayer: ui.dotsH(x0, x0 + 10, cy)
     else:
       let xc = x0 + TreeIndent
-      ui.dotsV(xc, mid(i - 1) + 6, cy + 1)
+      # The first child hangs below its parent's label, the next ones off the
+      # sibling above.
+      ui.dotsV(xc, mid(i - 1) + (if rows[i - 1][1] == level: 0'f32 else: 6), cy + 1)
       ui.dotsH(xc, xc + 10, cy)
 
   for i, (p, level) in rows:
@@ -114,7 +124,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
       if ui.hover(ex) and ui.pressed():
         ui.consumeClick()
         d.playerOpen = not d.playerOpen
-        if not d.playerOpen and d.page == opFormats: d.selectPage(ui, opPlayer)
+        if not d.playerOpen and d.page in PlayerChildren: d.selectPage(ui, opPlayer)
     let lx = x0 + level.float32 * TreeIndent + 12
     let label = rect(lx, y + 2, ui.textSize($p).x + 10, TreeRow - 4)
     let rowR = rect(lx, y, r.x + r.w - lx - 4, TreeRow)
@@ -131,6 +141,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
       d.selectPage(ui, p)
     if hov and p == opPlayer and ui.window.buttonPressed[DoubleClick]:
       d.playerOpen = not d.playerOpen
+      if not d.playerOpen and d.page in PlayerChildren: d.selectPage(ui, opPlayer)
 
   # Keyboard: Up/Down move, Left collapses (or goes to the parent), Right expands.
   if not keys or ui.navId notin ["", "o-tree"]: return
@@ -141,7 +152,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
   if w.buttonPressed[KeyUp] and cur > 0: d.selectPage(ui, rows[cur - 1][0])
   elif w.buttonPressed[KeyDown] and cur < rows.high: d.selectPage(ui, rows[cur + 1][0])
   elif w.buttonPressed[KeyLeft]:
-    if d.page == opFormats: d.selectPage(ui, opPlayer)
+    if d.page in PlayerChildren: d.selectPage(ui, opPlayer)
     elif d.page == opPlayer: d.playerOpen = false
   elif w.buttonPressed[KeyRight] and d.page == opPlayer:
     d.playerOpen = true
@@ -181,6 +192,25 @@ proc textRow(ui: Ui, p: var Pane, id, label: string, value: var string, placehol
 proc hint(ui: Ui, p: var Pane, s: string) =
   ui.textIn(s, rect(p.x + 8, p.y - 2, p.w - 8, 18), colTextDim, FontSmall)
   p.y += 20
+
+proc folderRow(ui: Ui, p: var Pane, id, label: string, value: var string,
+               placeholder: string): bool =
+  ## A folder text input with a Browse... button; true when it was pressed.
+  const bw = 96'f32
+  ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
+  let fw = max(120'f32, p.w - LabelW - 8 - bw - 8)
+  discard ui.textField(id, rect(p.x + 8 + LabelW, p.y, fw, 26), value, placeholder)
+  result = ui.textButton(id & "-browse", rect(p.x + 16 + LabelW + fw, p.y, bw, 26),
+    "Browse...")
+  p.y += Row + 4
+
+proc folderNote(ui: Ui, p: var Pane, value: string) =
+  ## Warns when a typed folder does not exist.
+  let d = value.expandPath
+  if d.len > 0 and not dirExists(d):
+    ui.textIn("This folder does not exist.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
+      colAccent, FontSmall)
+    p.y += 20
 
 # --- pages ----------------------------------------------------------------------
 
@@ -328,6 +358,29 @@ proc formatsPage(d: OptionsDialog, ui: Ui, p: var Pane, bottom: float32) =
     if waiting > 0: colAccent else: colTextDim, FontSmall)
   p.y += 18
 
+proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Screenshots")
+  if ui.folderRow(p, "o-shotdir", "Folder", c.screenshotDir, defaultScreenshotDir()):
+    d.request = prBrowseScreenshots
+  ui.folderNote(p, c.screenshotDir)
+  ui.checkRow(p, "o-shotask", "Save without asking for a file name", c.screenshotNoAsk)
+  ui.hint(p, "Alt+I saves a PNG named after the file and the time straight into the folder.")
+  ui.group(p, "Open dialogs")
+  if ui.folderRow(p, "o-opendir", "Start in", c.openDir,
+      "Folder of the playing file"):
+    d.request = prBrowseOpen
+  ui.folderNote(p, c.openDir)
+  ui.hint(p, "Empty: the playing file's folder, else the last folder a file was opened from.")
+  ui.group(p, "Settings")
+  ui.textIn("Settings folder", rect(p.x + 8, p.y, LabelW, 26), colText)
+  const bw = 96'f32
+  let tw = max(120'f32, p.w - LabelW - 8 - bw - 8)
+  ui.textIn(ui.ellipsize(configDir(), tw), rect(p.x + 8 + LabelW, p.y, tw, 26), colTextDim)
+  if ui.textButton("o-cfgdir", rect(p.x + 16 + LabelW + tw, p.y, bw, 26), "Open"):
+    d.request = prShowSettings
+  p.y += Row + 4
+  ui.hint(p, "Settings, remembered positions, bookmarks and Run commands are kept here.")
+
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Display")
   ui.checkRow(p, "o-awake", "Keep the monitor on while playing video", c.keepDisplayOn)
@@ -384,6 +437,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   case d.page
   of opPlayer: playerPage(ui, c, p)
   of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
+  of opPaths: d.pathsPage(ui, c, p)
   of opPlayback: playbackPage(ui, c, p)
   of opSubtitles: subtitlesPage(ui, c, p)
   of opMisc: miscPage(ui, c, p)

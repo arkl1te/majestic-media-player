@@ -67,6 +67,10 @@ type
     bookmarksAsChapters*: bool = false  # chapter steps also stop at bookmarks
     titleFullPath*: bool = false
     titleUseMediaTitle*: bool = false
+    # Options > Player > Paths
+    screenshotDir*: string = ""    # "" = ~/Pictures (or home)
+    screenshotNoAsk*: bool = false # save straight into screenshotDir
+    openDir*: string = ""          # "" = the playing file's folder, else lastDir
     # Options > Playback
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
@@ -93,10 +97,23 @@ type
 
 const MaxRecent = 15
 
+proc expandPath*(p: string): string =
+  ## A folder typed in Options: trimmed, with ~ expanded.
+  result = p.strip
+  if result.len > 0: result = result.expandTilde
+
+proc defaultScreenshotDir*(): string =
+  result = getHomeDir() / "Pictures"
+  if not dirExists(result): result = getHomeDir()
+
+proc screenshotFolder*(c: Config): string =
+  let d = c.screenshotDir.expandPath
+  if d.len > 0: d else: defaultScreenshotDir()
+
 proc newHook*(c: var Config) =
   c = Config()
 
-proc configDir(): string = getConfigDir() / "majestic-media-player"
+proc configDir*(): string = getConfigDir() / "majestic-media-player"
 
 proc configPath(): string = configDir() / "config.json"
 

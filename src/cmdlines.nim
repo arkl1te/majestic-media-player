@@ -20,6 +20,9 @@ type
     toks: seq[CmdPart]        ## the command line; text one character per token
     caret: int                ## token index
     caretEol: bool            ## caret drawn after the token before it (line end)
+    anchor: int               ## other end of the selection (== caret: none)
+    dragCaret: int            ## where the press that may start a drag put the caret
+    dragFrom: Vec2            ## where that press happened, text coordinates
     selected: int             ## card token whose properties are shown, else -1
     scroll: float32           ## command line field, vertical
     refScroll: float32        ## reference list
@@ -152,6 +155,7 @@ proc load*(d: CmdDialog, c: CommandLine) =
   d.toks = c.parts.toTokens
   d.caret = d.toks.len
   d.caretEol = true
+  d.anchor = d.caret
   d.selected = -1
   d.scroll = 0
   d.listOpen = false
@@ -201,6 +205,7 @@ proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "") =
   d.selected = at
   d.caret = at + 2
   d.caretEol = false
+  d.anchor = d.caret
   d.error = ""
 
 proc newCard(d: CmdDialog, ui: Ui) =
@@ -278,9 +283,36 @@ proc hitCaret(rs: seq[Rect], p: Vec2): tuple[caret: int, eol: bool] =
     last = k
   if last < 0: (rs.len, false) else: (last + 1, true)
 
+proc hitTok(rs: seq[Rect], p: Vec2): int =
+  ## Token under p (text coordinates), or the nearest one on p's line.
+  if rs.len == 0: return 0
+  let line = clamp(int(floor(p.y / LineH)), 0, int(rs[^1].y / LineH))
+  result = -1
+  for k, r in rs:
+    if int(r.y / LineH) != line: continue
+    result = k
+    if p.x < r.x + r.w: return
+  if result < 0: result = rs.len - 1
+
+proc eolAt(rs: seq[Rect], c: int): bool =
+  ## Whether caret index c, at a line's end, is drawn there rather than at
+  ## the next line's start.
+  c > 0 and c < rs.len and rs[c].y > rs[c - 1].y
+
+proc classes(toks: seq[CmdPart]): seq[int] =
+  ## Word classes for ui's word helpers; each card is a word of its own.
+  for k, t in toks:
+    result.add(if t.card: 3 + k else: charClass(t.text[0]))
+
+proc clipText(toks: openArray[CmdPart]): string =
+  ## Copied text: cards become bash variables.
+  for t in toks: result.add(if t.card: "$" & t.name else: t.text)
+
 proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
   ## The command line: wrapping text with cards as chips. Click a chip to
-  ## show its properties.
+  ## show its properties. Dragging or Shift+click/arrows select, a
+  ## double-click selects a word and a triple-click everything; Ctrl+arrows
+  ## move by words.
   const id = "cl-line"
   let w = ui.window
   let hov = ui.hover(r)
@@ -290,6 +322,7 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
     ui.focusFresh = false
     d.caret = d.toks.len
     d.caretEol = true
+    d.anchor = d.caret
   if ui.focusId == id and w.buttonPressed[MouseLeft] and not hov:
     ui.focusId = ""
   var rs = layout(ui, d.toks, inner.w)
@@ -298,63 +331,116 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
     ui.consumeClick()
     ui.navId = id
     ui.focusId = id
+    ui.activeId = id
     let p = ui.mouse - origin
+    d.dragFrom = p
+    let clicks = ui.countClick(id)
     var chip = -1
     for k, t in d.toks:
       if t.card and p.inside(rs[k]): chip = k
-    if chip >= 0:
-      d.selected = chip
-      d.caret = chip + 1
+    if clicks == 2:
+      (d.anchor, d.caret) = wordAround(d.toks.classes, hitTok(rs, p))
+      d.caretEol = eolAt(rs, d.caret)
+    elif clicks >= 3:
+      d.anchor = 0
+      d.caret = d.toks.len
       d.caretEol = true
     else:
+      if chip >= 0:
+        d.selected = chip
+        d.caret = chip + 1
+        d.caretEol = true
+      else:
+        (d.caret, d.caretEol) = hitCaret(rs, p)
+      if not w.shiftDown: d.anchor = d.caret
+      d.dragCaret = d.caret
+  if ui.focusId == id and ui.activeId == id and ui.down():
+    let p = ui.mouse - origin
+    if ui.clickCount == 2:
+      (d.anchor, d.caret) = wordDrag(d.toks.classes, hitTok(rs, d.dragFrom), hitTok(rs, p))
+      d.caretEol = eolAt(rs, d.caret)
+    elif ui.clickCount == 1 and (p - d.dragFrom).length > 3:
+      d.anchor = d.dragCaret
       (d.caret, d.caretEol) = hitCaret(rs, p)
 
   let focused = ui.focusId == id
   var moved = false
   if focused:
     d.caret = clamp(d.caret, 0, d.toks.len)
+    d.anchor = clamp(d.anchor, 0, d.toks.len)
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+    let shift = w.shiftDown
+    let (s0, s1) = (min(d.anchor, d.caret), max(d.anchor, d.caret))
+    proc deleteSelection() =
+      for _ in s0 ..< s1: d.deleteTok(s0)
+      d.caret = s0
+      d.anchor = s0
+      d.caretEol = false
+      moved = true
+    if ctrl and w.buttonPressed[KeyA]:
+      d.anchor = 0
+      d.caret = d.toks.len
+      d.caretEol = true
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+      setClipboardString(d.toks[s0 ..< s1].clipText)
+      if w.buttonPressed[KeyX]: deleteSelection()
     var ins = ""
     for ch in ui.typed:
       if ch.ord >= 0x20 and ch.ord != 0x7f: ins.add ch
     if ctrl and w.buttonPressed[KeyV]:
       ins.add getClipboardString().multiReplace(("\r", ""), ("\n", " "), ("\t", " "))
+    if ins.len > 0 and d.caret != d.anchor: deleteSelection()
     for ch in ins.chars:
       d.insertTok(CmdPart(text: ch), d.caret)
       inc d.caret
+      d.anchor = d.caret
       d.caretEol = false
       moved = true
-    if w.buttonPressed[KeyBackspace] and d.caret > 0:
+    if (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
+       d.caret != d.anchor:
+      deleteSelection()
+    elif w.buttonPressed[KeyBackspace] and d.caret > 0:
       dec d.caret
       d.deleteTok(d.caret)
+      d.anchor = d.caret
       d.caretEol = false
       moved = true
-    if w.buttonPressed[KeyDelete] and d.caret < d.toks.len:
+    elif w.buttonPressed[KeyDelete] and d.caret < d.toks.len:
       d.deleteTok(d.caret)
       d.caretEol = false
       moved = true
     if moved: rs = layout(ui, d.toks, inner.w)
+    # Moving keys: with Shift they extend the selection, without it a
+    # selection collapses to the side moved toward (arrows) or the caret
+    # moves on from where it is.
     let cp = d.caretPos(rs)
-    if w.buttonPressed[KeyLeft] and d.caret > 0:
-      dec d.caret
+    let (lo, hi) = (min(d.anchor, d.caret), max(d.anchor, d.caret))
+    var keyMoved = false
+    if w.buttonPressed[KeyLeft]:
+      d.caret = if ctrl: wordLeft(d.toks.classes, d.caret)
+                elif shift or lo == hi: max(0, d.caret - 1) else: lo
       d.caretEol = false
-      moved = true
-    if w.buttonPressed[KeyRight] and d.caret < d.toks.len:
-      inc d.caret
+      keyMoved = true
+    if w.buttonPressed[KeyRight]:
+      d.caret = if ctrl: wordRight(d.toks.classes, d.caret)
+                elif shift or lo == hi: min(d.toks.len, d.caret + 1) else: hi
       # Stepping past a line's last token: stay at that line's end.
-      d.caretEol = d.caret < rs.len and rs[d.caret].y > rs[d.caret - 1].y
-      moved = true
+      d.caretEol = eolAt(rs, d.caret)
+      keyMoved = true
     if w.buttonPressed[KeyHome]:
       (d.caret, d.caretEol) = hitCaret(rs, vec2(-1, cp.y + 1))
-      moved = true
+      keyMoved = true
     if w.buttonPressed[KeyEnd]:
       (d.caret, d.caretEol) = hitCaret(rs, vec2(1e9, cp.y + 1))
-      moved = true
+      keyMoved = true
     if w.buttonPressed[KeyUp] and cp.y > 0:
       (d.caret, d.caretEol) = hitCaret(rs, vec2(cp.x, cp.y - LineH + 1))
-      moved = true
+      keyMoved = true
     if w.buttonPressed[KeyDown]:
       (d.caret, d.caretEol) = hitCaret(rs, vec2(cp.x, cp.y + LineH + 1))
+      keyMoved = true
+    if keyMoved:
+      if not shift: d.anchor = d.caret
       moved = true
     if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or
        w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
@@ -379,9 +465,12 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
   if d.toks.len == 0 and ui.focusId != id:
     ui.textIn("Type a command; New card adds a variable at the caret",
       rect(o.x, o.y, inner.w, LineH), colTextDisabled)
+  let (lo, hi) = (min(d.anchor, d.caret), max(d.anchor, d.caret))
   for k, t in d.toks:
     let tr = rect(rs[k].xy + o, rs[k].wh)
     if tr.y + tr.h < inner.y or tr.y > inner.y + inner.h: continue
+    if ui.focusId == id and k >= lo and k < hi:
+      ui.rect(rect(tr.x, tr.y + 2, tr.w, tr.h - 4), colAccentDim)
     if not t.card:
       ui.textIn(t.text, rect(tr.x, tr.y, tr.w + 20, tr.h), colText)
       continue

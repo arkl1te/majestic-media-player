@@ -1,6 +1,7 @@
 ## Small immediate-mode widget layer on top of Silky's drawing primitives.
 
 import std/[strformat, strutils, math]
+from std/times import epochTime
 import silky, vmath, bumpy, chroma, pixie, opengl
 import theme, xwin
 
@@ -24,6 +25,10 @@ type
     selAnchor*: int          ## other end of the focused field's selection (== caret: none)
     dragFrom*: int           ## text field press: byte offset under the press
     dragX*: float32          ## text field press: where it happened
+    clickCount*: int         ## text field press: 1, 2 (word), 3 (all) in a quick series
+    clickTime: float         ## when the last text field press happened
+    clickPos: Vec2           ## where
+    clickId: string          ## on which field
     fieldScroll*: float32    ## horizontal scroll of the focused field's text
     editText*: string        ## numberField: text being typed
     typed*: string           ## text typed since the previous frame
@@ -157,7 +162,7 @@ proc wheelNotches*(ui: Ui): float32 =
   ## one poll).
   ui.scroll() / 10
 
-proc shiftDown(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
+proc shiftDown*(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
 
 # --- keyboard focus ----------------------------------------------------------
 
@@ -368,21 +373,80 @@ proc nextRune(s: string, i: int): int =
   result = min(s.len, i + 1)
   while result < s.len and (s[result].ord and 0xC0) == 0x80: inc result
 
+proc countClick*(ui: Ui, id: string): int =
+  ## Call on a left press over text input id: 1, then 2 (select a word) and
+  ## 3 or more (select all) for presses in quick succession at the same spot.
+  let now = epochTime()
+  if id == ui.clickId and now - ui.clickTime < 0.4 and (ui.mouse - ui.clickPos).length <= 4:
+    inc ui.clickCount
+  else:
+    ui.clickCount = 1
+  ui.clickId = id
+  ui.clickTime = now
+  ui.clickPos = ui.mouse
+  ui.clickCount
+
+proc charClass*(c: char): int =
+  ## What separates words: 0 whitespace, 1 letters, digits, underscores and
+  ## any non-ASCII byte (so a UTF-8 character is never split), 2 the rest.
+  if c in Whitespace: 0
+  elif c in IdentChars or c.ord >= 0x80: 1
+  else: 2
+
+proc classes*(s: string): seq[int] =
+  for c in s: result.add charClass(c)
+
+proc wordLeft*(cls: openArray[int], i: int): int =
+  ## Ctrl+Left from i: start of the word before it. cls holds each item's
+  ## class; a run of the same nonzero class is a word, 0 is whitespace.
+  result = min(i, cls.len)
+  while result > 0 and cls[result - 1] == 0: dec result
+  if result > 0:
+    let c = cls[result - 1]
+    while result > 0 and cls[result - 1] == c: dec result
+
+proc wordRight*(cls: openArray[int], i: int): int =
+  ## Ctrl+Right from i: start of the next word.
+  result = max(i, 0)
+  if result < cls.len and cls[result] != 0:
+    let c = cls[result]
+    while result < cls.len and cls[result] == c: inc result
+  while result < cls.len and cls[result] == 0: inc result
+
+proc wordAround*(cls: openArray[int], i: int): tuple[a, b: int] =
+  ## Double-click on item i: the run of items of its class around it.
+  if cls.len == 0: return (0, 0)
+  let k = clamp(i, 0, cls.len - 1)
+  result = (k, k + 1)
+  while result.a > 0 and cls[result.a - 1] == cls[k]: dec result.a
+  while result.b < cls.len and cls[result.b] == cls[k]: inc result.b
+
+proc wordDrag*(cls: openArray[int], fromItem, toItem: int): tuple[anchor, caret: int] =
+  ## Dragging after a double-click selects whole words, from the one first
+  ## clicked to the one under the pointer.
+  let w0 = wordAround(cls, fromItem)
+  let w1 = wordAround(cls, toItem)
+  if w1.a >= w0.a: (w0.a, max(w0.b, w1.b)) else: (w0.b, w1.a)
+
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
                 placeholder = ""): set[EditEvent] =
   ## Single-line text input. Focusing it (click or Tab) selects all of its
   ## text; Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
-  ## Dragging or Shift+click/arrows select, Ctrl+A/C/X/V work on the selection.
+  ## Dragging or Shift+click/arrows select, a double-click selects a word and
+  ## a triple-click everything; Ctrl+arrows move by words, Ctrl+A/C/X/V work
+  ## on the selection.
   let w = ui.window
   let hov = ui.hover(r)
   let pad = 7'f32
-  proc hitIndex(text: string, x: float32): int =
-    ## Character boundary nearest to window x.
+  proc hitIndex(text: string, x: float32, nearest = true): int =
+    ## Character boundary nearest to window x, or with nearest off, where
+    ## the character under x starts.
     let x = x - r.x - pad + ui.fieldScroll
     while result < text.len:
       let j = nextRune(text, result)
-      let mid = (ui.textSize(text[0 ..< result]).x + ui.textSize(text[0 ..< j]).x) / 2
-      if x < mid: break
+      let edge = if nearest: (ui.textSize(text[0 ..< result]).x + ui.textSize(text[0 ..< j]).x) / 2
+                 else: ui.textSize(text[0 ..< j]).x
+      if x < edge: break
       result = j
   discard ui.tabStop(id, r, edit = true)
   if ui.focusId == id and ui.focusFresh:
@@ -400,20 +464,27 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.activeId = id
     ui.dragFrom = hitIndex(text, ui.mouse.x)
     ui.dragX = ui.mouse.x
+    let clicks = ui.countClick(id)
     if ui.focusId != id:
       ui.focusId = id
       ui.fieldScroll = 0
       ui.selAnchor = 0
       ui.caret = text.len
       result.incl eeFocused
-    elif w.buttonPressed[DoubleClick]:
+    elif clicks == 2:
+      (ui.selAnchor, ui.caret) = wordAround(text.classes, hitIndex(text, ui.mouse.x, false))
+    elif clicks >= 3:
       ui.selAnchor = 0
       ui.caret = text.len
     else:
       if not w.shiftDown: ui.selAnchor = ui.dragFrom
       ui.caret = ui.dragFrom
   let focused = ui.focusId == id
-  if focused and ui.activeId == id and ui.down() and abs(ui.mouse.x - ui.dragX) > 3:
+  if focused and ui.activeId == id and ui.down() and ui.clickCount == 2:
+    (ui.selAnchor, ui.caret) = wordDrag(text.classes,
+      hitIndex(text, ui.dragX, false), hitIndex(text, ui.mouse.x, false))
+  elif focused and ui.activeId == id and ui.down() and ui.clickCount == 1 and
+       abs(ui.mouse.x - ui.dragX) > 3:
     # Dragging selects from the press, even the one that focused the field.
     ui.selAnchor = ui.dragFrom
     ui.caret = hitIndex(text, ui.mouse.x)
@@ -459,14 +530,17 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
       text.delete(ui.caret ..< nextRune(text, ui.caret))
       result.incl eeChanged
-    # Arrows, Home and End move the caret; with Shift they extend the
-    # selection, without it a selection collapses to the side moved toward.
+    # Arrows, Home and End move the caret, Ctrl+arrows by words; with Shift
+    # they extend the selection, without it a selection collapses to the
+    # side moved toward.
     var move = -1
     let (lo, hi) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
     if w.buttonPressed[KeyLeft]:
-      move = if shift or lo == hi: prevRune(text, ui.caret) else: lo
+      move = if ctrl: wordLeft(text.classes, ui.caret)
+             elif shift or lo == hi: prevRune(text, ui.caret) else: lo
     if w.buttonPressed[KeyRight]:
-      move = if shift or lo == hi: nextRune(text, ui.caret) else: hi
+      move = if ctrl: wordRight(text.classes, ui.caret)
+             elif shift or lo == hi: nextRune(text, ui.caret) else: hi
     if w.buttonPressed[KeyHome]: move = 0
     if w.buttonPressed[KeyEnd]: move = text.len
     if move >= 0:

@@ -1137,7 +1137,9 @@ proc pollPeers(a: App): bool =
 # --- dialogs ----------------------------------------------------------------
 
 proc startDir(a: App): string =
-  if a.player.path.len > 0 and fileExists(a.player.path): a.player.path.parentDir
+  let custom = a.cfg.openDir.expandPath  # Options > Player > Paths
+  if custom.len > 0 and dirExists(custom): custom
+  elif a.player.path.len > 0 and fileExists(a.player.path): a.player.path.parentDir
   elif a.cfg.lastDir.len > 0 and dirExists(a.cfg.lastDir): a.cfg.lastDir
   else: getHomeDir()
 
@@ -1157,8 +1159,20 @@ proc screenshot(a: App) =
   if not a.player.loaded: return
   let base = a.player.path.splitFile.name
   let stamp = fmtTime(a.player.timePos).replace(":", ".")
-  var dir = getHomeDir() / "Pictures"
-  if not dirExists(dir): dir = getHomeDir()
+  let dir = a.cfg.screenshotFolder
+  if a.cfg.screenshotNoAsk:
+    var p = dir / &"{base}_{stamp}.png"
+    var n = 2
+    while fileExists(p):
+      p = dir / &"{base}_{stamp}_{n}.png"
+      inc n
+    try: createDir(dir)
+    except OSError: discard
+    if a.player.h.command("screenshot-to-file", p, "video") >= 0:
+      a.osd("Screenshot saved: " & p.extractFilename)
+    else:
+      a.osd("Screenshot failed")
+    return
   a.ask(dkSaveFile, "screenshot", "Save Screenshot",
     dir / &"{base}_{stamp}.png", @["png", "jpg", "webp"], "Images")
 
@@ -1269,6 +1283,10 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
       a.extPicks[a.extQueue[0]] = paths[0].absolutePath
       a.extQueue.delete(0)
       a.askExternal()
+  of "optshotdir", "optopendir":  # Options > Player > Paths, Browse...
+    if a.overlay == ovOptions:
+      if purpose == "optshotdir": a.cfg.screenshotDir = paths[0]
+      else: a.cfg.openDir = paths[0]
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
   of "audio":
@@ -3315,6 +3333,21 @@ proc renderOptions(a: App, shot: string) =
   of oaCancel: a.closeOptions(false)
   of oaNone:
     if esc: a.closeOptions(false)
+  let req = a.optionsDlg.request
+  a.optionsDlg.request = prNone
+  case req
+  of prNone: discard
+  of prBrowseScreenshots:
+    a.ask(dkOpenDir, "optshotdir", "Screenshot Folder", a.cfg.screenshotFolder)
+  of prBrowseOpen:
+    let d = a.cfg.openDir.expandPath
+    a.ask(dkOpenDir, "optopendir", "Start Folder",
+      if d.len > 0 and dirExists(d): d else: a.startDir)
+  of prShowSettings:
+    try: createDir(configDir())
+    except OSError: discard
+    when defined(windows): a.spawn("explorer.exe", configDir())
+    else: a.spawn("xdg-open", configDir())
   if a.optionsDlg.assocApplied:
     a.optionsDlg.assocApplied = false
     # Let KDE's service cache notice the new defaults right away.
@@ -3537,7 +3570,10 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("Remove selected playlist item", "Delete")]),
     ("Subtitles", @[
       ("Align (numpad as a 3x3 grid)", "Shift+Numpad 1 ... 9"),
-      ("Move", "Shift+Arrows"), ("Bigger / smaller", "Shift+Numpad + / -")])],
+      ("Move", "Shift+Arrows"), ("Bigger / smaller", "Shift+Numpad + / -")]),
+    ("Text fields", @[
+      ("Next / previous word", "Ctrl+Right / Ctrl+Left"),
+      ("Select next / previous word", "Ctrl+Shift+Right / Left")])],
   @[
     ("View", @[
       ("Seek bar", "Ctrl+1"), ("Controls", "Ctrl+2"), ("Status", "Ctrl+3"),
@@ -3564,7 +3600,8 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("360° video: field of view", "Ctrl+Wheel"),
       ("360° video: reset view", "Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
-      ("Repeat options", "Right-click loop button")])]]
+      ("Repeat options", "Right-click loop button"),
+      ("Select word / all in a text field", "Double / Triple-click")])]]
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
