@@ -675,10 +675,13 @@ const
 
 proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
 
-proc start*(d: PickDialog, c: CommandLine, count: int) =
-  ## Prepares the window for c. Values start at the card's own; the n-th
-  ## bookmark card starts at bookmark n, so a command using bookmarks in
-  ## order needs no changes for a file marked in order.
+proc start*(d: PickDialog, c: CommandLine, marks: seq[Bookmark],
+    last = initTable[string, RunValue]()) =
+  ## Prepares the window for c. Cards start at what they were last run with
+  ## (last): a value, or the bookmark at the same time (the same file), else
+  ## at the same position. Otherwise values start at the card's own and the
+  ## n-th bookmark card at bookmark n, so a command using bookmarks in order
+  ## needs no changes for a file marked in order.
   d.cmd = c
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
@@ -686,10 +689,15 @@ proc start*(d: PickDialog, c: CommandLine, count: int) =
   var n = 0
   for i, row in d.rows:
     if row.isBookmark:
-      d.picks[i] = max(0, min(n, count - 1))
+      d.picks[i] = max(0, min(n, marks.len - 1))
       inc n
+      if row.name in last:
+        let v = last[row.name]
+        let same = marks.mapIt(abs(it.time - v.time) < 0.0005).find(true)
+        if same >= 0: d.picks[i] = same
+        elif v.mark >= 0 and v.mark < marks.len: d.picks[i] = v.mark
     else:
-      d.texts[i] = row.content
+      d.texts[i] = if row.name in last: last[row.name].value else: row.content
   d.openRow = -1
   d.listScroll = 0
 

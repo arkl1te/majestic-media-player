@@ -25,6 +25,7 @@ let
   colTrack* = c("#30333b")
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")
+  colLoop* = c("#4dd2ff")
   colError* = c("#ff6b6b")
   colCardValue* = c("#9d8cff", 0.28)
   colCardRef* = c("#ffc857", 0.24)

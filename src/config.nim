@@ -353,6 +353,68 @@ proc save*(cmds: seq[CommandLine]) =
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
+# --- last values given in the Run window ------------------------------------
+
+type
+  RunValue* = object
+    default*: string              ## the card's own content when this was given
+    value*: string                ## value cards: the value
+    mark*: int = -1               ## bookmark cards: index of the bookmark chosen,
+    time*: float                  ## and its time
+
+  RunValues* = Table[string, Table[string, RunValue]]  ## title -> card name -> value
+
+proc newHook*(v: var RunValue) =
+  v = RunValue()
+
+proc runValuesPath(): string = configDir() / "runvalues.json"
+
+proc loadRunValues*(): RunValues =
+  let path = runValuesPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(RunValues)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(v: RunValues) =
+  let path = runValuesPath()
+  try:
+    createDir(path.parentDir)
+    writeFile(path, v.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+proc lastValues*(c: CommandLine): Table[string, RunValue] =
+  ## What c's cards were last run with, skipping cards whose own content has
+  ## been changed in the Commands window since.
+  for name, v in loadRunValues().getOrDefault(c.title):
+    for p in c.parts:
+      if p.card and p.name == name and p.content == v.default:
+        result[name] = v
+        break
+
+proc moveValues*(oldTitle, newTitle: string) =
+  ## Carries the values remembered for a command line over to its new title,
+  ## or forgets them when newTitle is "" (deleted).
+  var all = loadRunValues()
+  if oldTitle notin all or oldTitle == newTitle: return
+  if newTitle.len > 0: all[newTitle] = all[oldTitle]
+  all.del(oldTitle)
+  all.save()
+
+proc rememberValues*(c: CommandLine, values: Table[string, RunValue]) =
+  ## Keeps what c's cards ran with, for its next run.
+  var all = loadRunValues()
+  var mine = all.getOrDefault(c.title)
+  for p in c.parts:
+    if p.card and p.name in values:
+      var v = values[p.name]
+      v.default = p.content
+      mine[p.name] = v
+  all[c.title] = mine
+  all.save()
+
 const PresetCommandLines = staticRead("../assets/presets/commandlines.json")
 
 proc seedPresets*(c: var Config): bool =

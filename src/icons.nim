@@ -12,6 +12,7 @@ const iconPaths = {
   "stop": (24, "M6 6h12v12H6z"),
   "prev": (24, "M6 6h2v12H6zM9.5 12L18 18V6z"),
   "next": (24, "M16 6h2v12h-2zM6 18l8.5-6L6 6z"),
+  "loop": (24, "M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"),
   "slower": (24, "M11 18V6l-8.5 6zM20.5 18V6L12 12z"),
   "faster": (24, "M3.5 18l8.5-6L3.5 6zM13 18l8.5-6L13 6z"),
   "check": (24, "M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"),

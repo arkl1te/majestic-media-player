@@ -29,7 +29,7 @@ type
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick
 
   ContextMenu = enum
-    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns  ## where the right-click menu was opened
+    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat  ## where the right-click menu was opened
 
   PlaylistSort = enum
     psName, psDuration, psDimensions, psSize
@@ -149,6 +149,12 @@ type
     seekRect: Rect            ## seek bar as last drawn
     ctxSeekT: float           ## seek bar time the context menu was opened at
     ctxBookmark: int          ## bookmark under the pointer then, else -1
+    ctxOnMarker: bool         ## a chapter or bookmark was under the pointer then
+    ctxMarkerT: float         ## and its time
+    # A-B loop; marks last only for the current file
+    loopA, loopB: float
+    hasLoopA, hasLoopB: bool
+    abLoop: bool
     lastDragSeekAt: float
     previewQuad: Rect
     showPreview: bool
@@ -365,6 +371,38 @@ proc applyLoop(a: App) =
   a.player.h.setProp("loop-file",
     if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: "inf" else: "no")
 
+proc loopReady(a: App): bool =
+  a.hasLoopA and a.hasLoopB and a.loopB > a.loopA
+
+proc applyAbLoop(a: App) =
+  let on = a.abLoop and a.loopReady
+  for (prop, t) in [("ab-loop-a", a.loopA), ("ab-loop-b", a.loopB)]:
+    if on: a.player.h.setProp(prop, t) else: a.player.h.setProp(prop, "no")
+
+proc clearLoopMarks(a: App) =
+  a.hasLoopA = false
+  a.hasLoopB = false
+  a.abLoop = false
+  a.applyAbLoop()
+
+proc setLoopMark(a: App, isB: bool, t: float) =
+  ## Sets mark A or B; marks placed out of order swap roles. Completing the
+  ## pair starts the loop.
+  let had = a.loopReady
+  if isB: (a.loopB, a.hasLoopB) = (t, true)
+  else: (a.loopA, a.hasLoopA) = (t, true)
+  if a.hasLoopA and a.hasLoopB and a.loopA > a.loopB: swap(a.loopA, a.loopB)
+  if a.loopReady and not had: a.abLoop = true
+  a.applyAbLoop()
+  a.osd((if isB: "Loop B: " else: "Loop A: ") & fmtTime(t, a.cfg.showMillis))
+
+proc unsetLoopMark(a: App, isB: bool) =
+  ## Removes mark A or B, which also ends the loop.
+  if isB: a.hasLoopB = false else: a.hasLoopA = false
+  a.abLoop = false
+  a.applyAbLoop()
+  a.osd(if isB: "Loop B unset" else: "Loop A unset")
+
 proc savePosition(a: App) =
   ## Remembers where the current file was left off; finished (or barely
   ## started) files are forgotten.
@@ -388,6 +426,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
     if start >= 0: start
     elif a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0)
     else: 0.0
+  a.clearLoopMarks()
   a.player.load(path, a.resumedAt)
   a.applyLoop()
   a.cfg.addRecent(path)
@@ -413,6 +452,7 @@ proc openPaths(a: App, paths: seq[string]) =
 proc closeFile(a: App) =
   if a.editLocked: return
   a.savePosition()
+  a.clearLoopMarks()
   a.player.close()
   a.preview.forget()
   a.playlist.setLen 0
@@ -1478,7 +1518,7 @@ proc askExternal(a: App) =
     a.osd(c.title & ": " & err)
     return
   a.menus.close()
-  a.pickDlg.start(c, marks.len)
+  a.pickDlg.start(c, marks, c.lastValues)
   let (sw, sh) = a.pickDlg.size
   if a.pickWin == nil:
     (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh))
@@ -1693,6 +1733,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.cfg.repeatMode = rmFile; a.applyLoop())
   rep.radio("Playlist", "", cfg.repeatMode == rmPlaylist, action = proc () =
     a.cfg.repeatMode = rmPlaylist; a.applyLoop())
+  rep.sep()
+  rep.check("Loop A-B", "", a.abLoop and a.loopReady, enabled = loaded and a.loopReady,
+    action = proc () =
+      a.abLoop = not a.abLoop; a.applyAbLoop())
   play.sep()
   var trackMenus: seq[MenuNode]
   let selectTrack = proc (pt: (string, int)) = a.setTrack(pt[0], pt[1])
@@ -1813,6 +1857,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   case a.ctxMenu
   of cmVideo: (root, ctx)
+  of cmRepeat:
+    let rc = newMenuRoot()
+    rc.children = rep.children
+    (root, rc)
   of cmTime:
     let timeCtx = newMenuRoot()
     timeCtx.check("Enable milliseconds", checked = a.cfg.showMillis, action = proc () =
@@ -1829,15 +1877,25 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.save())
     (root, st)
   of cmSeekBar:
-    # Adds at the time clicked; removes or renames the bookmark clicked on.
+    # Adds at the time clicked; edits or removes the bookmark clicked on.
     let sb = newMenuRoot()
     let i = a.ctxBookmark
     let on = i >= 0 and i < a.fileBookmarks.len
     let (t, bt) = (a.ctxSeekT, if on: a.fileBookmarks[i].time else: 0.0)
     sb.item("Add Bookmark", enabled = loaded and not on, action = proc () = a.addBookmark(t))
+    sb.item("Edit Bookmark...", enabled = on, action = proc () = a.showRename(i))
     sb.item("Remove Bookmark", enabled = on, action = proc () = a.removeBookmark(bt))
-    sb.sep()
-    sb.item("Rename Bookmark...", enabled = on, action = proc () = a.showRename(i))
+    if a.ctxOnMarker:
+      let mt = a.ctxMarkerT
+      sb.sep()
+      for (isB, has, lt, name) in [(false, a.hasLoopA, a.loopA, "Loop A"),
+                                   (true, a.hasLoopB, a.loopB, "Loop B")]:
+        if has and abs(lt - mt) < 0.001:
+          sb.check(name, checked = true, action = bindAct(proc (b: bool) = a.unsetLoopMark(b), isB))
+        else:
+          sb.check(name, checked = false, action = bindAct(proc (b: bool) = a.setLoopMark(b, mt), isB))
+      sb.item("Clear Loop", enabled = a.hasLoopA or a.hasLoopB, action = proc () =
+        a.clearLoopMarks(); a.osd("Loop cleared"))
     sb.sep()
     sb.check("Bookmarks as chapters", checked = a.cfg.bookmarksAsChapters, action = proc () =
       a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
@@ -2399,6 +2457,15 @@ proc seekBarContext(a: App, pos: Vec2) =
     if d <= best:
       best = d
       a.ctxBookmark = i
+  # Nearest chapter or bookmark, for the loop marks.
+  a.ctxOnMarker = a.ctxBookmark >= 0
+  if a.ctxOnMarker: a.ctxMarkerT = a.fileBookmarks[a.ctxBookmark].time
+  for c in a.player.chapters:
+    let d = abs(x0 + w * (c.time / dur) - pos.x)
+    if d < best or (d <= best and not a.ctxOnMarker):
+      best = d
+      a.ctxOnMarker = true
+      a.ctxMarkerT = c.time
   a.ctxMenu = cmSeekBar
   a.menus.openContext(pos)
 
@@ -2421,6 +2488,16 @@ proc seekBar(a: App, r: Rect) =
   let cur = if active: a.seekDragT else: p.timePos
   let frac = if dur > 0: clamp(cur / dur, 0, 1) else: 0
   ui.rect(rect(x0, cy - th / 2, w * frac, th), colAccent)
+
+  # A-B loop: the looped span when active, and each mark set.
+  if dur > 0 and p.loaded:
+    if a.abLoop and a.loopReady:
+      let (lx, rx) = (x0 + w * (a.loopA / dur), x0 + w * (a.loopB / dur))
+      ui.rect(rect(lx, cy + th / 2 + 2, rx - lx, 2), colLoop)
+    for (has, lt) in [(a.hasLoopA, a.loopA), (a.hasLoopB, a.loopB)]:
+      if has:
+        let lx = round(x0 + w * (lt / dur))
+        ui.rect(rect(lx - 1, cy - 9, 2, 18), colLoop)
 
   # Markers: chapters and bookmarks, both snapped to.
   var markers: seq[(float, string, ColorRGBX)]
@@ -2550,6 +2627,17 @@ proc controls(a: App, r: Rect) =
   btn("slower", "slower", "Slower playback", p.loaded, false): a.changeRate(-1)
   btn("faster", "faster", "Faster playback", p.loaded, false): a.changeRate(1)
   btn("next", "next", "Next", navOk, false): a.navigate(1)
+  ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
+  x += 10
+  # Click toggles Repeat > Forever; right-click opens the Repeat menu.
+  let loopR = rect(x, y, bw, bh)
+  btn("loop", "loop", "Repeat (right-click for options)", true,
+      a.cfg.repeatForever or (a.abLoop and a.loopReady)):
+    a.cfg.repeatForever = not a.cfg.repeatForever
+    a.applyLoop()
+  if ui.hover(loopR) and ui.released(MouseRight):
+    a.ctxMenu = cmRepeat
+    a.menus.openContext(ui.mouse)
 
   # Volume on the right.
   let sw = 100'f32
@@ -3162,11 +3250,13 @@ proc renderCommands(a: App, shot: string) =
       let i = cmds.mapIt(it.title).find(orig)
       if orig.len > 0 and i >= 0: cmds[i] = c
       else: cmds.add c)
+    if orig.len > 0: moveValues(orig, c.title)
     a.closeCommands()
   of caDelete:
     let orig = d.origTitle
     a.editCommandLines(proc (cmds: var seq[CommandLine]) =
       cmds.keepItIf(it.title != orig))
+    moveValues(orig, "")
     d.saved = a.commands
     d.load(a.latestCommandLine)
 
@@ -3202,10 +3292,15 @@ proc renderPick(a: App, shot: string) =
   of paRun:
     let d = a.pickDlg
     var picks = a.extPicks
+    var used = initTable[string, RunValue]()
     for i, row in d.rows:
-      if row.kind == ckValue: picks[row.name] = d.texts[i]
+      if row.kind == ckValue:
+        picks[row.name] = d.texts[i]
+        used[row.name] = RunValue(value: d.texts[i])
       elif d.picks[i] >= 0 and d.picks[i] < marks.len:
         picks[row.name] = fmtTime(marks[d.picks[i]].time, millis = true)
+        used[row.name] = RunValue(mark: d.picks[i], time: marks[d.picks[i]].time)
+    d.cmd.rememberValues(used)
     a.closePick()
     a.execute(d.cmd, picks)
 
@@ -3324,7 +3419,8 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
       ("Reset rotation", "Alt+Middle-click video"),
       ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
-      ("Toggle seek snapping", "Shift+Drag seek bar")])]]
+      ("Toggle seek snapping", "Shift+Drag seek bar"),
+      ("Repeat options", "Right-click loop button")])]]
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
