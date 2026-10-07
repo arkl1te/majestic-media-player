@@ -3,6 +3,7 @@
 
 import std/[algorithm, atomics, json, strutils, os, times]
 import mpv, videogl, spherical
+from config import AudioExtensions
 
 type
   Track* = object
@@ -162,6 +163,31 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
         p.videoW = 0
         p.videoH = 0
 
+proc addSameNameAudio(p: Player) =
+  ## A video's audio files of the same name (song.mkv + song.flac) join as
+  ## external tracks, the first one selected. Audio-only files, cover art
+  ## included, pick up nothing.
+  if p.path.len == 0 or p.path.contains("://"): return
+  var video = false
+  for i in 0 ..< p.h.getInt("track-list/count"):
+    let t = "track-list/" & $i & "/"
+    if p.h.getStr(t & "type") == "video" and not p.h.getFlag(t & "albumart") and
+       not p.h.getFlag(t & "external"):
+      video = true
+  if not video: return
+  let (dir, name, _) = p.path.splitFile
+  var found: seq[string]
+  try:
+    for kind, f in walkDir(dir):
+      if kind notin {pcFile, pcLinkToFile} or f == p.path: continue
+      let (_, n, ext) = f.splitFile
+      if n == name and ext.toLowerAscii.strip(chars = {'.'}) in AudioExtensions:
+        found.add f
+  except OSError: return
+  found.sort()
+  for i, f in found:
+    p.h.command("audio-add", f, if i == 0: "select" else: "auto", f.extractFilename)
+
 proc pollEvents*(p: Player): bool =
   ## Drains the mpv event queue. Returns true if anything changed.
   while true:
@@ -177,6 +203,7 @@ proc pollEvents*(p: Player): bool =
       # Read here rather than in load: the previous file may still show a
       # frame or two until mpv switches over.
       p.sphere = detectSphere(p.path)
+      p.addSameNameAudio()
       p.loaded = true
       p.justLoaded = true
       p.loadError = ""

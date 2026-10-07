@@ -2,7 +2,7 @@
 
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
   random, tables, streams]
-import silky, vmath, bumpy, chroma, pixie, opengl
+import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap
 from std/uri import encodeUrl, decodeUrl, parseUri
@@ -120,6 +120,9 @@ type
     pickSk: Silky
     pickUi: Ui
     resumedAt: float          ## start time of the file being loaded, else 0
+    savedPos: float           ## playback position last written to positions.json
+    savedCfg: string          ## config.json as last written by autosave
+    autosaveAt: float         ## when the remembered state was last checked
     instance: InstanceServer  ## receives files from later launches
     peers: PeerNet            ## other players, for Synchronize
     syncMaster: int           ## pid of our group's master, 0 when not synchronized
@@ -430,11 +433,47 @@ proc savePosition(a: App) =
   ## started) files are forgotten.
   let p = a.player
   if not a.cfg.rememberTime or not p.loaded or p.path.len == 0 or p.duration <= 0: return
+  a.savedPos = p.timePos
+  # Reloaded first so positions other players remembered meanwhile survive.
+  a.positions = loadPositions()
   if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached:
     a.positions.remember(p.path, p.timePos)
   else:
     a.positions.del(p.path)
   a.positions.save()
+
+proc rememberState(a: App) =
+  ## Copies the state kept between runs (volume, window, pan/rotate/scale,
+  ## playlist) into the config.
+  a.cfg.volume = a.player.volume
+  a.cfg.muted = a.player.muted
+  a.cfg.transform = SavedTransform(panX: a.xf.pan.x, panY: a.xf.pan.y,
+    rotation: a.xf.rotation, zoom: a.xf.zoom, scaleX: a.xf.scaleX, scaleY: a.xf.scaleY)
+  if not a.fullscreen and not a.window.maximized and not a.window.minimized:
+    let (pos, size) = (a.window.framePos, a.window.size)
+    (a.cfg.windowX, a.cfg.windowY, a.cfg.windowW, a.cfg.windowH) =
+      (pos.x.int, pos.y.int, size.x.int, size.y.int)
+  if a.cfg.rememberPlaylist:
+    a.cfg.playlist = a.playlist
+    a.cfg.playlistIndex = if a.plIndex >= 0: a.plIndex else: a.plSelected
+  else:
+    (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
+
+proc autosave(a: App) =
+  ## Saves the remembered state as it changes rather than only on exit, so
+  ## a crash or a killed session loses at most a couple of seconds of it.
+  let t = now()
+  if t - a.autosaveAt < 2: return
+  a.autosaveAt = t
+  if a.player.loaded and abs(a.player.timePos - a.savedPos) >= 1:
+    a.savePosition()
+  # Options edits the config live until OK or Cancel; never persist those.
+  if a.overlay == ovOptions: return
+  a.rememberState()
+  let j = a.cfg.toJson
+  if j != a.savedCfg:
+    a.cfg.save()
+    a.savedCfg = j
 
 proc playIndex(a: App, i: int, start = -1.0) =
   ## Plays entry i from `start`, or from where it was left off when negative.
@@ -842,7 +881,7 @@ proc setMute(a: App, on: bool) =
 
 proc changeRate(a: App, dir: float) =
   if not a.player.loaded: return
-  let s = clamp(a.player.speed + dir * a.cfg.rateStep, 0.25, 4.0)
+  let s = clamp(a.player.speed + dir * a.cfg.rateStep, 0.1, 100.0)  # 100 = mpv's own maximum
   a.player.h.setProp("speed", s)
   a.syncSend("speed", $s)
   a.osd(&"Speed: {s:.2f}x")
@@ -4179,6 +4218,7 @@ proc main() =
     a.applyOnTop()
     a.applyKeepAwake()
     a.updateAspectHints()
+    a.autosave()
 
     let t = now()
     a.pollVideoFrame()
@@ -4199,19 +4239,7 @@ proc main() =
 
   if a.overlay == ovOptions: a.closeOptions(false)
   a.savePosition()
-  a.cfg.volume = a.player.volume
-  a.cfg.muted = a.player.muted
-  a.cfg.transform = SavedTransform(panX: a.xf.pan.x, panY: a.xf.pan.y,
-    rotation: a.xf.rotation, zoom: a.xf.zoom, scaleX: a.xf.scaleX, scaleY: a.xf.scaleY)
-  if not a.fullscreen and not a.window.maximized:
-    let (pos, size) = (a.window.framePos, a.window.size)
-    (a.cfg.windowX, a.cfg.windowY, a.cfg.windowW, a.cfg.windowH) =
-      (pos.x.int, pos.y.int, size.x.int, size.y.int)
-  if a.cfg.rememberPlaylist:
-    a.cfg.playlist = a.playlist
-    a.cfg.playlistIndex = if a.plIndex >= 0: a.plIndex else: a.plSelected
-  else:
-    (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
+  a.rememberState()
   a.cfg.save()
   a.instance.close()
   a.peers.close()

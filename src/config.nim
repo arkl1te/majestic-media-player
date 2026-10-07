@@ -119,6 +119,13 @@ proc configDir*(): string = getConfigDir() / "majestic-media-player"
 
 proc configPath(): string = configDir() / "config.json"
 
+proc writeAtomic(path, data: string) =
+  ## Saved through a temporary file, so a crash mid-write (now that state is
+  ## saved while playing) can't leave a truncated file behind.
+  let tmp = path & ".tmp"
+  writeFile(tmp, data)
+  moveFile(tmp, path)
+
 proc loadConfig*(): Config =
   result = Config()
   let path = configPath()
@@ -132,7 +139,7 @@ proc save*(c: Config) =
   let path = configPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, c.toJson)
+    writeAtomic(path, c.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -163,7 +170,7 @@ proc save*(p: Positions) =
   let path = positionsPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, p.toJson)
+    writeAtomic(path, p.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -194,7 +201,7 @@ proc save*(s: SubScales) =
   let path = subScalesPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, s.toJson)
+    writeAtomic(path, s.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -354,7 +361,7 @@ proc save*(b: Bookmarks) =
   let path = bookmarksPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, b.toJson)
+    writeAtomic(path, b.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -391,7 +398,7 @@ proc save*(cmds: seq[CommandLine]) =
   let path = commandLinesPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, cmds.toJson)
+    writeAtomic(path, cmds.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
@@ -423,7 +430,7 @@ proc save*(v: RunValues) =
   let path = runValuesPath()
   try:
     createDir(path.parentDir)
-    writeFile(path, v.toJson)
+    writeAtomic(path, v.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
