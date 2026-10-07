@@ -21,7 +21,7 @@ type
     apShutdown, apLogOff, apLock
 
   SavedTransform* = object
-    ## Grab, rotate & scale state, kept when "Remember last grab, rotation
+    ## Pan, rotate & scale state, kept when "Remember last pan, rotation
     ## and scale" is on.
     panX*, panY*, rotation*: float
     zoom*: float = 1
@@ -56,7 +56,7 @@ type
     osdTimestamp*: bool = false
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
-    showAllShortcuts*: bool = false  # status bar hints include view toggles and grab/rotate/scale
+    showAllShortcuts*: bool = false  # status bar hints include view toggles and pan/rotate/scale
     autoFitWindow*: bool = true
     sphereDragMovesWindow*: bool = false  # 360° video: drag moves the window, Ctrl+drag looks around
     rememberTime*: bool = false
@@ -71,6 +71,8 @@ type
     screenshotDir*: string = ""    # "" = ~/Pictures (or home)
     screenshotNoAsk*: bool = false # save straight into screenshotDir
     openDir*: string = ""          # "" = the playing file's folder, else lastDir
+    # Options > Player > Keys
+    keys*: Table[string, string]   # command id -> "Home|0" ("" = none); only changed keys
     # Options > Playback
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25

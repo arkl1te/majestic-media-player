@@ -2,15 +2,16 @@
 ## tree view) and the selected page on the right. Edits apply to the config
 ## live; the caller snapshots it beforehand so Cancel can undo them.
 
-import std/[os, strutils, strformat, math]
+import std/[os, strutils, strformat, math, tables]
 import silky, vmath, bumpy, chroma, pixie
-import ui, theme, config, assoc
+import ui, theme, config, assoc, keymap
 
 type
   OptionsPage* = enum
     opPlayer = "Player"
     opFormats = "Formats"
     opPaths = "Paths"
+    opKeys = "Keys"
     opPlayback = "Playback"
     opSubtitles = "Subtitles"
     opMisc = "Miscellaneous"
@@ -34,6 +35,13 @@ type
     status: string              ## Formats page: outcome of the last Apply
     assocApplied*: bool         ## associations were written; the caller clears it
     request*: PathRequest       ## Paths page button pressed; the caller clears it
+    keySearch: string
+    keyScroll: float32
+    keySel: KeyAction           ## Keys page: selected command
+    capturing: bool             ## Keys page: waiting for the selected command's new key
+    keyTaken: bool              ## a key went to the capture this frame
+    keyNote: string             ## Keys page: outcome of the last change
+    keyReveal: bool             ## scroll the selected command into view
 
   Pane = object
     ## Layout cursor for a page.
@@ -41,9 +49,9 @@ type
     started: bool               ## a group header was placed already
 
 const
-  Tree = [(opPlayer, 0), (opFormats, 1), (opPaths, 1), (opPlayback, 0), (opSubtitles, 0),
-          (opMisc, 0)]
-  PlayerChildren = {opFormats, opPaths}
+  Tree = [(opPlayer, 0), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
+          (opSubtitles, 0), (opMisc, 0)]
+  PlayerChildren = {opFormats, opPaths, opKeys}
   TreeWidth = 180'f32
   TreeRow = 22'f32
   TreeIndent = 16'f32
@@ -56,6 +64,8 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   ## The window is being shown: re-read associations, start at the top.
   d.assocLoaded = false
   d.status = ""
+  d.keyNote = ""
+  d.capturing = false
   d.scroll = 0
   ui.navId = "o-tree"
   ui.navVisible = false
@@ -64,6 +74,7 @@ proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   if p == d.page: return
   d.page = p
   d.scroll = 0
+  d.capturing = false
   ui.focusId = ""
   if p in PlayerChildren: d.playerOpen = true
 
@@ -226,7 +237,7 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rtime", "Remember time (continue where the file was left off)", c.rememberTime)
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
-  ui.checkRow(p, "o-rxf", "Remember last grab, rotation and scale", c.rememberTransform)
+  ui.checkRow(p, "o-rxf", "Remember last pan, rotation and scale", c.rememberTransform)
   ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
   ui.group(p, "Timestamps")
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
@@ -381,6 +392,199 @@ proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   p.y += Row + 4
   ui.hint(p, "Settings, remembered positions, bookmarks and Run commands are kept here.")
 
+const KeyCapture = "o-keycap"     ## focusId while waiting for a key
+
+proc startCapture*(d: OptionsDialog, ui: Ui, act: KeyAction) =
+  d.keySel = act
+  d.capturing = true
+  d.keyReveal = true
+  ui.focusId = KeyCapture       # the window's own keys (Esc, Enter, Tab) stand back
+  ui.navId = "o-keys-list"
+
+proc stopCapture(d: OptionsDialog, ui: Ui) =
+  d.capturing = false
+  if ui.focusId == KeyCapture: ui.focusId = ""
+
+proc assignKeys*(d: OptionsDialog, c: var Config, act: KeyAction, ks: seq[KeyCombo]) =
+  ## Gives act the keys ks, taking each from any command that had it.
+  var taken: seq[string]
+  for k in ks:
+    for other in c.actionsUsing(k):
+      if other != act:
+        c.removeCombo(other, k)
+        let name = "\"" & Actions[other].label & "\""
+        if name notin taken: taken.add name
+  c.setCombos(act, ks)
+  d.keyNote =
+    if ks.len == 0: Actions[act].label & ": no key"
+    else: Actions[act].label & ": " & c.keysText(act)
+  if taken.len > 0: d.keyNote.add " (taken from " & taken.join(", ") & ")"
+
+proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
+  let w = ui.window
+  d.keyTaken = false
+  if d.capturing:
+    # The next key pressed, with the modifiers held, becomes the command's
+    # key. Escape or a click cancels.
+    let key = w.pressedKey
+    if w.buttonPressed[KeyEscape] or w.buttonPressed[MouseLeft] or
+       w.buttonPressed[MouseRight] or ui.focusId != KeyCapture:
+      d.stopCapture(ui)
+      d.keyTaken = w.buttonPressed[KeyEscape]
+    elif key != ButtonUnknown:
+      d.assignKeys(c, d.keySel, @[KeyCombo(mods: w.heldMods, key: key)])
+      d.stopCapture(ui)
+      d.keyTaken = true
+
+  ui.group(p, "Keyboard shortcuts")
+  discard ui.textField("o-keysearch", rect(p.x + 8, p.y, p.w - 8, 26), d.keySearch,
+    "Search commands or keys")
+  p.y += 34
+
+  # Rows: a header per group, then its commands matching the search.
+  type KeyRow = tuple[header: bool, group: KeyGroup, act: KeyAction]
+  var rows: seq[KeyRow]
+  var acts: seq[int]            # indexes of the command rows
+  for g in KeyGroup:
+    var first = true
+    for act in KeyAction:
+      let info = Actions[act]
+      if info.group != g: continue
+      if not c.matchesSearch(act, d.keySearch): continue
+      if first:
+        rows.add (true, g, act)
+        first = false
+      acts.add rows.len
+      rows.add (false, g, act)
+
+  let footer = 8'f32 + 34 + 18  # buttons and the status line below the list
+  let list = rect(p.x + 8, p.y, p.w - 8, max(120'f32, bottom - p.y - footer))
+  ui.rect(list, colBackground)
+  ui.border(list, colBorder)
+  const rowH = 24'f32
+  const keyW = 190'f32
+  let inner = rect(list.x + 1, list.y + 1, list.w - 2, list.h - 2)
+  let maxScroll = max(0'f32, rows.len.float32 * rowH - inner.h)
+  let listFocused = ui.tabStop("o-keys-list", list)
+  var cur = -1                  # position of the selected command in acts
+  for n, i in acts:
+    if rows[i].act == d.keySel: cur = n
+  proc reveal(d: OptionsDialog, i: int) =
+    let top = i.float32 * rowH
+    if top < d.keyScroll: d.keyScroll = top
+    if top + rowH > d.keyScroll + inner.h: d.keyScroll = top + rowH - inner.h
+  if d.keyReveal and cur >= 0:
+    d.keyReveal = false
+    d.reveal(acts[cur])
+  if listFocused and ui.focusId.len == 0 and acts.len > 0:
+    # Up/Down/PageUp/PageDown/Home/End move the selection, Enter or Space
+    # asks for a new key, Delete or Backspace removes the key.
+    let page = max(1, int(inner.h / rowH) - 1)
+    var n = max(cur, 0)
+    if w.buttonPressed[KeyUp]: dec n
+    if w.buttonPressed[KeyDown]: inc n
+    if w.buttonPressed[KeyPageUp]: n -= page
+    if w.buttonPressed[KeyPageDown]: n += page
+    if w.buttonPressed[KeyHome]: n = 0
+    if w.buttonPressed[KeyEnd]: n = acts.high
+    n = clamp(n, 0, acts.high)
+    if n != cur:
+      cur = n
+      d.keySel = rows[acts[n]].act
+      ui.navVisible = true
+      # Bring the group header into view with the first command.
+      d.reveal(if n == 0: 0 else: acts[n])
+    if cur >= 0:
+      if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or w.buttonPressed[KeySpace]:
+        ui.enterUsed = true
+        d.startCapture(ui, d.keySel)
+      elif w.buttonPressed[KeyDelete] or w.buttonPressed[KeyBackspace]:
+        d.assignKeys(c, d.keySel, @[])
+  if ui.hover(inner) and ui.scroll() != 0:
+    d.keyScroll += ui.scroll() * rowH / 3
+    ui.scrollConsumed = true
+  d.keyScroll = clamp(d.keyScroll, 0, maxScroll)
+
+  let outerClip = ui.hitClip
+  ui.hitClip = inner
+  ui.sk.pushClipRect(inner)
+  for i, row in rows:
+    let r = rect(inner.x, inner.y + i.float32 * rowH - d.keyScroll, inner.w, rowH)
+    if r.y + rowH < inner.y or r.y > inner.y + inner.h: continue
+    if row.header:
+      ui.textIn($row.group, rect(r.x + 8, r.y, r.w - 16, rowH), colAccent, FontSmall)
+      ui.rect(rect(r.x + 8, r.y + rowH - 3, r.w - 16, 1), colBorder)
+      continue
+    let act = row.act
+    let sel = act == d.keySel and cur >= 0
+    let capturing = sel and d.capturing
+    let hov = ui.hover(r)
+    if sel: ui.rect(r, if listFocused or capturing: colAccent else: colPanelRaised)
+    elif hov: ui.rect(r, colHover)
+    let fg = if sel and (listFocused or capturing): colOnAccent else: colText
+    let changed = not c.isDefault(act)
+    ui.textIn(ui.ellipsize(Actions[act].label, r.w - keyW - 40),
+      rect(r.x + 20, r.y, r.w - keyW - 28, rowH), fg)
+    let kr = rect(r.x + r.w - keyW - 6, r.y + 2, keyW, rowH - 4)
+    let key = c.keysText(act)
+    if capturing:
+      ui.rect(kr, colBackground)
+      ui.border(kr, colAccent)
+      ui.textIn("Press a key...", rect(kr.x + 8, kr.y, kr.w - 16, kr.h), colTextDim, FontSmall)
+    else:
+      let kcol =
+        if sel and (listFocused or capturing): colOnAccent
+        elif key.len == 0: colTextDisabled
+        elif changed: colAccent
+        else: colTextDim
+      ui.textIn((if changed: "• " else: "") & (if key.len > 0: key else: "None"),
+        rect(kr.x + 8, kr.y, kr.w - 16, kr.h), kcol, FontSmall)
+      if ui.hover(kr): ui.tip(kr, "Click to change")
+    if hov and ui.pressed():
+      ui.consumeClick()
+      ui.navId = "o-keys-list"
+      ui.focusId = ""
+      # Clicking the key, or double-clicking the row, asks for a new key.
+      if ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act)
+      else: d.keySel = act
+  if rows.len == 0:
+    ui.textIn("No matching commands", inner, colTextDim, FontSmall, h = CenterAlign)
+  ui.sk.popClipRect()
+  ui.hitClip = outerClip
+  p.y = list.y + list.h + 8
+
+  let has = cur >= 0
+  proc button(ui: Ui, id, label: string, r: Rect, enabled: bool): bool =
+    if enabled: return ui.textButton(id, r, label)
+    ui.rect(r, colPanelRaised)
+    ui.border(r, colBorder)
+    ui.textIn(label, r, colTextDisabled, h = CenterAlign)
+  const bw = 110'f32
+  let by = p.y
+  proc at(i: int): Rect = rect(list.x + i.float32 * (bw + 8), by, bw, 28)
+  if ui.button("o-keyset", "Change...", at(0), has): d.startCapture(ui, d.keySel)
+  if ui.button("o-keyclear", "Clear", at(1), has and c.combos(d.keySel).len > 0):
+    d.assignKeys(c, d.keySel, @[])
+  if ui.button("o-keyreset", "Default", at(2), has and not c.isDefault(d.keySel)):
+    d.assignKeys(c, d.keySel, d.keySel.defaults)
+  let allR = rect(p.x + p.w - 150, p.y, 150, 28)
+  if c.keys.len > 0:
+    if ui.textButton("o-keyresetall", allR, "Reset all keys"):
+      c.keys.clear()
+      d.keyNote = "All keys are back to their defaults."
+  else:
+    ui.rect(allR, colPanelRaised)
+    ui.border(allR, colBorder)
+    ui.textIn("Reset all keys", allR, colTextDisabled, h = CenterAlign)
+  p.y += 34
+  let note =
+    if d.capturing: "Press a key for \"" & Actions[d.keySel].label & "\"; Esc cancels."
+    elif d.keyNote.len > 0: d.keyNote
+    else: "Click a key to change it. A key given to another command is taken from it."
+  ui.textIn(ui.ellipsize(note, p.w - 8, FontSmall), rect(p.x + 8, p.y, p.w - 8, 18),
+    if d.capturing: colAccent else: colTextDim, FontSmall)
+  p.y += 18
+
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Display")
   ui.checkRow(p, "o-awake", "Keep the monitor on while playing video", c.keepDisplayOn)
@@ -438,6 +642,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   of opPlayer: playerPage(ui, c, p)
   of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
   of opPaths: d.pathsPage(ui, c, p)
+  of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
   of opPlayback: playbackPage(ui, c, p)
   of opSubtitles: subtitlesPage(ui, c, p)
   of opMisc: miscPage(ui, c, p)
@@ -471,7 +676,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
 
   # Tab / Shift+Tab: tree, page controls, OK, Cancel. Scroll the page so a
   # newly focused control is visible.
-  let i = ui.tabNavigate()
+  # A Tab that was just bound to a command doesn't move the focus too.
+  let i = if d.keyTaken: -1 else: ui.tabNavigate()
   if i >= pageStops and i < pageStopsEnd:
     let sr = ui.tabStops[i].r
     if sr.y < pageR.y: d.scroll -= pageR.y - sr.y + 4

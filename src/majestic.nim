@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables, streams]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -1623,11 +1623,12 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let p = a.player
   let loaded = p.loaded
   let cfg = addr a.cfg
+  let k = proc (act: KeyAction): string = a.cfg.keyText(act)
 
   # File
   let locked = a.playlistLocked  # synchronized: the master's playlist rules
   let file = root.sub("File")
-  file.item("Open File...", "Ctrl+O", enabled = not locked, action = proc () = a.openFileDialog())
+  file.item("Open File...", k(kaOpenFile), enabled = not locked, action = proc () = a.openFileDialog())
   let recent = file.sub("Open Recent", enabled = a.cfg.recentFiles.len > 0 and not locked)
   let openOne = proc (path: string) = a.openPaths(@[path])
   let removeOne = proc (path: string) =
@@ -1642,77 +1643,77 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     recent.item("Clear List", action = proc () = a.cfg.recentFiles.setLen 0)
   file.item("Open Directory...", enabled = not locked, action = proc () =
     a.ask(dkOpenDir, "opendir", "Open Directory"))
-  file.item("Open From Clipboard", "Ctrl+V", enabled = not locked,
+  file.item("Open From Clipboard", k(kaOpenClipboard), enabled = not locked,
     action = proc () = a.openFromClipboard())
-  file.item("Copy to Clipboard", "Ctrl+C", enabled = loaded,
+  file.item("Copy to Clipboard", k(kaCopyClipboard), enabled = loaded,
     action = proc () = a.copyToClipboard())
-  file.item("Close", "Ctrl+X", enabled = loaded and not locked, action = proc () = a.closeFile())
+  file.item("Close", k(kaClose), enabled = loaded and not locked, action = proc () = a.closeFile())
   file.sep()
-  file.item("Save Screenshot...", "Alt+I", enabled = loaded and p.hasVideo,
+  file.item("Save Screenshot...", k(kaScreenshot), enabled = loaded and p.hasVideo,
     action = proc () = a.screenshot())
   file.sep()
   let loadTrack = file.sub("Load Track From File", enabled = loaded)
-  loadTrack.item("Subtitle File...", "Ctrl+Shift+O", action = proc () =
+  loadTrack.item("Subtitle File...", k(kaLoadSubtitle), action = proc () =
     a.ask(dkOpenFile, "subtitle", "Load Subtitle", exts = @SubtitleExtensions,
       filterName = "Subtitles"))
-  loadTrack.item("Audio File...", action = proc () =
+  loadTrack.item("Audio File...", k(kaLoadAudio), action = proc () =
     a.ask(dkOpenFile, "audio", "Load Audio Track", exts = @MediaExtensions,
       filterName = "Audio files"))
   file.sep()
-  file.item("Properties", enabled = loaded, action = proc () = a.showOverlay(ovProperties))
+  file.item("Properties", k(kaProperties), enabled = loaded, action = proc () = a.showOverlay(ovProperties))
   file.sep()
-  file.item("Exit", "Alt+X", action = proc () = a.window.closeRequested = true)
+  file.item("Exit", k(kaExit), action = proc () = a.window.closeRequested = true)
   let exitItem = file.children[^1]
 
   # View
   let view = root.sub("View")
-  view.check("Seek Bar", "Ctrl+1", cfg.showSeekBar, action = proc () =
+  view.check("Seek Bar", k(kaSeekBar), cfg.showSeekBar, action = proc () =
     a.cfg.showSeekBar = not a.cfg.showSeekBar
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showSeekBar: SeekBarHeight else: -SeekBarHeight))))
-  view.check("Controls", "Ctrl+2", cfg.showControls, action = proc () =
+  view.check("Controls", k(kaControls), cfg.showControls, action = proc () =
     a.cfg.showControls = not a.cfg.showControls
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showControls: ControlsHeight else: -ControlsHeight))))
-  view.check("Status", "Ctrl+3", cfg.showStatus, action = proc () =
+  view.check("Status", k(kaStatus), cfg.showStatus, action = proc () =
     a.cfg.showStatus = not a.cfg.showStatus
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showStatus: StatusHeight else: -StatusHeight))))
-  view.check("Playlist", "Ctrl+4", cfg.showPlaylist, action = proc () =
+  view.check("Playlist", k(kaPlaylist), cfg.showPlaylist, action = proc () =
     a.setPlaylistShown(not a.cfg.showPlaylist))
-  view.check("Run Log", "Ctrl+5", cfg.showRunLog, action = proc () =
+  view.check("Run Log", k(kaRunLog), cfg.showRunLog, action = proc () =
     a.setRunLogShown(not a.cfg.showRunLog))
   view.sep()
-  view.check("Show OSD", "", cfg.showOsd, action = proc () =
+  view.check("Show OSD", k(kaShowOsd), cfg.showOsd, action = proc () =
     a.cfg.showOsd = not a.cfg.showOsd
     a.syncSettings())
-  view.check("Full Screen", "Alt+Enter", a.fullscreen, action = proc () =
+  view.check("Full Screen", k(kaFullScreen), a.fullscreen, action = proc () =
     a.setFullscreen(not a.fullscreen))
   let fullScreen = view.children[^1]
 
-  let grab = view.sub("Grab, Rotate && Scale".replace("&&", "&"))
-  grab.item("Center", "Numpad 5", action = proc () =
+  let grab = view.sub("Pan, Rotate && Scale".replace("&&", "&"))
+  grab.item("Center", k(kaCenter), action = proc () =
     a.xf.pan = vec2(0, 0); a.xfChanged("Pan: center"))
-  for (label, key, d) in [("Move Up", "Numpad 8", vec2(0, -1)), ("Move Down", "Numpad 2", vec2(0, 1)),
-                          ("Move Left", "Numpad 4", vec2(-1, 0)), ("Move Right", "Numpad 6", vec2(1, 0))]:
-    grab.item(label, key, action = bindAct(proc (dir: Vec2) =
+  for (label, key, d) in [("Move Up", kaMoveUp, vec2(0, -1)), ("Move Down", kaMoveDown, vec2(0, 1)),
+                          ("Move Left", kaMoveLeft, vec2(-1, 0)), ("Move Right", kaMoveRight, vec2(1, 0))]:
+    grab.item(label, k(key), action = bindAct(proc (dir: Vec2) =
       a.xf.pan += dir * a.cfg.panStep.float32
       a.xfChanged(&"Pan: {int(a.xf.pan.x)}, {int(a.xf.pan.y)}"), d))
   grab.sep()
-  grab.item("0 Degrees", "Alt+Numpad 5", action = proc () =
+  grab.item("0 Degrees", k(kaRotate0), action = proc () =
     a.xf.rotation = 0; a.xfChanged("Rotation: 0°"))
-  grab.item("Rotate Clockwise", "Alt+Numpad 6", action = proc () =
+  grab.item("Rotate Clockwise", k(kaRotateCw), action = proc () =
     a.xf.rotation = floorMod(a.xf.rotation + a.cfg.rotateStep.float32, 360)
     a.xfChanged(&"Rotation: {a.xf.rotation:g}°"))
-  grab.item("Rotate Counter-clockwise", "Alt+Numpad 4", action = proc () =
+  grab.item("Rotate Counter-clockwise", k(kaRotateCcw), action = proc () =
     a.xf.rotation = floorMod(a.xf.rotation - a.cfg.rotateStep.float32, 360)
     a.xfChanged(&"Rotation: {a.xf.rotation:g}°"))
   grab.sep()
-  grab.item("Restore Size", "Ctrl+Numpad 5", action = proc () =
+  grab.item("Restore Size", k(kaRestoreSize), action = proc () =
     a.xf.zoom = 1; a.xf.scaleX = 1; a.xf.scaleY = 1; a.xfChanged("Size: 100%"))
   let step = a.cfg.sizeStep.float32 / 100
   for (label, key, which, d) in [
-      ("Increase Size", "Ctrl+Numpad 9", 0, 1'f32), ("Decrease Size", "Ctrl+Numpad 3", 0, -1'f32),
-      ("Increase Width", "Ctrl+Numpad 6", 1, 1'f32), ("Decrease Width", "Ctrl+Numpad 4", 1, -1'f32),
-      ("Increase Height", "Ctrl+Numpad 8", 2, 1'f32), ("Decrease Height", "Ctrl+Numpad 2", 2, -1'f32)]:
-    grab.item(label, key, action = bindAct(proc (wd: (int, float32)) =
+      ("Increase Size", kaSizeUp, 0, 1'f32), ("Decrease Size", kaSizeDown, 0, -1'f32),
+      ("Increase Width", kaWidthUp, 1, 1'f32), ("Decrease Width", kaWidthDown, 1, -1'f32),
+      ("Increase Height", kaHeightUp, 2, 1'f32), ("Decrease Height", kaHeightDown, 2, -1'f32)]:
+    grab.item(label, k(key), action = bindAct(proc (wd: (int, float32)) =
       let (w, dd) = wd
       case w
       of 0:
@@ -1725,7 +1726,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.xf.scaleY = max(0.05, a.xf.scaleY + dd * step)
         a.xfChanged(&"Height: {int(round(a.xf.scaleY * 100))}%"), (which, d)))
   grab.sep()
-  grab.item("Reset", action = proc () =
+  grab.item("Reset", k(kaPanReset), action = proc () =
     a.xf = VideoTransform(); a.xfChanged("Reset"))
 
   let frame = view.sub("Video Frame")
@@ -1750,24 +1751,24 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
                         ("While Playing Video", otWhilePlayingVideo)]:
     ontop.radio(label, "", cfg.onTop == mode,
       action = bindAct(proc (m: OnTopMode) = a.cfg.onTop = m, mode))
-  view.item("Options...", "O", action = proc () = a.showOverlay(ovOptions))
+  view.item("Options...", k(kaOptions), action = proc () = a.showOverlay(ovOptions))
   let options = view.children[^1]
 
   # Play
   let play = root.sub("Play")
-  play.item(if p.playing: "Pause" else: "Play", "Space",
+  play.item(if p.playing: "Pause" else: "Play", k(kaPlayPause),
     enabled = loaded or a.cfg.recentFiles.len > 0,
     action = proc () = a.playPause())
-  play.item("Stop", "", enabled = loaded, action = proc () = a.stop())
+  play.item("Stop", k(kaStop), enabled = loaded, action = proc () = a.stop())
   let (playPause, stop) = (play.children[0], play.children[1])
-  play.item("Frame Forward", ".", enabled = loaded, action = proc () = a.frameStep(true))
-  play.item("Frame Back", ",", enabled = loaded, action = proc () = a.frameStep(false))
-  play.item(&"Faster Playback (+{a.cfg.rateStep:g}x)", "Shift+.", enabled = loaded,
+  play.item("Frame Forward", k(kaFrameForward), enabled = loaded, action = proc () = a.frameStep(true))
+  play.item("Frame Back", k(kaFrameBack), enabled = loaded, action = proc () = a.frameStep(false))
+  play.item(&"Faster Playback (+{a.cfg.rateStep:g}x)", k(kaFaster), enabled = loaded,
     action = proc () = a.changeRate(1))
-  play.item(&"Slower Playback (-{a.cfg.rateStep:g}x)", "Shift+,", enabled = loaded,
+  play.item(&"Slower Playback (-{a.cfg.rateStep:g}x)", k(kaSlower), enabled = loaded,
     action = proc () = a.changeRate(-1))
   let rep = play.sub("Repeat")
-  rep.check("Forever", "", cfg.repeatForever, action = proc () =
+  rep.check("Forever", k(kaRepeatForever), cfg.repeatForever, action = proc () =
     a.cfg.repeatForever = not a.cfg.repeatForever; a.applyLoop())
   rep.sep()
   rep.radio("File", "", cfg.repeatMode == rmFile, action = proc () =
@@ -1792,9 +1793,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         m.radio(t.trackLabel, "", t.selected, action = bindAct(selectTrack, (prop, t.id)))
   play.sep()
   let vol = play.sub("Volume")
-  vol.item("Up", "Up", action = proc () = a.volumeStep(true))
-  vol.item("Down", "Down", action = proc () = a.volumeStep(false))
-  vol.check("Mute", "Ctrl+M", p.muted, action = proc () = a.setMute(not a.player.muted))
+  vol.item("Up", k(kaVolumeUp), action = proc () = a.volumeStep(true))
+  vol.item("Down", k(kaVolumeDown), action = proc () = a.volumeStep(false))
+  vol.check("Mute", k(kaMute), p.muted, action = proc () = a.setMute(not a.player.muted))
   vol.item("Max", action = proc () =
     a.player.setVolume(100); a.osd("Volume: 100%"))
   let after = play.sub("After Playback")
@@ -1808,7 +1809,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   # Navigate
   let nav = root.sub("Navigate")
   let bm = nav.sub("Bookmarks", enabled = loaded)
-  bm.item("Add Bookmark", "Insert", enabled = loaded, action = proc () = a.addBookmark(a.player.timePos))
+  bm.item("Add Bookmark", k(kaAddBookmark), enabled = loaded, action = proc () = a.addBookmark(a.player.timePos))
   bm.item("Remove Bookmark", enabled = a.fileBookmarks.len > 0, action = proc () =
     let i = a.nearestBookmark(a.player.timePos)
     if i >= 0: a.removeBookmark(a.fileBookmarks[i].time))
@@ -1822,11 +1823,11 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     for i, b in marks:
       bm.item(fmtTime(b.time) & "  " & b.label(i), action = bindAct(proc (t: float) = a.seekTo(t), b.time))
   nav.sep()
-  nav.item(&"Jump Forward {a.cfg.seekStep:g}s", "Right", enabled = loaded,
+  nav.item(&"Jump Forward {a.cfg.seekStep:g}s", k(kaJumpForward), enabled = loaded,
     action = proc () = a.seekRelative(a.cfg.seekStep))
-  nav.item(&"Jump Back {a.cfg.seekStep:g}s", "Left", enabled = loaded,
+  nav.item(&"Jump Back {a.cfg.seekStep:g}s", k(kaJumpBack), enabled = loaded,
     action = proc () = a.seekRelative(-a.cfg.seekStep))
-  nav.item("Go To Beginning", "Home", enabled = loaded, action = proc () = a.seekTo(0))
+  nav.item("Go To Beginning", k(kaGoBeginning), enabled = loaded, action = proc () = a.seekTo(0))
   nav.sep()
   let hasCh = p.chapters.len > 0
   let canStep = hasCh or (a.cfg.bookmarksAsChapters and a.fileBookmarks.len > 0)
@@ -1834,11 +1835,11 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   for i, c in p.chapters:
     let label = fmtTime(c.time) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
     chm.item(label, action = bindAct(proc (t: float) = a.seekTo(t), c.time))
-  nav.item("Next Chapter", "Ctrl+Right", enabled = canStep, action = proc () = a.chapterStep(1))
-  nav.item("Previous Chapter", "Ctrl+Left", enabled = canStep, action = proc () = a.chapterStep(-1))
+  nav.item("Next Chapter", k(kaNextChapter), enabled = canStep, action = proc () = a.chapterStep(1))
+  nav.item("Previous Chapter", k(kaPrevChapter), enabled = canStep, action = proc () = a.chapterStep(-1))
   nav.sep()
-  nav.item("Next File", "Page Down", enabled = loaded and not locked, action = proc () = a.navigate(1))
-  nav.item("Previous File", "Page Up", enabled = loaded and not locked, action = proc () = a.navigate(-1))
+  nav.item("Next File", k(kaNextFile), enabled = loaded and not locked, action = proc () = a.navigate(1))
+  nav.item("Previous File", k(kaPrevFile), enabled = loaded and not locked, action = proc () = a.navigate(-1))
 
   # Synchronize: the other players found, checked when in our group.
   let syn = root.sub("Synchronize")
@@ -1872,7 +1873,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Help
   let help = root.sub("Help")
-  help.item("Keyboard Shortcuts", "F1", action = proc () = a.showOverlay(ovShortcuts))
+  help.item("Keyboard Shortcuts", k(kaShortcuts), action = proc () = a.showOverlay(ovShortcuts))
   help.item("About " & AppName, action = proc () = a.showOverlay(ovAbout))
 
   # Right-click menu, built from the bar's nodes.
@@ -1963,7 +1964,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       pl.item("Add Media File...", enabled = edit, action = proc () =
         a.ask(dkOpenFiles, "pladd", "Add Media File", exts = @MediaExtensions,
           filterName = "Media files"))
-    pl.item("Remove Media File", "Delete", enabled = hasSel and edit, action = proc () =
+    pl.item("Remove Media File", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.sep()
     let sortBy = proc (by: PlaylistSort) = a.sortPlaylist(by)
@@ -2248,18 +2249,87 @@ proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32],
       let p = kv.split('=')
       h.setProp(p[0], p[1])
 
-proc digitPressed(pressed: ButtonView): int =
-  ## Top-row digit pressed this frame (0-9), or -1.
-  const keys = [Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9]
-  for i, k in keys:
-    if pressed[k]: return i
-  -1
+const PanMenuLabels: array[kaCenter .. kaPanReset, string] = [
+  "Center", "Move Up", "Move Down", "Move Left", "Move Right", "0 Degrees",
+  "Rotate Clockwise", "Rotate Counter-clockwise", "Restore Size", "Increase Size",
+  "Decrease Size", "Increase Width", "Decrease Width", "Increase Height",
+  "Decrease Height", "Reset"]
+
+proc runAction(a: App, act: KeyAction) =
+  ## Carries out a rebindable command (Options > Player > Keys). View toggles
+  ## and Pan/Rotate/Scale go through the menu actions so the window-resizing
+  ## side effects live in one place.
+  case act
+  of kaOpenFile: a.openFileDialog()
+  of kaLoadSubtitle:
+    if a.player.loaded:
+      a.ask(dkOpenFile, "subtitle", "Load Subtitle", exts = @SubtitleExtensions,
+        filterName = "Subtitles")
+  of kaLoadAudio:
+    if a.player.loaded:
+      a.ask(dkOpenFile, "audio", "Load Audio Track", exts = @MediaExtensions,
+        filterName = "Audio files")
+  of kaOpenClipboard: a.openFromClipboard()
+  of kaCopyClipboard: a.copyToClipboard()
+  of kaClose: a.closeFile()
+  of kaScreenshot: a.screenshot()
+  of kaProperties: a.showOverlay(ovProperties)
+  of kaExit: a.window.closeRequested = true
+  of kaPlayPause: a.playPause()
+  of kaStop: a.runMenuPath(@["Play", "Stop"])
+  of kaFrameForward: a.frameStep(true)
+  of kaFrameBack: a.frameStep(false)
+  of kaFaster: a.changeRate(1)
+  of kaSlower: a.changeRate(-1)
+  of kaRepeatForever: a.runMenuPath(@["Play", "Repeat", "Forever"])
+  of kaVolumeUp: a.volumeStep(true)
+  of kaVolumeDown: a.volumeStep(false)
+  of kaMute: a.setMute(not a.player.muted)
+  of kaNextAudio: a.cycleTrack("aid", true)
+  of kaPrevAudio: a.cycleTrack("aid", false)
+  of kaNextSub: a.cycleTrack("sid", true)
+  of kaPrevSub: a.cycleTrack("sid", false)
+  of kaJumpForward: a.seekRelative(a.cfg.seekStep)
+  of kaJumpBack: a.seekRelative(-a.cfg.seekStep)
+  of kaGoBeginning: a.seekTo(0)
+  of kaSeek10 .. kaSeek90:
+    if a.player.loaded:
+      let k = act.ord - kaSeek10.ord + 1
+      a.player.stopped = false
+      a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
+      a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
+  of kaNextChapter: a.chapterStep(1)
+  of kaPrevChapter: a.chapterStep(-1)
+  of kaNextFile: a.navigate(1)
+  of kaPrevFile: a.navigate(-1)
+  of kaAddBookmark: a.addBookmark(a.player.timePos)
+  of kaRemoveFromPlaylist:
+    if a.cfg.showPlaylist: a.removeSelected()
+  of kaSubTopLeft .. kaSubBottomRight:
+    # The numpad as a 3x3 grid.
+    let i = act.ord - kaSubTopLeft.ord
+    a.alignSubs(i mod 3, i div 3)
+  of kaSubUp: a.moveSubs(vec2(0, -SubMoveStep))
+  of kaSubDown: a.moveSubs(vec2(0, SubMoveStep))
+  of kaSubMoveLeft: a.moveSubs(vec2(-SubMoveStep, 0))
+  of kaSubMoveRight: a.moveSubs(vec2(SubMoveStep, 0))
+  of kaSubBigger: a.scaleSubs(1)
+  of kaSubSmaller: a.scaleSubs(-1)
+  of kaSeekBar: a.runMenuPath(@["View", "Seek Bar"])
+  of kaControls: a.runMenuPath(@["View", "Controls"])
+  of kaStatus: a.runMenuPath(@["View", "Status"])
+  of kaPlaylist: a.runMenuPath(@["View", "Playlist"])
+  of kaRunLog: a.runMenuPath(@["View", "Run Log"])
+  of kaShowOsd: a.runMenuPath(@["View", "Show OSD"])
+  of kaFullScreen: a.setFullscreen(not a.fullscreen)
+  of kaOptions: a.showOverlay(ovOptions)
+  of kaShortcuts: a.showOverlay(ovShortcuts)
+  of kaCenter .. kaPanReset:
+    a.runMenuPath(@["View", "Pan, Rotate & Scale", PanMenuLabels[act]])
 
 proc handleKeys(a: App) =
   let w = a.window
   let pressed = w.buttonPressed
-  let (c, s, al) = (w.ctrl, w.shift, w.alt)
-  let none = not c and not s and not al
 
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
@@ -2282,89 +2352,8 @@ proc handleKeys(a: App) =
     elif pressed[KeyEnd]: a.propScroll = float32.high
   if a.overlay != ovNone: return
 
-  # Alt+Enter must be checked before anything grabs Enter.
-  if al and (pressed[KeyEnter] or pressed[NumpadEnter]):
-    a.setFullscreen(not a.fullscreen)
-    return
-
-  if c and s and pressed[KeyO]:
-    if a.player.loaded:
-      a.ask(dkOpenFile, "subtitle", "Load Subtitle", exts = @SubtitleExtensions,
-        filterName = "Subtitles")
-  elif c and pressed[KeyO]: a.openFileDialog()
-  elif c and pressed[KeyX]: a.closeFile()
-  elif c and pressed[KeyC]: a.copyToClipboard()
-  elif c and pressed[KeyV]: a.openFromClipboard()
-  elif al and pressed[KeyI]: a.screenshot()
-  elif al and pressed[KeyX]: w.closeRequested = true
-  elif none and pressed[KeyO]: a.showOverlay(ovOptions)
-  elif none and pressed[KeyF1]: a.showOverlay(ovShortcuts)
-  elif none and pressed[KeySpace]: a.playPause()
-  elif c and pressed[KeyM]: a.setMute(not a.player.muted)
-  elif none and pressed[KeyUp]: a.volumeStep(true)
-  elif none and pressed[KeyDown]: a.volumeStep(false)
-  elif none and pressed[KeyLeft]: a.seekRelative(-a.cfg.seekStep)
-  elif none and pressed[KeyRight]: a.seekRelative(a.cfg.seekStep)
-  elif c and pressed[KeyLeft]: a.chapterStep(-1)
-  elif c and pressed[KeyRight]: a.chapterStep(1)
-  elif none and pressed[KeyHome]: a.seekTo(0)
-  elif none and pressed[KeyPageUp]: a.navigate(-1)
-  elif none and pressed[KeyPageDown]: a.navigate(1)
-  elif s and pressed[KeyPeriod]: a.changeRate(1)
-  elif s and pressed[KeyComma]: a.changeRate(-1)
-  elif none and pressed[KeyPeriod]: a.frameStep(true)
-  elif none and pressed[KeyComma]: a.frameStep(false)
-  elif pressed[KeyA] and not c and not al: a.cycleTrack("aid", not s)
-  elif pressed[KeyS] and not c and not al: a.cycleTrack("sid", not s)
-  elif none and a.player.loaded and (let k = digitPressed(pressed); k >= 0):
-    a.player.stopped = false
-    a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
-    a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
-  elif none and pressed[KeyInsert]: a.addBookmark(a.player.timePos)
-  elif none and pressed[KeyDelete] and a.cfg.showPlaylist:
-    a.removeSelected()
-
-  # View toggles and Grab/Rotate/Scale go through the menu actions so the
-  # window-resizing side effects live in one place.
-  var menuPath: seq[string]
-  if c and not s and not al:
-    if pressed[Key1]: menuPath = @["View", "Seek Bar"]
-    elif pressed[Key2]: menuPath = @["View", "Controls"]
-    elif pressed[Key3]: menuPath = @["View", "Status"]
-    elif pressed[Key4]: menuPath = @["View", "Playlist"]
-    elif pressed[Key5]: menuPath = @["View", "Run Log"]
-  let g = "Grab, Rotate & Scale"
-  if none:
-    if pressed[Numpad5]: menuPath = @["View", g, "Center"]
-    elif pressed[Numpad8]: menuPath = @["View", g, "Move Up"]
-    elif pressed[Numpad2]: menuPath = @["View", g, "Move Down"]
-    elif pressed[Numpad4]: menuPath = @["View", g, "Move Left"]
-    elif pressed[Numpad6]: menuPath = @["View", g, "Move Right"]
-  elif al and not c:
-    if pressed[Numpad5]: menuPath = @["View", g, "0 Degrees"]
-    elif pressed[Numpad6]: menuPath = @["View", g, "Rotate Clockwise"]
-    elif pressed[Numpad4]: menuPath = @["View", g, "Rotate Counter-clockwise"]
-  elif c and not al:
-    if pressed[Numpad5]: menuPath = @["View", g, "Restore Size"]
-    elif pressed[Numpad9]: menuPath = @["View", g, "Increase Size"]
-    elif pressed[Numpad3]: menuPath = @["View", g, "Decrease Size"]
-    elif pressed[Numpad6]: menuPath = @["View", g, "Increase Width"]
-    elif pressed[Numpad4]: menuPath = @["View", g, "Decrease Width"]
-    elif pressed[Numpad8]: menuPath = @["View", g, "Increase Height"]
-    elif pressed[Numpad2]: menuPath = @["View", g, "Decrease Height"]
-  if menuPath.len > 0: a.runMenuPath(menuPath)
-
-  # Shift: subtitle alignment (numpad as a 3x3 grid), nudging and size.
-  if s and not c and not al:
-    const grid = [Numpad7, Numpad8, Numpad9, Numpad4, Numpad5, Numpad6, Numpad1, Numpad2, Numpad3]
-    for i, k in grid:
-      if pressed[k]: a.alignSubs(i mod 3, i div 3)
-    if pressed[KeyUp]: a.moveSubs(vec2(0, -SubMoveStep))
-    elif pressed[KeyDown]: a.moveSubs(vec2(0, SubMoveStep))
-    elif pressed[KeyLeft]: a.moveSubs(vec2(-SubMoveStep, 0))
-    elif pressed[KeyRight]: a.moveSubs(vec2(SubMoveStep, 0))
-    if pressed[NumpadAdd]: a.scaleSubs(1)
-    elif pressed[NumpadSubtract]: a.scaleSubs(-1)
+  let (ok, act) = a.cfg.pressedAction(w)
+  if ok: a.runAction(act)
 
 # --- video geometry ---------------------------------------------------------
 
@@ -2807,49 +2796,61 @@ proc controls(a: App, r: Rect) =
 type KeyHint = tuple[key, label: string]
 
 proc modifierHints(a: App): seq[seq[KeyHint]] =
-  ## Shortcuts reachable with the modifiers currently held, in groups.
+  ## Shortcuts reachable with the modifiers currently held, in groups: the
+  ## keys set in Options > Player > Keys, one group per command group, then
+  ## the mouse gestures.
   let w = a.window
   var (c, s, al) = (w.ctrl, w.shift, w.alt)
   if a.fakeMods.len > 0:
     (c, s, al) = ("ctrl" in a.fakeMods, "shift" in a.fakeMods, "alt" in a.fakeMods)
+  var mods: set[KeyMod]
+  if c: mods.incl kmCtrl
+  if s: mods.incl kmShift
+  if al: mods.incl kmAlt
+  if mods == {}: return
   let rot = &"{a.cfg.rotateStep:g}°"
-  # View toggles and grab/rotate/scale only show with "Show all shortcuts".
+  # View toggles and pan/rotate/scale only show with "Show all shortcuts".
   let all = a.cfg.showAllShortcuts
-  if c and s and not al:
-    result = @[@[("O", "Load Subtitle")]]
-  elif c and not s and not al:
-    result = @[@[("←", "Previous Chapter"), ("→", "Next Chapter")],
-      @[("M", "Mute"), ("Wheel", "Zoom At Cursor")],
-      @[("O", "Open File"), ("V", "Open From Clipboard"), ("C", "Copy to Clipboard"),
-        ("X", "Close")]]
+  let viewToggles = {kaSeekBar, kaControls, kaStatus, kaPlaylist, kaRunLog, kaShowOsd}
+  for g in KeyGroup:
+    if g == kgPan and not all: continue
+    var hints: seq[KeyHint]
+    var done: set[KeyAction]
+    # Clusters still on their default keys share one hint.
+    for (acts, key, label) in [(@SubAlignActions, "Num1-9", "Align Subtitles"),
+                               (@SubMoveActions, "Arrows", "Move Subtitles")]:
+      if Actions[acts[0]].group == g and acts.allIt(a.cfg.isDefault(it)) and
+         a.cfg.combos(acts[0]).len > 0 and a.cfg.combos(acts[0])[0].mods == mods:
+        hints.add (key, label)
+        for x in acts: done.incl x
+    for act in KeyAction:
+      if Actions[act].group != g or act in done: continue
+      if act in viewToggles and not all: continue
+      let ks = a.cfg.combos(act).filterIt(it.mods == mods)
+      if ks.len == 0: continue
+      let label =
+        case act
+        of kaRotateCw: "Rotate " & rot & " CW"
+        of kaRotateCcw: "Rotate " & rot & " CCW"
+        else: Actions[act].hint
+      hints.add (ks.mapIt(shortKeyName(it.key)).join("/"), label)
+    if hints.len > 0: result.add hints
+  var mouse: seq[KeyHint]
+  if mods == {kmCtrl}:
     if a.player.isSpherical:
       # 360° view: the wheel changes the field of view; Ctrl swaps what a drag does.
-      result[1][1] = ("Wheel", "Field Of View")
-      result[1].add ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")
-    if all:
-      result.add @[@[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist"),
-        ("5", "Run Log")],
-        @[("Num5", "Reset Size"), ("Num9", "+Size"), ("Num3", "-Size"),
-          ("Num6", "+Width"), ("Num4", "-Width"), ("Num8", "+Height"), ("Num2", "-Height")]]
-  elif al and not c and not s:
-    result = @[@[("Enter", "Fullscreen")], @[("I", "Screenshot")], @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]]
-    if all:
-      result.add @[("Num4", "Rotate " & rot & " CCW"), ("Num5", "Reset Rotation"),
-        ("Num6", "Rotate " & rot & " CW")]
-    result.add @[("X", "Exit")]
-  elif al and s and not c:
-    result = @[@[("MDrag", "Rotate In " & rot & " Steps")]]
-  elif c and al and not s:
-    result = @[@[("MDrag", "Rotate Around Cursor")]]
-  elif c and al and s:
-    result = @[@[("MDrag", "Rotate Around Cursor In " & rot & " Steps")]]
-  elif s and not c and not al:
-    result = @[@[(",", "Slower Playback"), (".", "Faster Playback")],
-      @[("A", "Previous Audio Track"), ("S", "Previous Subtitle Track")],
-      @[("Num1-9", "Align Subtitles"), ("Arrows", "Move Subtitles"),
-        ("Num+", "Bigger Subtitles"), ("Num-", "Smaller Subtitles")],
-      @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping"),
-        ("MDrag", "Pan Zoomed Video")]]
+      mouse = @[("Wheel", "Field Of View"),
+        ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
+    else: mouse = @[("Wheel", "Zoom At Cursor")]
+  elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
+  elif mods == {kmAlt, kmShift}: mouse = @[("MDrag", "Rotate In " & rot & " Steps")]
+  elif mods == {kmCtrl, kmAlt}: mouse = @[("MDrag", "Rotate Around Cursor")]
+  elif mods == {kmCtrl, kmAlt, kmShift}:
+    mouse = @[("MDrag", "Rotate Around Cursor In " & rot & " Steps")]
+  elif mods == {kmShift}:
+    mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping"),
+      ("MDrag", "Pan Zoomed Video")]
+  if mouse.len > 0: result.add mouse
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
@@ -3560,42 +3561,75 @@ proc propertiesOverlay(a: App) =
 
 type ShortcutGroup = tuple[title: string, rows: seq[(string, string)]]
 
-const shortcutColumns: array[2, seq[ShortcutGroup]] = [
-  @[
-    ("File", @[
-      ("Open file", "Ctrl+O"), ("Load subtitle file", "Ctrl+Shift+O"),
-      ("Open from clipboard", "Ctrl+V"), ("Copy to clipboard", "Ctrl+C"), ("Close", "Ctrl+X"),
-      ("Save screenshot", "Alt+I"), ("Exit", "Alt+X")]),
-    ("Playback", @[
-      ("Play / Pause", "Space"), ("Frame forward / back", ". / ,"),
-      ("Faster / slower playback", "Shift+. / Shift+,"),
-      ("Volume up / down", "Up / Down"), ("Mute", "Ctrl+M"),
-      ("Next / previous audio track", "A / Shift+A"),
-      ("Next / previous subtitle track", "S / Shift+S")]),
-    ("Navigate", @[
-      ("Jump forward / back", "Right / Left"), ("Go to beginning", "Home"),
-      ("Jump to 0% ... 90%", "0 ... 9"), ("Next / previous chapter", "Ctrl+Right / Ctrl+Left"),
-      ("Next / previous file", "Page Down / Page Up"), ("Add bookmark", "Insert"),
-      ("Remove selected playlist item", "Delete")]),
-    ("Subtitles", @[
-      ("Align (numpad as a 3x3 grid)", "Shift+Numpad 1 ... 9"),
-      ("Move", "Shift+Arrows"), ("Bigger / smaller", "Shift+Numpad + / -")]),
+proc keysText(a: App, acts: openArray[KeyAction], whenDefault = ""): string =
+  ## Keys of the commands on one row, "Up / Down"; whenDefault replaces them
+  ## while they're all on their default keys ("0 ... 9"). Commands without a
+  ## key are left out.
+  if whenDefault.len > 0 and acts.allIt(a.cfg.isDefault(it)): return whenDefault
+  acts.mapIt(a.cfg.keysText(it)).filterIt(it.len > 0).join(" / ")
+
+proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
+  ## The F1 window's rows, with the keys set in Options > Player > Keys.
+  ## Rows whose commands have no key are left out.
+  proc keyRows(a: App, title: string,
+               rows: openArray[(string, seq[KeyAction], string)]): ShortcutGroup =
+    result.title = title
+    for (label, acts, whenDefault) in rows:
+      let keys = a.keysText(acts, whenDefault)
+      if keys.len > 0: result.rows.add (label, keys)
+  result[0] = @[
+    a.keyRows("File", [
+      ("Open file", @[kaOpenFile], ""), ("Load subtitle file", @[kaLoadSubtitle], ""),
+      ("Load audio file", @[kaLoadAudio], ""),
+      ("Open from clipboard", @[kaOpenClipboard], ""),
+      ("Copy to clipboard", @[kaCopyClipboard], ""), ("Close", @[kaClose], ""),
+      ("Save screenshot", @[kaScreenshot], ""), ("Properties", @[kaProperties], ""),
+      ("Exit", @[kaExit], "")]),
+    a.keyRows("Playback", [
+      ("Play / Pause", @[kaPlayPause], ""), ("Stop", @[kaStop], ""),
+      ("Frame forward / back", @[kaFrameForward, kaFrameBack], ""),
+      ("Faster / slower playback", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
+      ("Repeat forever", @[kaRepeatForever], ""),
+      ("Volume up / down", @[kaVolumeUp, kaVolumeDown], ""), ("Mute", @[kaMute], ""),
+      ("Next / previous audio track", @[kaNextAudio, kaPrevAudio], ""),
+      ("Next / previous subtitle track", @[kaNextSub, kaPrevSub], "")]),
+    a.keyRows("Navigate", [
+      ("Jump forward / back", @[kaJumpForward, kaJumpBack], ""),
+      ("Go to beginning", @[kaGoBeginning], ""),
+      ("Jump to 10% ... 90%", @SeekActions, "1 ... 9"),
+      ("Next / previous chapter", @[kaNextChapter, kaPrevChapter], ""),
+      ("Next / previous file", @[kaNextFile, kaPrevFile], ""),
+      ("Add bookmark", @[kaAddBookmark], ""),
+      ("Remove selected playlist item", @[kaRemoveFromPlaylist], "")]),
+    a.keyRows("Subtitles", [
+      ("Align (numpad as a 3x3 grid)",
+        @[kaSubBottomLeft, kaSubBottom, kaSubBottomRight, kaSubLeft, kaSubCenter, kaSubRight,
+          kaSubTopLeft, kaSubTop, kaSubTopRight], "Shift+Numpad 1 ... 9"),
+      ("Move", @SubMoveActions, "Shift+Arrows"),
+      ("Bigger / smaller", @[kaSubBigger, kaSubSmaller], "Shift+Numpad + / -")]),
     ("Text fields", @[
       ("Next / previous word", "Ctrl+Right / Ctrl+Left"),
-      ("Select next / previous word", "Ctrl+Shift+Right / Left")])],
-  @[
-    ("View", @[
-      ("Seek bar", "Ctrl+1"), ("Controls", "Ctrl+2"), ("Status", "Ctrl+3"),
-      ("Playlist", "Ctrl+4"), ("Run log", "Ctrl+5"), ("Full screen", "Alt+Enter"),
-      ("Leave full screen / close dialog", "Esc"), ("Options", "O"),
-      ("Keyboard shortcuts", "F1")]),
-    ("Grab, Rotate & Scale", @[
-      ("Center", "Numpad 5"), ("Move up / down", "Numpad 8 / 2"),
-      ("Move left / right", "Numpad 4 / 6"), ("0 degrees", "Alt+Numpad 5"),
-      ("Rotate clockwise / counter-clockwise", "Alt+Numpad 6 / 4"),
-      ("Restore size", "Ctrl+Numpad 5"), ("Increase / decrease size", "Ctrl+Numpad 9 / 3"),
-      ("Increase / decrease width", "Ctrl+Numpad 6 / 4"),
-      ("Increase / decrease height", "Ctrl+Numpad 8 / 2")]),
+      ("Select next / previous word", "Ctrl+Shift+Right / Left")])]
+  var view = a.keyRows("View", [
+    ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
+    ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
+    ("Run log", @[kaRunLog], ""), ("Show OSD", @[kaShowOsd], ""),
+    ("Full screen", @[kaFullScreen], "")])
+  view.rows.add ("Leave full screen / close dialog", "Esc")
+  view.rows.add a.keyRows("", [("Options", @[kaOptions], ""),
+    ("Keyboard shortcuts", @[kaShortcuts], "")]).rows
+  result[1] = @[
+    view,
+    a.keyRows("Pan, Rotate & Scale", [
+      ("Center", @[kaCenter], ""), ("Move up / down", @[kaMoveUp, kaMoveDown], "Numpad 8 / 2"),
+      ("Move left / right", @[kaMoveLeft, kaMoveRight], "Numpad 4 / 6"),
+      ("0 degrees", @[kaRotate0], ""),
+      ("Rotate clockwise / counter-clockwise", @[kaRotateCw, kaRotateCcw], "Alt+Numpad 6 / 4"),
+      ("Restore size", @[kaRestoreSize], ""),
+      ("Increase / decrease size", @[kaSizeUp, kaSizeDown], "Ctrl+Numpad 9 / 3"),
+      ("Increase / decrease width", @[kaWidthUp, kaWidthDown], "Ctrl+Numpad 6 / 4"),
+      ("Increase / decrease height", @[kaHeightUp, kaHeightDown], "Ctrl+Numpad 8 / 2"),
+      ("Reset", @[kaPanReset], "")]),
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
@@ -3610,7 +3644,9 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("360° video: reset view", "Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
-      ("Select word / all in a text field", "Double / Triple-click")])]]
+      ("Select word / all in a text field", "Double / Triple-click")])]
+  for col in result.mitems:
+    col.keepItIf(it.rows.len > 0)
 
 proc shortcutsOverlay(a: App) =
   let ui = a.ui
@@ -3620,14 +3656,15 @@ proc shortcutsOverlay(a: App) =
     ColW = 420'f32
     ColGap = 32'f32
     Pad = 24'f32
+  let columns = a.shortcutColumns
   var colH = 0'f32
-  for col in shortcutColumns:
+  for col in columns:
     var h = 0'f32
     for g in col: h += HeadH + g.rows.len.float32 * RowH
     colH = max(colH, h)
   let r = a.overlayFrame("Keyboard Shortcuts",
     vec2(Pad * 2 + ColW * 2 + ColGap, 60 + colH + Pad - 8))
-  for ci, col in shortcutColumns:
+  for ci, col in columns:
     let x = r.x + Pad + ci.float32 * (ColW + ColGap)
     var y = r.y + 58
     for g in col:
@@ -3884,6 +3921,19 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.ensureOptionsWindow()
     for p in OptionsPage:
       if ($p).toLowerAscii.startsWith(arg.toLowerAscii): a.optionsDlg.selectPage(a.optUi, p)
+  of "optkey":  # id [combo]: Options > Keys; gives the command combo ("none" clears), else asks for a key
+    for act in KeyAction:
+      if $act == st.args[0]:
+        if st.args.len > 1:
+          let k = if st.args[1] == "none": KeyCombo() else: parseCombo(st.args[1 .. ^1].join(" "))
+          a.optionsDlg.assignKeys(a.cfg, act, if k.key == ButtonUnknown: @[] else: @[k])
+        else: a.optionsDlg.startCapture(a.optUi, act)
+  of "key":  # combo: runs the command bound to it, as pressing it would
+    let k = parseCombo(arg)
+    for act in KeyAction:
+      if k in a.cfg.combos(act):
+        a.runAction(act)
+        break
   of "focus": a.keyUi.focusId = arg
   of "type": a.keyUi.typedPending.add arg
   of "overlay":
