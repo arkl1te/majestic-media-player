@@ -2,7 +2,7 @@
 ## second instance that renders seek-bar thumbnails.
 
 import std/[algorithm, atomics, json, strutils, os, times]
-import mpv, videogl
+import mpv, videogl, spherical
 
 type
   Track* = object
@@ -39,6 +39,7 @@ type
     videoW*, videoH*: int     ## display size (aspect-corrected)
     audioChannels*: int
     loadError*: string
+    sphere*: SphereInfo       ## 360° metadata of the open file
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
 
@@ -173,6 +174,9 @@ proc pollEvents*(p: Player): bool =
       if id in Prop.low.int .. Prop.high.int:
         p.handleProp(Prop(id), cast[ptr MpvEventProperty](ev.data))
     of evFileLoaded:
+      # Read here rather than in load: the previous file may still show a
+      # frame or two until mpv switches over.
+      p.sphere = detectSphere(p.path)
       p.loaded = true
       p.justLoaded = true
       p.loadError = ""
@@ -210,6 +214,7 @@ proc close*(p: Player) =
   p.path = ""
   p.loaded = false
   p.stopped = false
+  p.sphere = SphereInfo()
   p.tracks.setLen 0
   p.chapters.setLen 0
   p.videoW = 0
@@ -225,6 +230,10 @@ proc hasRealVideo*(p: Player): bool =
   if not p.hasVideo: return false
   for t in p.tracks:
     if t.kind == "video" and t.selected and not t.albumArt: return true
+
+proc isSpherical*(p: Player): bool =
+  ## Shown as a 360° view: equirectangular metadata on a real video track.
+  p.sphere.is360 and p.hasRealVideo
 
 proc playing*(p: Player): bool = p.loaded and not p.paused and not p.stopped
 

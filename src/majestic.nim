@@ -4,7 +4,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables, streams]
 import silky, vmath, bumpy, chroma, pixie, opengl
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -23,6 +23,9 @@ const
   RunLogGripH = 5'f32       ## draggable bottom edge of the run log
   RunLogBarW = 10'f32       ## its scroll bar
   RunLogWheelRows = 4       ## lines scrolled per mouse wheel step
+  SphereFov = 75'f32        ## 360° video: vertical field of view a file opens with
+  SphereFovStep = 5'f32     ## degrees per Ctrl+Wheel notch
+  SphereTextureMax = 8192   ## cap on the equirectangular texture's longer side
 
 type
   Overlay = enum
@@ -139,6 +142,13 @@ type
     rotRef: float32           ## cursor angle around the pivot the turn counts from
     rotRefSet: bool
     rotPressPos: Vec2         ## window pixels where the press began
+    # 360° video camera, degrees
+    lookYaw, lookPitch: float32
+    lookFov: float32 = SphereFov
+    lookDragging: bool        ## a left drag is turning the camera
+    lookLast: Vec2            ## pointer position the drag last turned from
+    osdMsg: string            ## OSD message drawn by us over a 360° view
+    osdUntil: float
     rotMoved: bool            ## past the click threshold; a click resets rotation
     lastMouse: Vec2
     lastMouseMove: float
@@ -194,7 +204,15 @@ proc shift(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRigh
 proc alt(w: Window): bool = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]
 
 proc osd(a: App, msg: string) =
-  a.player.osd(msg)
+  # mpv draws the OSD into the picture, which a 360° view would warp onto
+  # the sphere (out of sight): show the message over the frame instead.
+  if a.player.isSpherical:
+    if a.cfg.showOsd:
+      a.osdMsg = msg
+      a.osdUntil = now() + 1.5
+      a.dirtyUntil = max(a.dirtyUntil, a.osdUntil + 0.1)
+  else:
+    a.player.osd(msg)
 
 proc fileTitle(path: string): string = path.extractFilename
 
@@ -1836,6 +1854,12 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
+  if p.isSpherical:
+    ctx.check("Ctrl+Drag to Look",
+      checked = a.cfg.sphereDragMovesWindow, action = proc () =
+        a.cfg.sphereDragMovesWindow = not a.cfg.sphereDragMovesWindow
+        a.cfg.save())
+    ctx.sep()
   ctx.children.add file
   ctx.sep()
   ctx.children.add [playPause.relabeled("Play/Pause"), stop, rep]
@@ -2334,13 +2358,51 @@ proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
 proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
   ## Ctrl+Wheel: zooms by the Resize step per notch (up = in), keeping the
   ## point under the cursor in place. `area` and `at` are window pixels.
+  ## Zooming out stops once the (rotated) frame touches the window from
+  ## inside, and the pan shrinks so the frame ends up centered there.
   let step = 1 + a.cfg.sizeStep.float32 / 100
-  let z = clamp(a.xf.zoom * pow(step, -notches), 0.05, 50)
-  let k = z / a.xf.zoom
+  var z = clamp(a.xf.zoom * pow(step, -notches), 0.05, 50)
   let c = area.xy + area.wh / 2
-  a.xf.pan = at + (c + a.xf.pan - at) * k - c
+  if notches > 0:
+    let size = a.videoGeometry(area).size
+    let rad = a.xf.rotation * PI.float32 / 180
+    let bw = abs(size.x * cos(rad)) + abs(size.y * sin(rad))
+    let bh = abs(size.x * sin(rad)) + abs(size.y * cos(rad))
+    if bw < 1 or bh < 1: return
+    # Zoom at which the frame touches the window; a frame already smaller
+    # (Half size, Decrease Size) just stays as it is.
+    let touch = a.xf.zoom * min(area.w / bw, area.h / bh)
+    let floorZ = min(a.xf.zoom, touch)
+    if z <= floorZ:
+      z = floorZ
+      if a.xf.zoom == z and a.xf.pan == vec2(0, 0): return
+    # Pull the pan toward the center in step with the zoom so the frame
+    # lands centered exactly when it reaches the touching size.
+    let t = if a.xf.zoom > floorZ: (z - floorZ) / (a.xf.zoom - floorZ) else: 0'f32
+    let k = z / a.xf.zoom
+    a.xf.pan = (at + (c + a.xf.pan - at) * k - c) * t
+  else:
+    let k = z / a.xf.zoom
+    a.xf.pan = at + (c + a.xf.pan - at) * k - c
   a.xf.zoom = z
   a.xfChanged(&"Zoom: {int(round(z * 100))}%")
+
+proc resetLook(a: App) =
+  a.lookYaw = 0; a.lookPitch = 0; a.lookFov = SphereFov
+
+proc lookDrag(a: App, at: Vec2) =
+  ## Left drag on a 360° view: the picture follows the pointer, as if
+  ## grabbed. `at` is in UI units, like the frame area.
+  let k = a.lookFov / max(1'f32, a.videoRect.h)
+  let d = at - a.lookLast
+  a.lookLast = at
+  a.lookYaw = floorMod(a.lookYaw - d.x * k, 360)
+  a.lookPitch = clamp(a.lookPitch + d.y * k, -90, 90)
+
+proc changeFov(a: App, notches: float32) =
+  ## Ctrl+Wheel on a 360° view: up narrows the view (zooms in).
+  a.lookFov = clamp(a.lookFov + notches * SphereFovStep, 20, 120)
+  a.osd(&"Field of view: {int(round(a.lookFov))}°")
 
 proc beginRotate(a: App, area: Rect, at: Vec2, atCursor: bool) =
   ## Alt+Middle press: the frame turns around its center, or around the
@@ -2388,6 +2450,32 @@ proc pollVideoFrame(a: App) =
   a.renderNow = a.framePending and
     (a.frameDue == 0 or mpv_get_time_ns(a.player.h) >= a.frameDue - 1_500_000)
 
+proc drawSphere(a: App, area: Rect, fb: IVec2, flags: uint64) =
+  ## 360° video: mpv renders the whole equirectangular picture at its own
+  ## size, then the camera's view of it fills the frame area.
+  let p = a.player
+  let cap = min(1'f32, SphereTextureMax / max(p.videoW, p.videoH).float32)
+  let size = (max(1, int(round(p.videoW.float32 * cap))), max(1, int(round(p.videoH.float32 * cap))))
+  let (_, _, (tw, th)) = a.applySubLayout(vec2(size[0].float32, size[1].float32),
+    (l: 0'f32, r: 0'f32, t: 0'f32, b: 0'f32), size)
+  let resized = tw != p.target.w or th != p.target.h
+  p.target.ensureSize(tw, th)
+  let fresh = resized or (flags and MpvRenderUpdateFrame) != 0
+  if fresh: p.render.render(p.target)
+  let s = p.sphere
+  var v = SphereView(yaw: a.lookYaw, pitch: a.lookPitch, fov: a.lookFov,
+    poseYaw: s.yaw, posePitch: s.pitch, poseRoll: s.roll,
+    bounds: [s.left, s.right, s.top, s.bottom], eye: [0'f32, 0, 1, 1])
+  # Stereo pictures hold both eyes: show the first.
+  case s.stereo
+  of slTopBottom: v.eye = [0'f32, 0, 1, 0.5]
+  of slSideBySide: v.eye = [0'f32, 0, 0.5, 1]
+  of slMono: discard
+  glEnable(GL_SCISSOR_TEST)
+  glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
+  a.quad.drawSphere(p.target.tex, area, fb.vec2, v, fresh)
+  glDisable(GL_SCISSOR_TEST)
+
 proc drawVideo(a: App, area: Rect, fb: IVec2) =
   ## GL pass beneath the UI: black frame area and the transformed video.
   let flags = if a.renderNow: MpvRenderUpdateFrame else: 0'u64
@@ -2404,6 +2492,9 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
     if (flags and MpvRenderUpdateFrame) != 0:
       a.player.target.ensureSize(16, 16)
       a.player.render.render(a.player.target)
+    return
+  if a.player.isSpherical:
+    a.drawSphere(area, fb, flags)
     return
   let (center, size) = a.videoGeometry(area)
   if size.x < 1 or size.y < 1: return
@@ -2669,6 +2760,10 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       @[("M", "Mute"), ("Wheel", "Zoom At Cursor")],
       @[("O", "Open File"), ("V", "Open From Clipboard"), ("C", "Copy to Clipboard"),
         ("X", "Close")]]
+    if a.player.isSpherical:
+      # 360° view: the wheel changes the field of view; Ctrl swaps what a drag does.
+      result[1][1] = ("Wheel", "Field Of View")
+      result[1].add ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")
     if all:
       result.add @[@[("1", "Seek Bar"), ("2", "Controls"), ("3", "Status"), ("4", "Playlist"),
         ("5", "Run Log")],
@@ -3076,6 +3171,15 @@ proc idleScreen(a: App, area: Rect) =
     ui.icon("crown96", c - vec2(0, 24), colAccentDim)
     ui.textIn(AppName, rect(area.x, c.y + 34, area.w, 30), colTextDim, FontTitle, h = CenterAlign)
 
+proc sphereOsd(a: App, area: Rect) =
+  ## The OSD message of a 360° view (see osd), top left of the frame.
+  if not a.player.isSpherical or now() >= a.osdUntil or a.osdMsg.len == 0: return
+  let ui = a.ui
+  let sz = ui.textSize(a.osdMsg, FontTitle)
+  let r = rect(area.x + 16, area.y + 16, sz.x + 20, sz.y + 10)
+  ui.rect(r, rgbx(0, 0, 0, 170))
+  ui.text(a.osdMsg, r.xy + vec2(10, 5), colText, FontTitle)
+
 proc syncOutline(a: App, r: Rect) =
   ## Synchronized players are framed in their group's color: solid around the
   ## master, dashed around the others.
@@ -3419,6 +3523,9 @@ const shortcutColumns: array[2, seq[ShortcutGroup]] = [
       ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
       ("Reset rotation", "Alt+Middle-click video"),
       ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
+      ("360° video: look around / move window", "Drag / Ctrl+Drag video"),
+      ("360° video: field of view", "Ctrl+Wheel"),
+      ("360° video: reset view", "Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button")])]]
 
@@ -3509,6 +3616,7 @@ proc frame(a: App) =
   glClear(GL_COLOR_BUFFER_BIT)
   a.drawVideo(a.px(videoArea), fb)
   a.idleScreen(videoArea)
+  a.sphereOsd(videoArea)
 
   # Video-frame mouse handling: click = play/pause, drag = move window.
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
@@ -3524,10 +3632,13 @@ proc frame(a: App) =
       a.ctxMenu = cmVideo
       a.menus.openContext(ui.mouse)
     if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
-      if w.ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
+      if w.ctrl and a.player.isSpherical: a.changeFov(ui.wheelNotches)
+      elif w.ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
       else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
-    if ui.pressed(MouseMiddle) and w.alt:
+    if ui.pressed(MouseMiddle) and a.player.isSpherical:
+      a.resetLook(); a.osd("View reset")
+    elif ui.pressed(MouseMiddle) and w.alt:
       a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
     elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
       a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
@@ -3544,7 +3655,16 @@ proc frame(a: App) =
         a.togglePlay()
     elif (ui.mouse - a.videoPressPos).length > 4:
       a.videoPress = false
-      if not fs: w.startWindowDrag()
+      # 360° view: a drag looks around, Ctrl+drag moves the window (or the
+      # other way round, from the frame's context menu). Full screen only looks.
+      if a.player.isSpherical and (fs or w.ctrl == a.cfg.sphereDragMovesWindow):
+        a.lookDragging = true
+        a.lookLast = a.videoPressPos
+        a.lookDrag(ui.mouse)
+      elif not fs: w.startWindowDrag()
+  if a.lookDragging:
+    if not ui.down() or not a.player.isSpherical: a.lookDragging = false
+    else: a.lookDrag(ui.mouse)
 
   # Chrome
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
@@ -3703,6 +3823,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
       offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]))
   of "seek": a.seekTo(parseFloat(arg))
+  of "look":  # yaw pitch fov: the 360° camera, degrees
+    (a.lookYaw, a.lookPitch, a.lookFov) = (parseFloat(st.args[0]).float32,
+      parseFloat(st.args[1]).float32, parseFloat(st.args[2]).float32)
   of "pause": a.togglePlay()
   of "sync":  # all | none | add <pid> | remove <pid> | addany (first peer found)
     if arg == "addany":
@@ -3885,6 +4008,8 @@ proc main() =
 
     if a.player.justLoaded:
       a.player.justLoaded = false
+      a.resetLook()
+      a.lookDragging = false
       a.updateTitle()
       # The master moved to another file: the group follows to its start time.
       a.syncSend("seek", $a.resumedAt, "true")

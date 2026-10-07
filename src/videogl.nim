@@ -1,7 +1,7 @@
 ## OpenGL plumbing for video: mpv renders into an offscreen texture, which is
 ## then drawn as an arbitrarily transformed quad (pan/rotate/scale).
 
-import opengl, vmath
+import opengl, vmath, bumpy
 import mpv
 
 when defined(windows):
@@ -32,6 +32,15 @@ type
     program: GLuint
     vao, vbo: GLuint
     uViewport, uTex, uAlpha: GLint
+    sphere: GLuint            ## 360° program: equirectangular texture -> camera view
+    sViewport, sTex, sTanHalf, sRot, sBounds, sEye: GLint
+
+  SphereView* = object
+    ## What the 360° pass needs: camera, picture layout on the sphere.
+    yaw*, pitch*, fov*: float32   ## degrees; fov is vertical
+    poseYaw*, posePitch*, poseRoll*: float32
+    bounds*: array[4, float32]    ## crop fractions: left, right, top, bottom
+    eye*: array[4, float32]       ## texture rect of the eye shown: x, y, w, h
 
 proc createRenderContext*(h: MpvHandle, blockForTargetTime = true): MpvRenderContext =
   var
@@ -115,6 +124,39 @@ void main() {
 }
 """
 
+  sphereFragSrc = """
+#version 410 core
+in vec2 vUv;
+uniform sampler2D tex;
+uniform vec2 tanHalf;   // tan of half the field of view, x and y
+uniform mat3 rot;       // view ray -> sphere direction
+uniform vec4 bounds;    // crop of the full sphere: left, right, top, bottom
+uniform vec4 eye;       // texture rect holding the picture: x, y, w, h
+out vec4 color;
+const float PI = 3.14159265358979;
+void main() {
+  vec3 d = normalize(rot * vec3((vUv.x * 2.0 - 1.0) * tanHalf.x,
+                                (1.0 - vUv.y * 2.0) * tanHalf.y, 1.0));
+  // Equirectangular: u follows longitude (0.5 straight ahead, right is +),
+  // v latitude (0 at the zenith).
+  vec2 full = vec2(atan(d.x, d.z) / (2.0 * PI) + 0.5, 0.5 - asin(clamp(d.y, -1.0, 1.0)) / PI);
+  vec2 span = vec2(1.0 - bounds.x - bounds.y, 1.0 - bounds.z - bounds.w);
+  vec2 uv = (full - bounds.xz) / span;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    color = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  // u jumps from 1 to 0 behind the viewer: take the gradient of whichever
+  // wrapping is continuous there, or that column samples the smallest mip.
+  float u2 = fract(full.x + 0.5);
+  float dux = abs(dFdx(full.x)) < abs(dFdx(u2)) ? dFdx(full.x) : dFdx(u2);
+  float duy = abs(dFdy(full.x)) < abs(dFdy(u2)) ? dFdy(full.x) : dFdy(u2);
+  vec2 k = eye.zw / span;
+  color = vec4(textureGrad(tex, eye.xy + uv * eye.zw,
+                           vec2(dux, dFdx(full.y)) * k, vec2(duy, dFdy(full.y)) * k).rgb, 1.0);
+}
+"""
+
 proc compile(kind: GLenum, src: string): GLuint =
   result = glCreateShader(kind)
   var s = src.cstring
@@ -137,6 +179,16 @@ proc newQuadRenderer*(): QuadRenderer =
   result.uViewport = glGetUniformLocation(result.program, "viewport")
   result.uTex = glGetUniformLocation(result.program, "tex")
   result.uAlpha = glGetUniformLocation(result.program, "alpha")
+  result.sphere = glCreateProgram()
+  glAttachShader(result.sphere, compile(GL_VERTEX_SHADER, vertSrc))
+  glAttachShader(result.sphere, compile(GL_FRAGMENT_SHADER, sphereFragSrc))
+  glLinkProgram(result.sphere)
+  result.sViewport = glGetUniformLocation(result.sphere, "viewport")
+  result.sTex = glGetUniformLocation(result.sphere, "tex")
+  result.sTanHalf = glGetUniformLocation(result.sphere, "tanHalf")
+  result.sRot = glGetUniformLocation(result.sphere, "rot")
+  result.sBounds = glGetUniformLocation(result.sphere, "bounds")
+  result.sEye = glGetUniformLocation(result.sphere, "eye")
   glGenVertexArrays(1, result.vao.addr)
   glGenBuffers(1, result.vbo.addr)
   glBindVertexArray(result.vao)
@@ -149,11 +201,7 @@ proc newQuadRenderer*(): QuadRenderer =
     cast[pointer](2 * sizeof(float32)))
   glBindVertexArray(0)
 
-proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2, alpha = 1.0'f32) =
-  ## Draws a texture onto a quad given by its corners in window pixels:
-  ## top-left, top-right, bottom-right, bottom-left (as the image should look).
-  ## mpv renders into the FBO with flip_y=0, which stores the image top row
-  ## first (v=0 is the top of the picture).
+proc upload(q: QuadRenderer, corners: array[4, Vec2]) =
   let uvs = [vec2(0, 0), vec2(1, 0), vec2(1, 1), vec2(0, 1)]
   var data: array[24, float32]
   var i = 0
@@ -161,6 +209,15 @@ proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2
     data[i] = corners[idx].x; data[i+1] = corners[idx].y
     data[i+2] = uvs[idx].x; data[i+3] = uvs[idx].y
     i += 4
+  glBindVertexArray(q.vao)
+  glBindBuffer(GL_ARRAY_BUFFER, q.vbo)
+  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(data), data[0].addr)
+
+proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2, alpha = 1.0'f32) =
+  ## Draws a texture onto a quad given by its corners in window pixels:
+  ## top-left, top-right, bottom-right, bottom-left (as the image should look).
+  ## mpv renders into the FBO with flip_y=0, which stores the image top row
+  ## first (v=0 is the top of the picture).
   glViewport(0, 0, viewport.x.GLsizei, viewport.y.GLsizei)
   glUseProgram(q.program)
   glUniform2f(q.uViewport, viewport.x, viewport.y)
@@ -168,9 +225,7 @@ proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2
   glUniform1f(q.uAlpha, alpha)
   glActiveTexture(GL_TEXTURE0)
   glBindTexture(GL_TEXTURE_2D, tex)
-  glBindVertexArray(q.vao)
-  glBindBuffer(GL_ARRAY_BUFFER, q.vbo)
-  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(data), data[0].addr)
+  q.upload(corners)
   glDrawArrays(GL_TRIANGLES, 0, 6)
   glBindVertexArray(0)
   glBindTexture(GL_TEXTURE_2D, 0)
@@ -178,6 +233,53 @@ proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2
 
 proc rectCorners*(pos, size: Vec2): array[4, Vec2] =
   [pos, pos + vec2(size.x, 0), pos + size, pos + vec2(0, size.y)]
+
+proc rotX(a: float32): Mat3 =
+  let (c, s) = (cos(a), sin(a))
+  mat3(1, 0, 0, 0, c, s, 0, -s, c)
+
+proc rotY(a: float32): Mat3 =
+  let (c, s) = (cos(a), sin(a))
+  mat3(c, 0, -s, 0, 1, 0, s, 0, c)
+
+proc rotZ(a: float32): Mat3 =
+  let (c, s) = (cos(a), sin(a))
+  mat3(c, s, 0, -s, c, 0, 0, 0, 1)
+
+proc drawSphere*(q: QuadRenderer, tex: GLuint, area: Rect, viewport: Vec2, v: SphereView,
+                 fresh: bool) =
+  ## Draws the camera view of an equirectangular texture over `area` (window
+  ## pixels). A wide view minifies the texture, so it gets mipmaps, rebuilt
+  ## when `fresh` (a new frame was rendered into it).
+  glActiveTexture(GL_TEXTURE0)
+  glBindTexture(GL_TEXTURE_2D, tex)
+  if fresh: glGenerateMipmap(GL_TEXTURE_2D)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR.GLint)
+  # A full mono sphere wraps around seamlessly behind the viewer.
+  let wrap = if v.eye[2] == 1 and v.bounds[0] + v.bounds[1] == 0: GL_REPEAT else: GL_CLAMP_TO_EDGE
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap.GLint)
+  let d = PI.float32 / 180
+  # Camera: yaw turns right, pitch looks up. The pose rotates the picture on
+  # the sphere, so view rays turn back by it.
+  let cam = rotY(v.yaw * d) * rotX(-v.pitch * d)
+  let pose = rotY(-v.poseYaw * d) * rotX(-v.posePitch * d) * rotZ(v.poseRoll * d)
+  var rot = pose.inverse * cam
+  let ty = tan(clamp(v.fov, 1, 170) * d / 2)
+  glViewport(0, 0, viewport.x.GLsizei, viewport.y.GLsizei)
+  glUseProgram(q.sphere)
+  glUniform2f(q.sViewport, viewport.x, viewport.y)
+  glUniform1i(q.sTex, 0)
+  glUniform2f(q.sTanHalf, ty * area.w / max(1, area.h), ty)
+  glUniformMatrix3fv(q.sRot, 1, GL_FALSE, cast[ptr GLfloat](rot.addr))
+  glUniform4f(q.sBounds, v.bounds[0], v.bounds[1], v.bounds[2], v.bounds[3])
+  glUniform4f(q.sEye, v.eye[0], v.eye[1], v.eye[2], v.eye[3])
+  q.upload(rectCorners(area.xy, area.wh))
+  glDrawArrays(GL_TRIANGLES, 0, 6)
+  glBindVertexArray(0)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR.GLint)
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE.GLint)
+  glBindTexture(GL_TEXTURE_2D, 0)
+  glUseProgram(0)
 
 proc transformedCorners*(center, size: Vec2, angleDeg: float32): array[4, Vec2] =
   let

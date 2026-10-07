@@ -58,6 +58,7 @@ type
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
     showAllShortcuts*: bool = false  # status bar hints include view toggles and grab/rotate/scale
     autoFitWindow*: bool = true
+    sphereDragMovesWindow*: bool = false  # 360° video: drag moves the window, Ctrl+drag looks around
     rememberTime*: bool = false
     rememberWindowPos*: bool = false
     rememberWindowSize*: bool = false
