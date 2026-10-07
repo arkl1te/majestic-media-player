@@ -3,7 +3,8 @@
 ## line; it holds a value, or refers to the current media file, a bookmark of
 ## it or an external file. When the command runs, a file dialog asks for each
 ## external file, then the Run window asks for the bookmarks and lets the
-## values be changed.
+## values be changed. Value cards can be numbers of a rectangle (its width,
+## height, x or y) that the Run window lets be drawn over the video.
 
 import std/[strutils, sequtils, os, math, tables]
 import silky, vmath, bumpy, pixie
@@ -73,6 +74,12 @@ proc isBookmark(p: CmdPart): bool =
 
 proc isExternal(p: CmdPart): bool =
   p.card and p.kind == ckReference and p.content == "external"
+
+proc isRect*(p: CmdPart): bool = p.card and p.kind == ckValue and p.rect > 0
+
+proc digitsOnly*(s: string): string =
+  for c in s:
+    if c in Digits: result.add c
 
 proc externalCards*(parts: seq[CmdPart]): seq[string] =
   ## Names of the external-file cards, asked for with a file dialog on run,
@@ -177,7 +184,8 @@ proc validate(d: CmdDialog): string =
     if t.kind == ckReference and t.content.len == 0:
       return "Choose what card " & t.name & " refers to."
     for u in d.toks[0 ..< i]:
-      if u.card and u.name == t.name and (u.kind != t.kind or u.content != t.content):
+      if u.card and u.name == t.name and (u.kind != t.kind or u.content != t.content or
+                                          u.rect != t.rect or u.dim != t.dim):
         return "Two different cards are named " & t.name & "."
 
 proc insertTok(d: CmdDialog, t: CmdPart, at: int) =
@@ -191,14 +199,16 @@ proc deleteTok(d: CmdDialog, at: int) =
 
 proc isSpace(t: CmdPart): bool = not t.card and t.text == " "
 
-proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "") =
+proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "", rect = 0,
+              dim = rdNone) =
   ## Inserts a card at the caret, spaced from its neighbours, and selects it;
   ## the caret goes after the space that follows it.
   var at = clamp(d.caret, 0, d.toks.len)
   if at > 0 and not d.toks[at - 1].isSpace:
     d.insertTok(CmdPart(text: " "), at)
     inc at
-  d.insertTok(CmdPart(card: true, name: name, kind: kind, content: content), at)
+  d.insertTok(CmdPart(card: true, name: name, kind: kind, content: content, rect: rect,
+    dim: dim), at)
   # Typing carries on after a space.
   if at + 1 == d.toks.len or not d.toks[at + 1].isSpace:
     d.insertTok(CmdPart(text: " "), at + 1)
@@ -207,6 +217,35 @@ proc addCard*(d: CmdDialog, name: string, kind = ckValue, content = "") =
   d.caretEol = false
   d.anchor = d.caret
   d.error = ""
+
+proc freeName(d: CmdDialog, base: string): string =
+  ## base, else base2, base3, ... whichever no card is named yet.
+  result = base
+  var n = 1
+  while d.toks.anyIt(it.card and it.name == result):
+    inc n
+    result = base & $n
+
+proc rectNumber*(toks: seq[CmdPart], id: int): int =
+  ## Rectangles are numbered by where their first card is.
+  var seen: seq[int]
+  for t in toks:
+    if t.isRect and t.rect notin seen: seen.add t.rect
+  seen.find(id) + 1
+
+proc makeRect(d: CmdDialog, s: int) =
+  ## Turns card s into the width of a new rectangle; a name New card made
+  ## up becomes "width".
+  var id = 1
+  for t in d.toks:
+    if t.isRect: id = max(id, t.rect + 1)
+  d.toks[s].rect = id
+  d.toks[s].dim = rdWidth
+  d.toks[s].content = d.toks[s].content.digitsOnly
+  let name = d.toks[s].name
+  if name.startsWith("var") and name.len > 3 and name[3 .. ^1].allCharsInSet(Digits):
+    d.toks[s].name = ""
+    d.toks[s].name = d.freeName("width")
 
 proc newCard(d: CmdDialog, ui: Ui) =
   ## New card button: a card named var1, var2, ... ready to be renamed.
@@ -475,10 +514,15 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
       ui.textIn(t.text, rect(tr.x, tr.y, tr.w + 20, tr.h), colText)
       continue
     let chip = rect(tr.x + 1, tr.y + 3, tr.w - 2, tr.h - 6)
-    ui.rect(chip, if t.kind == ckReference: colCardRef else: colCardValue)
+    ui.rect(chip, if t.kind == ckReference: colCardRef elif t.isRect: colCardRect
+                  else: colCardValue)
     let bad = not validName(t.name) or t.kind == ckReference and t.content.len == 0
+    # The other cards of the selected card's rectangle are outlined dashed.
+    let sibling = t.isRect and d.selected >= 0 and d.selected < d.toks.len and
+      d.toks[d.selected].isRect and d.toks[d.selected].rect == t.rect
     if k == d.selected: ui.border(chip, colAccent)
     elif bad: ui.border(chip, colError)
+    elif sibling: ui.dashedBorder(chip, colAccent, 4, 3)
     elif ui.hover(chip): ui.border(chip, colTextDim)
     ui.textIn(t.chipLabel, chip, colText, h = CenterAlign)
   if ui.focusId == id:
@@ -492,28 +536,25 @@ proc commandField(d: CmdDialog, ui: Ui, r: Rect) =
 
 # --- properties ----------------------------------------------------------------
 
-proc referenceList(d: CmdDialog, ui: Ui, r: Rect, card: var CmdPart, path: string) =
-  ## Flat list of what a card can refer to: the media file's path, or a
-  ## bookmark or external file picked when the command runs.
-  let rows: array[3, tuple[key, label, detail: string]] = [
-    ("file", "Current media file", (if path.len > 0: "" else: "none open")),
-    ("bookmark", "Bookmark", "chosen on run"),
-    ("external", "External file", "chosen on run")]
+proc choiceList(d: CmdDialog, ui: Ui, id: string, r: Rect,
+    rows: openArray[tuple[key, label, detail: string]], key: var string, path = ""): bool =
+  ## Flat list to pick one of rows from, by key; true when key changed.
   ui.rect(r, colBackground)
   ui.border(r, colBorder)
   let inner = rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2)
-  let focused = ui.tabStop("cl-ref", r)
+  let focused = ui.tabStop(id, r)
   if focused: ui.focusRing(r)
   var cur = -1
   for i, row in rows:
-    if row.key == card.content: cur = i
+    if row.key == key: cur = i
   if focused and ui.focusId.len == 0:
     let w = ui.window
     var c = cur
     if w.buttonPressed[KeyUp]: c = max(0, c - 1)
     if w.buttonPressed[KeyDown]: c = min(rows.high, c + 1)
     if c != cur and c >= 0:
-      card.content = rows[c].key
+      key = rows[c].key
+      result = true
       cur = c
       let top = c.float32 * RowH
       if top < d.refScroll: d.refScroll = top
@@ -542,8 +583,9 @@ proc referenceList(d: CmdDialog, ui: Ui, r: Rect, card: var CmdPart, path: strin
     if row.key == "file" and path.len > 0: ui.tip(rr, path)
     if hov and ui.pressed():
       ui.consumeClick()
-      ui.navId = "cl-ref"
-      card.content = row.key
+      ui.navId = id
+      result = key != row.key
+      key = row.key
   ui.sk.popClipRect()
   ui.hitClip = outerClip
 
@@ -572,26 +614,65 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
       rect(r.x + labelW, y, r.w - labelW, 18), colError, FontSmall)
   y += 26
   ui.textIn("Type", rect(r.x, y, labelW, 22), colText)
-  if ui.radioButton("cl-value", vec2(r.x + labelW, y), "Value", d.toks[s].kind == ckValue):
+  if ui.radioButton("cl-value", vec2(r.x + labelW, y), "Value", d.toks[s].kind == ckValue) and
+     d.toks[s].kind != ckValue:
     d.toks[s].kind = ckValue
     d.toks[s].content = ""
+    d.refScroll = 0
   if ui.radioButton("cl-refer", vec2(r.x + labelW + 90, y), "Reference",
-                    d.toks[s].kind == ckReference):
+                    d.toks[s].kind == ckReference) and d.toks[s].kind != ckReference:
     d.toks[s].kind = ckReference
     d.toks[s].content = "file"
+    d.toks[s].rect = 0
+    d.toks[s].dim = rdNone
     d.refScroll = 0
   y += 34
   ui.textIn("Content", rect(r.x, y, labelW, 26), colText)
-  if d.toks[s].kind == ckValue:
-    discard ui.textField("cl-content", rect(r.x + labelW, y, r.w - labelW, 26),
-      d.toks[s].content, "text")
-    ui.textIn("The default; it can be changed on run.",
-      rect(r.x + labelW, y + 28, r.w - labelW, 18), colTextDim, FontSmall)
+  let fw = r.w - labelW
+  if d.toks[s].kind == ckReference:
+    # What a card can refer to: the media file's path, or a bookmark or
+    # external file picked when the command runs.
+    let rows = [
+      (key: "file", label: "Current media file", detail: (if path.len > 0: "" else: "none open")),
+      (key: "bookmark", label: "Bookmark", detail: "chosen on run"),
+      (key: "external", label: "External file", detail: "chosen on run")]
+    discard d.choiceList(ui, "cl-ref", rect(r.x + labelW, y, fw, RowH * 3 + 2), rows,
+      d.toks[s].content, path)
+    return
+  let contents = [(key: "text", label: "Text", detail: ""),
+                  (key: "rect", label: "Rectangle", detail: "drawn on run")]
+  var content = if d.toks[s].isRect: "rect" else: "text"
+  if d.choiceList(ui, "cl-kind", rect(r.x + labelW, y, fw, RowH * 2 + 2), contents, content):
+    if content == "rect": d.makeRect(s)
+    else:
+      d.toks[s].rect = 0
+      d.toks[s].dim = rdNone
+  y += RowH * 2 + 10
+  ui.textIn("Default", rect(r.x, y, labelW, 26), colText)
+  if not d.toks[s].isRect:
+    discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "text")
+    ui.textIn("Can be changed on run.", rect(r.x + labelW, y + 28, fw, 18), colTextDim, FontSmall)
     ui.textIn("A leading ~ means your home folder.",
-      rect(r.x + labelW, y + 46, r.w - labelW, 18), colTextDim, FontSmall)
-  else:
-    let h = RowH * 3 + 2
-    d.referenceList(ui, rect(r.x + labelW, y, r.w - labelW, h), d.toks[s], path)
+      rect(r.x + labelW, y + 46, fw, 18), colTextDim, FontSmall)
+    return
+  discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "number")
+  d.toks[s].content = d.toks[s].content.digitsOnly
+  let t = d.toks[s]
+  let dimLabel = case t.dim
+    of rdHeight: "Height"
+    of rdX: "X"
+    of rdY: "Y"
+    else: "Width"
+  ui.textIn(dimLabel & " of rectangle " & $d.toks.rectNumber(t.rect) & ", in pixels",
+    rect(r.x + labelW, y + 28, fw, 18), colTextDim, FontSmall)
+  # More cards of this rectangle, at the caret.
+  y += 52
+  let bw = (fw - 6) / 2
+  for i, (dim, label) in [(rdWidth, "Add width"), (rdHeight, "Add height"),
+                          (rdX, "Add X"), (rdY, "Add Y")]:
+    let br = rect(r.x + labelW + float32(i mod 2) * (bw + 6), y + float32(i div 2) * 32, bw, 26)
+    if ui.textButton("cl-add" & $dim, br, label):
+      d.addCard(d.freeName($dim), ckValue, "", t.rect, dim)
 
 # --- window ---------------------------------------------------------------------
 
@@ -743,7 +824,7 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
 
 type
   PickAction* = enum
-    paNone, paRun, paCancel
+    paNone, paRun, paCancel, paDraw
 
   PickDialog* = ref object
     ## Shown when a command line with value or bookmark cards runs: one row
@@ -753,6 +834,9 @@ type
     rows*: seq[CmdPart]       ## the cards asked about
     picks*: seq[int]          ## bookmark rows: the bookmark index chosen
     texts*: seq[string]       ## value rows: the value to run with
+    crossed*: seq[bool]       ## rectangle rows: a drawn rectangle leaves them alone
+    drawing*: int             ## rectangle being drawn over the video, else 0
+    drawRequest*: int         ## with paDraw: the rectangle to draw
     openRow*: int             ## row whose dropdown is open, else -1
     listScroll: int
     runRequested*: bool       ## debug scripting: press Run next frame
@@ -775,6 +859,8 @@ proc start*(d: PickDialog, c: CommandLine, marks: seq[Bookmark],
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
   d.texts = newSeq[string](d.rows.len)
+  d.crossed = newSeq[bool](d.rows.len)
+  d.drawing = 0
   var n = 0
   for i, row in d.rows:
     if row.isBookmark:
@@ -787,6 +873,7 @@ proc start*(d: PickDialog, c: CommandLine, marks: seq[Bookmark],
         elif v.mark >= 0 and v.mark < marks.len: d.picks[i] = v.mark
     else:
       d.texts[i] = if row.name in last: last[row.name].value else: row.content
+      d.crossed[i] = row.isRect and row.name in last and last[row.name].crossed
   d.openRow = -1
   d.listScroll = 0
 
@@ -839,11 +926,36 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, marks: seq[Bookmark]): PickAction =
 
   ui.textIn(ui.ellipsize("Variables of " & d.cmd.title & " for this run.", r.w - 32, FontSmall),
     rect(r.x + 16, r.y + 12, r.w - 32, 20), colTextDim, FontSmall)
+  # Rectangle rows end in an icon: hovering it lights the icons of the rows
+  # its rectangle sets.
+  proc iconRect(dr: Rect): Rect = rect(dr.x + dr.w - 28, dr.y, 28, dr.h)
+  var hovRect = 0
+  for i, row in d.rows:
+    if row.isRect and ui.hover(iconRect(dropRect(r, i))): hovRect = row.rect
   for i, row in d.rows:
     let dr = dropRect(r, i)
     ui.textIn(ui.ellipsize(row.name, PickLabelW - 12),
       rect(r.x + 16, dr.y, PickLabelW - 12, dr.h), colText)
     let id = "pk-" & $i
+    if row.isRect:
+      discard ui.textField(id, rect(dr.x, dr.y, dr.w - 32, dr.h), d.texts[i], "number")
+      d.texts[i] = d.texts[i].digitsOnly
+      let ir = iconRect(dr)
+      let hov = ui.hover(ir)
+      if hov and ui.pressed():
+        ui.consumeClick()
+        ui.pressId = id & "-rect"
+      if hov and ui.pressed(MouseRight): d.crossed[i] = not d.crossed[i]
+      if hov and ui.released() and ui.pressId == id & "-rect":
+        result = paDraw
+        d.drawRequest = row.rect
+      let lit = not d.crossed[i] and (row.rect == hovRect or row.rect == d.drawing)
+      if hov: ui.rect(ir, if ui.down() and ui.pressId == id & "-rect": colPressed else: colHover)
+      ui.icon(if d.crossed[i]: "rectoff20" else: "rect20", ir.xy + ir.wh / 2,
+        if lit: colRect elif d.crossed[i]: colTextDisabled else: colTextDim)
+      ui.tip(ir, if d.crossed[i]: "Kept as typed; right-click to let the drawn rectangle set it"
+                 else: "Draw the rectangle on the video; right-click to keep this value")
+      continue
     if not row.isBookmark:
       discard ui.textField(id, dr, d.texts[i], "empty")
       continue

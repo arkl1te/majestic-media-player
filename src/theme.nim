@@ -29,6 +29,8 @@ let
   colError* = c("#ff6b6b")
   colCardValue* = c("#9d8cff", 0.28)
   colCardRef* = c("#ffc857", 0.24)
+  colCardRect* = c("#2ec4b6", 0.30)
+  colRect* = c("#2ec4b6")       ## rectangle drawn over the video
   colShadow* = c("#000000", 0.45)
   colScrim* = c("#000000", 0.55)
   colOverlayBg* = c("#121317", 0.92)

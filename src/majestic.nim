@@ -4,7 +4,8 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
   random, tables, streams]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
-  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap
+  options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
+  rectedit
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -43,7 +44,7 @@ type
     sort: PlaylistSort
 
   PointerShape = enum
-    ptArrow, ptHidden, ptResize, ptResizeV
+    ptArrow, ptHidden, ptResize, ptResizeV, ptCross, ptMove, ptMoving
 
   VideoTransform = object
     pan: Vec2
@@ -119,6 +120,8 @@ type
     pickWin: Window
     pickSk: Silky
     pickUi: Ui
+    rectEdit: RectEdit        ## a Run window rectangle being drawn over the video
+    rectBefore: seq[string]   ## the Run window's values when it began, for Escape
     resumedAt: float          ## start time of the file being loaded, else 0
     savedPos: float           ## playback position last written to positions.json
     savedCfg: string          ## config.json as last written by autosave
@@ -1618,6 +1621,8 @@ proc runCommandLine(a: App, c: CommandLine) =
   a.askExternal()
 
 proc closePick(a: App) =
+  a.rectEdit = nil
+  a.pickDlg.drawing = 0
   a.overlay = ovNone
   if a.pickWin.visible:
     a.pickWin.visible = false
@@ -2366,9 +2371,12 @@ proc runAction(a: App, act: KeyAction) =
   of kaCenter .. kaPanReset:
     a.runMenuPath(@["View", "Pan, Rotate & Scale", PanMenuLabels[act]])
 
+proc rectKeys(a: App): bool  # rectangle drawing, below
+
 proc handleKeys(a: App) =
   let w = a.window
   let pressed = w.buttonPressed
+  if a.rectKeys(): return
 
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
@@ -2528,6 +2536,110 @@ proc rotateDrag(a: App, area: Rect, at: Vec2, snap: bool) =
   if r != a.xf.rotation:
     a.xf.rotation = r
     a.xfChanged(&"Rotation: {r:g}°")
+
+# --- rectangle drawing (Run window) ------------------------------------------
+
+proc videoMap(a: App): VideoMap =
+  let s = a.sk.uiScale
+  let (center, size) = a.videoGeometry(a.px(a.videoRect))
+  VideoMap(center: center / s, size: size / s, rotation: a.xf.rotation,
+    video: ivec2(a.player.pixelW.int32, a.player.pixelH.int32))
+
+proc rectBlocker(a: App): string =
+  ## Why no rectangle can be drawn over the video now, else "".
+  let p = a.player
+  if not p.hasVideo or p.stopped or p.pixelW <= 0 or p.pixelH <= 0: "No video is showing"
+  elif p.isSpherical: "Rectangles can't be drawn on a 360° video"
+  elif abs(a.xf.rotation / 90 - round(a.xf.rotation / 90)) > 0.001:
+    "Rectangles need the frame turned by a multiple of 90°"
+  else: ""
+
+proc applyRect(a: App) =
+  ## The drawn rectangle's numbers into the Run window rows it sets.
+  let e = a.rectEdit
+  let d = a.pickDlg
+  if e == nil or not e.has: return
+  for i, row in d.rows:
+    if row.isRect and row.rect == e.rect and not d.crossed[i]:
+      d.texts[i] = $e.value($row.dim)
+  a.dirtyUntil = now() + 0.5
+
+proc endRectDraw(a: App, keep: bool, refocus = true) =
+  ## Stops drawing, keeping the numbers drawn or going back to the values
+  ## from before.
+  if a.rectEdit == nil: return
+  if not keep: a.pickDlg.texts = a.rectBefore
+  a.rectEdit = nil
+  a.pickDlg.drawing = 0
+  a.dirtyUntil = now() + 0.5
+  if refocus and a.overlay == ovPick: a.pickWin.activate()
+
+proc movePickAside(a: App) =
+  ## Takes the Run window off the video: beside the main window, when its
+  ## monitor has room there.
+  let w = a.pickWin
+  let fp = w.framePos
+  let off = w.pos - fp
+  let width = w.size.x + 2 * off.x
+  let mainL = a.window.framePos.x
+  let mainR = a.window.pos.x + a.window.size.x + (a.window.pos.x - mainL)
+  if fp.x + width <= mainL or fp.x >= mainR: return
+  let m = monitorAt(a.window.pos + a.window.size div 2)
+  let x =
+    if mainR + width <= m.pos.x + m.size.x: mainR
+    elif mainL - width >= m.pos.x: mainL - width
+    else: return
+  w.pos = ivec2(x, fp.y) + off
+
+proc beginRectDraw(a: App, id: int) =
+  ## Left-click on a Run window rectangle icon: draw that rectangle over the
+  ## video, starting from the numbers its rows hold.
+  let err = a.rectBlocker
+  if err.len > 0:
+    a.osd(err)
+    return
+  a.endRectDraw(true, refocus = false)
+  let d = a.pickDlg
+  a.rectBefore = d.texts
+  var v: array[RectDim, int]
+  var known: set[RectDim]
+  for i, row in d.rows:
+    if row.isRect and row.rect == id and d.texts[i].len > 0:
+      try:
+        v[row.dim] = parseInt(d.texts[i])
+        known.incl row.dim
+      except ValueError: discard
+  let m = a.videoMap
+  let e = RectEdit(rect: id)
+  # Numbers without a card take the rest of the video; a rectangle of no
+  # size isn't one.
+  if known != {} and not (rdWidth in known and v[rdWidth] == 0) and
+     not (rdHeight in known and v[rdHeight] == 0):
+    e.seed(v[rdX], v[rdY],
+      if rdWidth in known: v[rdWidth] else: m.video.x - v[rdX],
+      if rdHeight in known: v[rdHeight] else: m.video.y - v[rdY], m)
+  a.rectEdit = e
+  d.drawing = id
+  a.movePickAside()
+  a.window.activate()
+  a.dirtyUntil = now() + 0.5
+
+proc rectKeys(a: App): bool =
+  ## Keys while a rectangle is drawn: Enter keeps it, Escape goes back, the
+  ## arrows move it a pixel.
+  let e = a.rectEdit
+  if e == nil: return false
+  result = true
+  let p = a.window.buttonPressed
+  if p[KeyEnter] or p[NumpadEnter]: a.endRectDraw(true)
+  elif p[KeyEscape]: a.endRectDraw(false)
+  else:
+    var d = ivec2(0, 0)
+    if p[KeyLeft]: d.x -= 1
+    if p[KeyRight]: d.x += 1
+    if p[KeyUp]: d.y -= 1
+    if p[KeyDown]: d.y += 1
+    if e.nudge(a.videoMap, d): a.applyRect()
 
 proc pollVideoFrame(a: App) =
   ## Picks up newly queued mpv frames and decides whether one is due.
@@ -3295,20 +3407,7 @@ proc syncOutline(a: App, r: Rect) =
   if a.isSyncMaster:
     ui.border(r, col, t)
     return
-  const dash = 14'f32
-  const gap = 8'f32
-  var x = r.x
-  while x < r.x + r.w:
-    let w = min(dash, r.x + r.w - x)
-    ui.rect(rect(x, r.y, w, t), col)
-    ui.rect(rect(x, r.y + r.h - t, w, t), col)
-    x += dash + gap
-  var y = r.y
-  while y < r.y + r.h:
-    let h = min(dash, r.y + r.h - y)
-    ui.rect(rect(r.x, y, t, h), col)
-    ui.rect(rect(r.x + r.w - t, y, t, h), col)
-    y += dash + gap
+  ui.dashedBorder(r, col, 14, 8, t)
 
 # --- overlays ---------------------------------------------------------------
 
@@ -3511,14 +3610,16 @@ proc renderPick(a: App, shot: string) =
   case action
   of paNone: discard
   of paCancel: a.closePick()
+  of paDraw: a.beginRectDraw(a.pickDlg.drawRequest)
   of paRun:
+    a.endRectDraw(true, refocus = false)
     let d = a.pickDlg
     var picks = a.extPicks
     var used = initTable[string, RunValue]()
     for i, row in d.rows:
       if row.kind == ckValue:
         picks[row.name] = d.texts[i]
-        used[row.name] = RunValue(value: d.texts[i])
+        used[row.name] = RunValue(value: d.texts[i], crossed: d.crossed[i])
       elif d.picks[i] >= 0 and d.picks[i] < marks.len:
         picks[row.name] = fmtTime(marks[d.picks[i]].time, millis = true)
         used[row.name] = RunValue(mark: d.picks[i], time: marks[d.picks[i]].time)
@@ -3648,7 +3749,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Bigger / smaller", @[kaSubBigger, kaSubSmaller], "Shift+Numpad + / -")]),
     ("Text fields", @[
       ("Next / previous word", "Ctrl+Right / Ctrl+Left"),
-      ("Select next / previous word", "Ctrl+Shift+Right / Left")])]
+      ("Select next / previous word", "Ctrl+Shift+Right / Left")]),
+    ("Drawing a rectangle (Run window)", @[
+      ("Confirm / cancel", "Enter / Esc"),
+      ("Move by one pixel", "Arrows")])]
   var view = a.keyRows("View", [
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
     ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
@@ -3683,7 +3787,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("360° video: reset view", "Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
-      ("Select word / all in a text field", "Double / Triple-click")])]
+      ("Select word / all in a text field", "Double / Triple-click"),
+      ("Draw on video / keep value (Run window)", "Click / Right-click rectangle icon"),
+      ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
   for col in result.mitems:
     col.keepItIf(it.rows.len > 0)
 
@@ -3777,6 +3883,25 @@ proc frame(a: App) =
   a.idleScreen(videoArea)
   a.sphereOsd(videoArea)
 
+  # A Run window rectangle being drawn over the video.
+  let overVideo = ui.mouse.inside(videoArea) and
+    not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
+    not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
+    not (a.cfg.showRunLog and ui.mouse.inside(rlRect))
+  if a.rectEdit != nil:
+    let err = a.rectBlocker
+    if err.len > 0:
+      a.osd(err)
+      a.endRectDraw(false)
+  if a.rectEdit != nil:
+    let m = a.videoMap
+    if a.rectEdit.update(m, ui.mouse, overVideo and w.buttonPressed[MouseLeft],
+                         w.buttonDown[MouseLeft]):
+      a.applyRect()
+    ui.sk.pushClipRect(videoArea)
+    a.rectEdit.draw(ui, m, videoArea, a.pickDlg.cmd.parts.rectNumber(a.rectEdit.rect))
+    ui.sk.popClipRect()
+
   # Video-frame mouse handling: click = play/pause, drag = move window.
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
      not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
@@ -3865,7 +3990,7 @@ proc frame(a: App) =
     of ovCommands:
       if ui.pressed(): a.cmdWin.activate()
     of ovPick:
-      if ui.pressed(): a.pickWin.activate()
+      if ui.pressed() and a.rectEdit == nil: a.pickWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -3894,13 +4019,23 @@ proc frame(a: App) =
   let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
     ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) and
     a.overlay == ovNone and not a.menus.isOpen
-  let shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV else: ptArrow
+  var shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV else: ptArrow
+  if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
+    shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
+      of rcCross: ptCross
+      of rcMove: ptMove
+      of rcMoving: ptMoving
+      of rcResizeH: ptResize
+      of rcResizeV: ptResizeV
   if shape != a.pointerShape:
     a.pointerShape = shape
     w.cursor = case shape
       of ptHidden: hiddenCursor()
       of ptResize: Cursor(kind: ResizeLeftRightCursor)
       of ptResizeV: Cursor(kind: ResizeUpDownCursor)
+      of ptCross: Cursor(kind: CrosshairCursor)
+      of ptMove: Cursor(kind: OpenHandCursor)
+      of ptMoving: Cursor(kind: ClosedHandCursor)
       of ptArrow: Cursor(kind: ArrowCursor)
 
   a.sk.endUi()
@@ -3986,6 +4121,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "cmdcard":  # name [value|reference [content]]: a card at the caret
     let kind = if st.args.len > 1 and st.args[1] == "reference": ckReference else: ckValue
     a.cmdDlg.addCard(st.args[0], kind, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "")
+  of "cmdrect":  # name rect dim [default]: a rectangle card at the caret
+    a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 3: st.args[3] else: "",
+      parseInt(st.args[1]), parseEnum[RectDim](st.args[2]))
   of "cmdapply": a.cmdDlg.applyRequested = true
   of "run": a.runMenuPath(@["Run", arg])
   of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
@@ -3995,6 +4133,14 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "picktext":  # row text: a value for this run
     a.pickDlg.texts[parseInt(st.args[0])] = st.args[1 .. ^1].join(" ")
   of "pickopen": a.pickDlg.openRow = parseInt(arg)
+  of "pickdraw": a.beginRectDraw(a.pickDlg.rows[parseInt(arg)].rect)  # row: its rectangle icon
+  of "pickcross": a.pickDlg.crossed[parseInt(arg)] = not a.pickDlg.crossed[parseInt(arg)]
+  of "rectset":  # x y w h: the rectangle being drawn
+    if a.rectEdit != nil:
+      a.rectEdit.seed(parseInt(st.args[0]), parseInt(st.args[1]), parseInt(st.args[2]),
+        parseInt(st.args[3]), a.videoMap)
+      a.applyRect()
+  of "rectend": a.endRectDraw(arg == "1")  # 1 keeps the rectangle, 0 goes back
   of "action": a.runMenuPath(arg.split('/'))
   of "dialogresult": a.handleDialogResult(st.args[0], @[st.args[1 .. ^1].join(" ")])  # purpose path
   of "fs": a.setFullscreen(arg == "1")

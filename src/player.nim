@@ -38,6 +38,8 @@ type
     tracks*: seq[Track]
     chapters*: seq[Chapter]
     videoW*, videoH*: int     ## display size (aspect-corrected)
+    pixelW*, pixelH*: int     ## stored size, as upright as shown (what ffmpeg
+                              ## filters see, autorotation included)
     audioChannels*: int
     loadError*: string
     sphere*: SphereInfo       ## 360° metadata of the open file
@@ -159,9 +161,14 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
       if j.kind == JObject:
         p.videoW = j{"dw"}.getInt
         p.videoH = j{"dh"}.getInt
+        let turned = j{"rotate"}.getInt mod 180 != 0
+        p.pixelW = j{if turned: "h" else: "w"}.getInt
+        p.pixelH = j{if turned: "w" else: "h"}.getInt
       else:
         p.videoW = 0
         p.videoH = 0
+        p.pixelW = 0
+        p.pixelH = 0
 
 proc addSameNameAudio(p: Player) =
   ## A video's audio files of the same name (song.mkv + song.flac) join as
@@ -246,6 +253,8 @@ proc close*(p: Player) =
   p.chapters.setLen 0
   p.videoW = 0
   p.videoH = 0
+  p.pixelW = 0
+  p.pixelH = 0
   p.timePos = 0
   p.duration = 0
 

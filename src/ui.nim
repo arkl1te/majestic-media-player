@@ -207,6 +207,20 @@ proc border*(ui: Ui, r: Rect, color: ColorRGBX, t = 1'f32) =
   ui.sk.drawRect(vec2(r.x, r.y), vec2(t, r.h), color)
   ui.sk.drawRect(vec2(r.x + r.w - t, r.y), vec2(t, r.h), color)
 
+proc dashedBorder*(ui: Ui, r: Rect, color: ColorRGBX, dash, gap: float32, t = 1'f32) =
+  var x = r.x
+  while x < r.x + r.w:
+    let w = min(dash, r.x + r.w - x)
+    ui.rect(rect(x, r.y, w, t), color)
+    ui.rect(rect(x, r.y + r.h - t, w, t), color)
+    x += dash + gap
+  var y = r.y
+  while y < r.y + r.h:
+    let h = min(dash, r.y + r.h - y)
+    ui.rect(rect(r.x, y, t, h), color)
+    ui.rect(rect(r.x + r.w - t, y, t, h), color)
+    y += dash + gap
+
 proc textSize*(ui: Ui, s: string, font = FontMain): Vec2 =
   ui.sk.getTextSize(font, s)
 

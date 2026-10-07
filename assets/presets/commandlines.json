@@ -150,6 +150,138 @@
   ]
  },
  {
+  "title": "Cut & Crop",
+  "parts": [
+   {
+    "text": "ffmpeg -y -ss ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "from",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -to ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "to",
+    "kind": "reference",
+    "content": "bookmark"
+   },
+   {
+    "text": " -i ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "video",
+    "kind": "reference",
+    "content": "file"
+   },
+   {
+    "text": " -vf crop=",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "width",
+    "kind": "value",
+    "content": "",
+    "rect": 1,
+    "dim": "width"
+   },
+   {
+    "text": ":",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "height",
+    "kind": "value",
+    "content": "",
+    "rect": 1,
+    "dim": "height"
+   },
+   {
+    "text": ":",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "x",
+    "kind": "value",
+    "content": "",
+    "rect": 1,
+    "dim": "x"
+   },
+   {
+    "text": ":",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "y",
+    "kind": "value",
+    "content": "",
+    "rect": 1,
+    "dim": "y"
+   },
+   {
+    "text": " -pix_fmt yuv420p -movflags +faststart ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "output",
+    "kind": "value",
+    "content": "~/output.mp4"
+   },
+   {
+    "text": " ",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": ""
+   }
+  ]
+ },
+ {
   "title": "Create chapters from file",
   "parts": [
    {

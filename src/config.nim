@@ -372,6 +372,10 @@ type
     ckValue = "value"             ## content is the text itself
     ckReference = "reference"     ## content is a key: "file" or "bookmark:N"
 
+  RectDim* = enum
+    ## Which number of a rectangle a value card holds.
+    rdNone = "none", rdWidth = "width", rdHeight = "height", rdX = "x", rdY = "y"
+
   CmdPart* = object
     ## Literal text, or a card: a variable placed in the command line.
     text*: string
@@ -379,6 +383,8 @@ type
     name*: string
     kind*: CardKind
     content*: string
+    rect*: int                    ## value cards: the rectangle drawn on run (1, 2, ...),
+    dim*: RectDim                 ## and which of its numbers; 0 for text
 
   CommandLine* = object
     title*: string
@@ -410,6 +416,7 @@ type
     value*: string                ## value cards: the value
     mark*: int = -1               ## bookmark cards: index of the bookmark chosen,
     time*: float                  ## and its time
+    crossed*: bool                ## rectangle cards: a drawn rectangle leaves it alone
 
   RunValues* = Table[string, Table[string, RunValue]]  ## title -> card name -> value
 
