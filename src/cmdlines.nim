@@ -912,6 +912,14 @@ proc timeChoices*(pos, duration: float, marks, chapters: seq[Bookmark]): seq[Tim
     if group.len > 0: result.add TimeChoice(sep: true)
     for i, b in group: result.add TimeChoice(label: b.label(i), time: b.time)
 
+proc stepChoice(choices: seq[TimeChoice], k, dir: int): int =
+  ## The next entry from k in direction dir, skipping separators; k at the end.
+  result = k
+  var j = k + dir
+  while j >= 0 and j < choices.len:
+    if not choices[j].sep: return j
+    j += dir
+
 proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
 
 proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
@@ -919,23 +927,26 @@ proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
   ## Prepares the window for c. Cards start at what they were last run with
   ## (last): a value, the start, current time or end, or the bookmark or
   ## chapter at the same time (the same file). Otherwise values start at the
-  ## card's own and the n-th timestamp card at the n-th bookmark (chapters
-  ## after them), so a command using bookmarks in order needs no changes for
-  ## a file marked in order; past them, at the current time.
+  ## card's own, the first timestamp card at the first bookmark (else the
+  ## current time) and each later one at the entry after the previous card's,
+  ## so a command using bookmarks in order needs no changes for a file marked
+  ## in order.
   d.cmd = c
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
   d.texts = newSeq[string](d.rows.len)
   d.crossed = newSeq[bool](d.rows.len)
   d.drawing = 0
-  var marks: seq[int]
-  for k, ch in choices:
-    if not ch.sep and ch.which.len == 0: marks.add k
-  var n = 0
+  var prev = -1  # the previous timestamp card's pick
   for i, row in d.rows:
     if row.isTimestamp:
-      d.picks[i] = if n < marks.len: marks[n] else: 1
-      inc n
+      d.picks[i] =
+        if prev >= 0: choices.stepChoice(prev, 1)
+        else:
+          var first = 1
+          for k, ch in choices:
+            if not ch.sep and ch.which.len == 0: first = k; break
+          first
       if row.name in last:
         let v = last[row.name]
         for k, ch in choices:
@@ -943,6 +954,7 @@ proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
                              else: ch.which.len == 0 and abs(ch.time - v.time) < 0.0005):
             d.picks[i] = k
             break
+      prev = d.picks[i]
     else:
       d.texts[i] = if row.name in last: last[row.name].value else: row.content
       d.crossed[i] = row.isRect and row.name in last and last[row.name].crossed
@@ -962,14 +974,6 @@ proc entryH(ch: TimeChoice): float32 = (if ch.sep: MenuSeparatorHeight else: Row
 proc entryY(choices: seq[TimeChoice], k: int): float32 =
   ## Top of entry k in the list, from the list's top.
   for ch in choices[0 ..< min(k, choices.len)]: result += ch.entryH
-
-proc stepChoice(choices: seq[TimeChoice], k, dir: int): int =
-  ## The next entry from k in direction dir, skipping separators; k at the end.
-  result = k
-  var j = k + dir
-  while j >= 0 and j < choices.len:
-    if not choices[j].sep: return j
-    j += dir
 
 proc dropRect(r: Rect, i: int): Rect =
   rect(r.x + 16 + PickLabelW, r.y + PickTop + i.float32 * PickRowH, r.w - 32 - PickLabelW, 28)

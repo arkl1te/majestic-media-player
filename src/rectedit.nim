@@ -12,7 +12,7 @@ type
     rgLeft, rgRight, rgTop, rgBottom
 
   RectCursor* = enum
-    rcCross, rcMove, rcMoving, rcResizeH, rcResizeV
+    rcCross, rcMove, rcMoving, rcResizeH, rcResizeV, rcResizeNWSE, rcResizeNESW
 
   VideoMap* = object
     ## Where the video's pixels land in the window: the frame's center and
@@ -97,6 +97,11 @@ proc cursorAt*(e: RectEdit, m: VideoMap, p: Vec2): RectCursor =
     # Which way the side runs on screen: the frame may be turned.
     let side = if g * {rgLeft, rgRight} != {}: vec2(0, 1) else: vec2(1, 0)
     return if abs(rot(side, m.rotation).x) < 0.5: rcResizeH else: rcResizeV
+  if g.len == 2:
+    # A corner: which diagonal it moves along on screen.
+    let c = vec2(if rgRight in g: 1 else: -1, if rgBottom in g: 1 else: -1)
+    let d = rot(c, m.rotation)
+    return if d.x * d.y > 0: rcResizeNWSE else: rcResizeNESW
   if g.len == 0 and e.has and not e.dragging and p.inside(e.screenRect(m)): return rcMove
   rcCross
 

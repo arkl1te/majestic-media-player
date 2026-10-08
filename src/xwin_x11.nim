@@ -104,6 +104,8 @@ const
   InputOutput = 1.cuint
   XaAtom = 4.Atom
   XcLeftPtr = 68.cuint
+  XcBottomLeftCorner = 12.cuint
+  XcBottomRightCorner = 14.cuint
   GrabModeAsync = 1.cint
   GrabSuccess = 0.cint
   Button1to3Mask = 0x700.cuint
@@ -376,6 +378,31 @@ proc ungrabPointer*() =
   if d == nil: return
   discard XUngrabPointer(d, 0)
   discard XFlush(d)
+
+proc XcursorLibraryLoadCursor(d: XDisplay, name: cstring): XID {.importc, cdecl, dynlib: "libXcursor.so(|.1)".}
+
+var diagonalCursors: array[bool, XID]
+
+proc setDiagonalCursor*(window: Window, nwse: bool) =
+  ## A diagonal resize cursor from the cursor theme: nwse runs top-left to
+  ## bottom-right, otherwise top-right to bottom-left. Set behind Windy's back;
+  ## its next cursor= replaces it.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  if diagonalCursors[nwse] == 0:
+    let names = if nwse: ["nwse-resize", "size_fdiag", "bd_double_arrow"]
+                else: ["nesw-resize", "size_bdiag", "fd_double_arrow"]
+    for name in names:
+      diagonalCursors[nwse] = XcursorLibraryLoadCursor(d, name.cstring)
+      if diagonalCursors[nwse] != 0: break
+    if diagonalCursors[nwse] == 0:
+      diagonalCursors[nwse] = XCreateFontCursor(d, if nwse: XcBottomRightCorner else: XcBottomLeftCorner)
+  discard XDefineCursor(d, window.xid, diagonalCursors[nwse])
+  discard XFlush(d)
+
+proc clearDiagonalCursor*(window: Window) =
+  ## Nothing to undo: Windy's cursor= redefines the cursor itself.
+  discard
 
 var hiddenCursorImage: Image
 

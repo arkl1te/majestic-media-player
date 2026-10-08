@@ -33,7 +33,7 @@ type
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick
 
   ContextMenu = enum
-    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat  ## where the right-click menu was opened
+    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog  ## where the right-click menu was opened
 
   PlaylistSort = enum
     psName, psDuration, psDimensions, psSize
@@ -44,7 +44,8 @@ type
     sort: PlaylistSort
 
   PointerShape = enum
-    ptArrow, ptHidden, ptResize, ptResizeV, ptCross, ptMove, ptMoving
+    ptArrow, ptHidden, ptResize, ptResizeV, ptResizeNWSE, ptResizeNESW, ptCross, ptMove,
+    ptMoving, ptText
 
   VideoTransform = object
     pan: Vec2
@@ -113,6 +114,8 @@ type
     rlFollow: bool            ## keep the run log scrolled to its newest line
     rlResizeFrom: (float32, float32)     ## pointer y and height when the drag began
     rlThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
+    rlRows: seq[string]       ## the run log's rows as last drawn, for copying
+    rlSelFrom, rlSelTo: (int, int)       ## selected text: (row, byte offset) where the drag began and where it is
     pickDlg: PickDialog       ## Run window: timestamps and values for a run
     extRun: CommandLine       ## the command line whose external files are asked for
     extQueue: seq[string]     ## its external-file cards still to ask about
@@ -1683,6 +1686,18 @@ proc relabeled(n: MenuNode, label: string): MenuNode =
   result[] = n[]
   result.label = label
 
+proc rlSelection(a: App): string =
+  ## The run log text selected by dragging, its rows joined by newlines.
+  var (s, e) = (a.rlSelFrom, a.rlSelTo)
+  if e < s: swap(s, e)
+  if s == e or s[0] >= a.rlRows.len: return
+  for r in s[0] .. min(e[0], a.rlRows.len - 1):
+    let row = a.rlRows[r]
+    let c0 = if r == s[0]: min(s[1], row.len) else: 0
+    let c1 = if r == e[0]: min(e[1], row.len) else: row.len
+    if r > s[0]: result.add '\n'
+    if c1 > c0: result.add row[c0 ..< c1]
+
 proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let root = newMenuRoot()
   let p = a.player
@@ -2020,6 +2035,18 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
       a.cfg.save())
     (root, sb)
+  of cmRunLog:
+    let rl = newMenuRoot()
+    # The selected text, or the whole log when nothing is selected.
+    let sel = a.rlSelection
+    rl.item("Copy to Clipboard", enabled = a.rlRows.len > 0, action = proc () =
+      if sel.len > 0:
+        setClipboardString(sel)
+        a.osd("Copied the selected text")
+      else:
+        setClipboardString(a.rlRows.join("\n"))
+        a.osd("Copied the run log"))
+    (root, rl)
   of cmPlaylist:
     let pl = newMenuRoot()
     let n = a.playlist.len
@@ -2425,6 +2452,14 @@ proc handleKeys(a: App) =
     elif pressed[KeyHome]: a.propScroll = 0
     elif pressed[KeyEnd]: a.propScroll = float32.high
   if a.overlay != ovNone: return
+
+  # Ctrl+C with text selected in the run log copies that text instead.
+  if pressed[KeyC] and w.ctrl and not w.alt and not w.shiftDown and a.cfg.showRunLog:
+    let sel = a.rlSelection
+    if sel.len > 0:
+      setClipboardString(sel)
+      a.osd("Copied the selected text")
+      return
 
   let (ok, act) = a.cfg.pressedAction(w)
   if ok: a.runAction(act)
@@ -2990,6 +3025,8 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   # View toggles and pan/rotate/scale only show with "Show all shortcuts".
   let all = a.cfg.showAllShortcuts
   let viewToggles = {kaSeekBar, kaControls, kaStatus, kaPlaylist, kaRunLog, kaShowOsd}
+  # Ctrl+C copies the run log's selected text while there is some (handleKeys).
+  let logSel = a.cfg.showRunLog and a.rlSelection.len > 0
   for g in KeyGroup:
     if g == kgPan and not all: continue
     var hints: seq[KeyHint]
@@ -3010,9 +3047,14 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
         case act
         of kaRotateCw: "Rotate " & rot & " CW"
         of kaRotateCcw: "Rotate " & rot & " CCW"
+        of kaCopyClipboard:
+          if logSel and mods == {kmCtrl} and ks.anyIt(it.key == KeyC): "Copy Selected Text"
+          else: Actions[act].hint
         else: Actions[act].hint
       hints.add (ks.mapIt(shortKeyName(it.key)).join("/"), label)
     if hints.len > 0: result.add hints
+  if logSel and mods == {kmCtrl} and not result.anyIt(it.anyIt(it[1] == "Copy Selected Text")):
+    result.add @[("C", "Copy Selected Text")]
   var mouse: seq[KeyHint]
   if mods == {kmCtrl}:
     if a.player.isSpherical:
@@ -3028,6 +3070,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif mods == {kmShift}:
     mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping"),
       ("MDrag", "Pan Zoomed Video")]
+    if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
   if mouse.len > 0: result.add mouse
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
@@ -3303,12 +3346,22 @@ proc runLogPanel(a: App, r: Rect) =
     a.cfg.runLogHeight = clamp(h0 + ui.mouse.y - y0, RunLogMinHeight,
       max(RunLogMinHeight, ui.size.y - below))
 
+  # One row per line: each run's heading, its output, then how it ended.
+  var rows: seq[(string, ColorRGBX)]
+  for i, e in a.runLog:
+    if i > 0: rows.add ("", colText)
+    rows.add (e.started.format("HH:mm:ss") & "  " & e.title & "  —  " & e.dir, colAccent)
+    for line in e.output: rows.add (line, colText)
+    if e.error.len > 0: rows.add (e.error, colError)
+    elif e.running: rows.add ((if e.stopped: "Stopping…" else: "Running…"), colMarker)
+    elif e.stopped: rows.add ("Stopped", colMarker)
+    elif e.code == 0: rows.add ("Finished", colTextDim)
+    else: rows.add (&"Failed (exit code {e.code})", colError)
+  a.rlRows = rows.mapIt(it[0])
+
   let header = rect(r.x, r.y, r.w, RunLogHeaderH)
   let running = a.runLog.countIt(it.running)
-  ui.icon("terminal16", vec2(r.x + 18, header.y + header.h / 2), colAccent)
-  ui.textIn(if running > 0: &"Run log ({running} running)" else: "Run log",
-    rect(r.x + 32, header.y, r.w - 150, header.h), colText)
-  # Header buttons, right to left: Close, Clear (finished runs), Stop (running ones).
+  # Header buttons, right to left: Close, Copy all, Clear (finished runs), Stop (running ones).
   if ui.iconButton("rl-close", rect(r.x + r.w - 30, header.y + 2, 24, 24), "close16", "Close (Ctrl+5)"):
     a.setRunLogShown(false)
   var bx = r.x + r.w - 38
@@ -3323,10 +3376,18 @@ proc runLogPanel(a: App, r: Rect) =
     if hov and ui.pressed():
       ui.consumeClick()
       return true
+  if rows.len > 0 and headerButton("Copy all", "Copy the whole log to the clipboard"):
+    setClipboardString(a.rlRows.join("\n"))
+    a.osd("Copied the run log")
   if a.runLog.len > running and headerButton("Clear", "Remove the finished runs"):
     a.runLog.keepItIf(it.running)
+    a.rlSelFrom = (0, 0)
+    a.rlSelTo = (0, 0)
   if running > 0 and headerButton("Stop", "Stop the running command lines"):
     for e in a.runLog: e.stop()
+  ui.icon("terminal16", vec2(r.x + 18, header.y + header.h / 2), colAccent)
+  ui.textIn(if running > 0: &"Run log ({running} running)" else: "Run log",
+    rect(r.x + 32, header.y, max(0'f32, bx - r.x - 32), header.h), colText)
   ui.rect(rect(r.x, header.y + header.h - 1, r.w, 1), colBorder)
 
   let list = rect(r.x, header.y + header.h, r.w, max(0'f32, r.h - header.h - RunLogGripH))
@@ -3334,18 +3395,6 @@ proc runLogPanel(a: App, r: Rect) =
     ui.textIn("Nothing has run yet. Command lines run from the Run menu show their output here.",
       list, colTextDim, FontSmall, h = CenterAlign)
     return
-
-  # One row per line: each run's heading, its output, then how it ended.
-  var rows: seq[(string, ColorRGBX)]
-  for i, e in a.runLog:
-    if i > 0: rows.add ("", colText)
-    rows.add (e.started.format("HH:mm:ss") & "  " & e.title & "  —  " & e.dir, colAccent)
-    for line in e.output: rows.add (line, colText)
-    if e.error.len > 0: rows.add (e.error, colError)
-    elif e.running: rows.add ((if e.stopped: "Stopping…" else: "Running…"), colMarker)
-    elif e.stopped: rows.add ("Stopped", colMarker)
-    elif e.code == 0: rows.add ("Finished", colTextDim)
-    else: rows.add (&"Failed (exit code {e.code})", colError)
 
   let rowH = RunLogRowH
   let pad = 6'f32
@@ -3383,13 +3432,73 @@ proc runLogPanel(a: App, r: Rect) =
   if a.rlFollow: a.rlScroll = maxScroll
   a.rlScroll = clamp(a.rlScroll, 0, maxScroll)
 
+  # Selecting text: drag over it (scrolling when the pointer leaves the
+  # list), Shift+click extends, a double-click takes a word and a triple-click
+  # the whole log. Ctrl+C copies it (handleKeys); a click elsewhere drops it.
+  let textX = list.x + 12
+  let textArea = rect(list.x, list.y, list.w - RunLogBarW - 4, list.h)
+  proc hitAt(p: Vec2, nearest = true): (int, int) =
+    ## (row, byte offset) of the character boundary nearest to p, or with
+    ## nearest off, where the character under p starts.
+    let i = int(floor((p.y - list.y - pad + a.rlScroll) / rowH))
+    if i < 0: return (0, 0)
+    if i >= rows.len: return (rows.len - 1, rows[^1][0].len)
+    let s = rows[i][0]
+    let x = p.x - textX
+    var lo = 0  # longest prefix not wider than x
+    var hi = s.len
+    while lo < hi:
+      let mid = (lo + hi + 1) div 2
+      if ui.textSize(s[0 ..< mid], FontSmall).x <= x: lo = mid
+      else: hi = mid - 1
+    while lo > 0 and lo < s.len and (s[lo].ord and 0xC0) == 0x80: dec lo
+    if nearest and lo < s.len:
+      var j = lo + 1
+      while j < s.len and (s[j].ord and 0xC0) == 0x80: inc j
+      if x > (ui.textSize(s[0 ..< lo], FontSmall).x + ui.textSize(s[0 ..< j], FontSmall).x) / 2:
+        lo = j
+    (i, lo)
+  if ui.window.buttonPressed[MouseLeft] and not ui.mouse.inside(list):
+    a.rlSelTo = a.rlSelFrom
+  if ui.hover(textArea) and ui.released(MouseRight):
+    a.ctxMenu = cmRunLog
+    a.menus.openContext(ui.mouse)
+  if ui.hover(textArea) and ui.pressed():
+    ui.consumeClick()
+    ui.activeId = "rlselect"
+    let p = hitAt(ui.mouse)
+    let clicks = ui.countClick("rlselect")
+    if clicks == 2:
+      let (row, col) = hitAt(ui.mouse, false)
+      let (w0, w1) = wordAround(rows[row][0].classes, col)
+      (a.rlSelFrom, a.rlSelTo) = ((row, w0), (row, w1))
+    elif clicks >= 3:
+      (a.rlSelFrom, a.rlSelTo) = ((0, 0), (rows.len - 1, rows[^1][0].len))
+    else:
+      if not ui.window.shiftDown: a.rlSelFrom = p
+      a.rlSelTo = p
+  if ui.activeId == "rlselect" and ui.down() and ui.clickCount == 1:
+    if ui.mouse.y < list.y or ui.mouse.y >= list.y + list.h:
+      a.rlScroll = clamp(a.rlScroll + (if ui.mouse.y < list.y: -rowH else: rowH), 0, maxScroll)
+      a.rlFollow = a.rlScroll >= maxScroll
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+    a.rlSelTo = hitAt(ui.mouse)
+  var (selA, selB) = (a.rlSelFrom, a.rlSelTo)
+  if selB < selA: swap(selA, selB)
+
   let textW = list.w - 24 - (if maxScroll > 0: RunLogBarW + 4 else: 0)
-  ui.sk.pushClipRect(rect(list.x, list.y, list.w - RunLogBarW - 4, list.h))
+  ui.sk.pushClipRect(textArea)
   let first = max(0, int((a.rlScroll - pad) / rowH))
   let last = min(rows.len, first + int(list.h / rowH) + 2) - 1
   for i in first .. last:
     let y = list.y + pad + i.float32 * rowH - a.rlScroll
-    ui.textIn(rows[i][0], rect(list.x + 12, y, textW, rowH), rows[i][1], FontSmall)
+    let row = rows[i][0]
+    if selA != selB and i >= selA[0] and i <= selB[0]:
+      let x0 = if i == selA[0]: ui.textSize(row[0 ..< min(selA[1], row.len)], FontSmall).x else: 0
+      let x1 = if i == selB[0]: ui.textSize(row[0 ..< min(selB[1], row.len)], FontSmall).x
+               else: ui.textSize(row, FontSmall).x + 4  # the line break
+      if x1 > x0: ui.rect(rect(textX + x0, y, x1 - x0, rowH), colAccentDim)
+    ui.textIn(row, rect(textX, y, textW, rowH), rows[i][1], FontSmall)
   ui.sk.popClipRect()
 
 proc dropFiles(a: App, paths: seq[string]) =
@@ -3796,7 +3905,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Select next / previous word", "Ctrl+Shift+Right / Left")]),
     ("Drawing a rectangle (Run window)", @[
       ("Confirm / cancel", "Enter / Esc"),
-      ("Move by one pixel", "Arrows")])]
+      ("Move by one pixel", "Arrows")]),
+    ("Run log", @[("Copy selected text", "Ctrl+C")])]
   var view = a.keyRows("View", [
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
     ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
@@ -3832,6 +3942,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
       ("Select word / all in a text field", "Double / Triple-click"),
+      ("Select run log text / extend selection", "Drag / Shift+Click run log"),
+      ("Select word / whole run log", "Double / Triple-click run log"),
       ("Draw on video / keep value (Run window)", "Click / Right-click rectangle icon"),
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
   for col in result.mitems:
@@ -4063,7 +4175,11 @@ proc frame(a: App) =
   let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
     ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) and
     a.overlay == ovNone and not a.menus.isOpen
-  var shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV else: ptArrow
+  let overLog = ui.activeId == "rlselect" or a.cfg.showRunLog and a.runLog.len > 0 and
+    ui.hover(rect(rlRect.x, rlRect.y + RunLogHeaderH, rlRect.w - RunLogBarW - 4,
+      rlRect.h - RunLogHeaderH - RunLogGripH)) and a.overlay == ovNone and not a.menus.isOpen
+  var shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV
+              elif overLog: ptText else: ptArrow
   if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
     shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
       of rcCross: ptCross
@@ -4071,16 +4187,24 @@ proc frame(a: App) =
       of rcMoving: ptMoving
       of rcResizeH: ptResize
       of rcResizeV: ptResizeV
+      of rcResizeNWSE: ptResizeNWSE
+      of rcResizeNESW: ptResizeNESW
   if shape != a.pointerShape:
     a.pointerShape = shape
-    w.cursor = case shape
-      of ptHidden: hiddenCursor()
-      of ptResize: Cursor(kind: ResizeLeftRightCursor)
-      of ptResizeV: Cursor(kind: ResizeUpDownCursor)
-      of ptCross: Cursor(kind: CrosshairCursor)
-      of ptMove: Cursor(kind: OpenHandCursor)
-      of ptMoving: Cursor(kind: ClosedHandCursor)
-      of ptArrow: Cursor(kind: ArrowCursor)
+    if shape in {ptResizeNWSE, ptResizeNESW}:
+      # Windy has no diagonal cursors.
+      w.setDiagonalCursor(nwse = shape == ptResizeNWSE)
+    else:
+      w.clearDiagonalCursor()
+      w.cursor = case shape
+        of ptHidden: hiddenCursor()
+        of ptResize: Cursor(kind: ResizeLeftRightCursor)
+        of ptResizeV: Cursor(kind: ResizeUpDownCursor)
+        of ptCross: Cursor(kind: CrosshairCursor)
+        of ptMove: Cursor(kind: OpenHandCursor)
+        of ptMoving: Cursor(kind: ClosedHandCursor)
+        of ptText: Cursor(kind: IBeamCursor)
+        of ptArrow, ptResizeNWSE, ptResizeNESW: Cursor(kind: ArrowCursor)
 
   a.sk.endUi()
   a.drawPreview(fb)

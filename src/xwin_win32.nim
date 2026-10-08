@@ -55,6 +55,7 @@ type Hook = ref object
   chrome, minSize: IVec2     ## client-area sizes
   dragging: bool
   dragOffset: IVec2          ## pointer minus outer top-left, in screen pixels
+  cursor: HCURSOR            ## shown instead of Windy's cursor; 0: Windy's
 
 var hooks: seq[Hook]
 
@@ -114,6 +115,10 @@ proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.std
   of WM_DROPFILES:
     k.dropFiles(cast[HANDLE](wParam))
     return 0
+  of WM_SETCURSOR:
+    if k.cursor != 0 and (lParam and 0xFFFF) == HTCLIENT:
+      discard SetCursor(k.cursor)
+      return 1
   of WM_MOUSEMOVE:
     if k.dragging:
       var p: POINT
@@ -248,6 +253,19 @@ proc grabPointer*(window: Window): bool =
 proc ungrabPointer*() =
   if grabbedBy != 0 and GetCapture() == grabbedBy: discard ReleaseCapture()
   grabbedBy = 0
+
+proc setDiagonalCursor*(window: Window, nwse: bool) =
+  ## A diagonal resize cursor, which Windy lacks: nwse runs top-left to
+  ## bottom-right, otherwise top-right to bottom-left.
+  let k = hookFor(window.hwnd)
+  if k == nil: return
+  k.cursor = LoadCursorW(0, if nwse: IDC_SIZENWSE else: IDC_SIZENESW)
+  discard SetCursor(k.cursor)
+
+proc clearDiagonalCursor*(window: Window) =
+  ## Back to Windy's cursor (set it right after).
+  let k = hookFor(window.hwnd)
+  if k != nil: k.cursor = 0
 
 var hiddenCursorImage: Image
 
