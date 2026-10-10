@@ -134,6 +134,7 @@ The Run menu runs its command lines with Git for Windows' bash (set
 | `src/options.nim` | Options window (page tree and pages) |
 | `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
 | `src/instance.nim`, `src/peers.nim`, `src/ipc.nim` | Single-instance hand-over, Synchronize links, local sockets |
+| `src/syncdlg.nim` | Synchronize ▸ Properties window (masters, slaves, offset, looping) |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
 | `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
 | `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity, Windows common dialogs), palette, vector icons |

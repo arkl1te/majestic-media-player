@@ -5,7 +5,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit
+  rectedit, syncdlg
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -30,7 +30,7 @@ const
 
 type
   Overlay = enum
-    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick
+    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync
 
   ContextMenu = enum
     cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog  ## where the right-click menu was opened
@@ -53,6 +53,14 @@ type
     zoom: float32 = 1
     scaleX: float32 = 1
     scaleY: float32 = 1
+
+  MasterClock = object
+    ## A slave's view of its master's playback, in the master's time.
+    known: bool               ## heard from the master since joining
+    loaded, playing, stopped: bool
+    t: float                  ## master time at `at`
+    at: float                 ## when, our clock
+    speed: float = 1
 
   SubLayout = object
     alignX: int = 1           ## 0 left, 1 center, 2 right
@@ -135,6 +143,20 @@ type
     syncMembers: seq[int]     ## the group, master included
     syncQuiet: bool           ## acting on a peer's command (or on our own EOF):
                               ## don't repeat it to the group
+    followOffset: float       ## Synchronize > Properties, as a slave: start this long after the master
+    followLoop: bool          ## as a slave: loop on our own until the master ends
+    clock: MasterClock        ## as a slave: where the master is
+    clockHeldUntil: float     ## a playback action is in flight: no ticks out (master)
+                              ## or in (slave) until then
+    tickAt, tickT: float      ## master: when the last tick went out, and its time
+    followRunning: bool       ## slave: following has the file playing
+    followSought: float       ## slave: time following last sought to while held, NaN when none
+    followFixAt: float        ## slave: when following last corrected the playing file
+    followLoopSet: string     ## slave: loop-file as following last set it
+    syncDlg: SyncDialog       ## Synchronize > Properties, its window created on first use
+    syncWin: Window
+    syncSk: Silky
+    syncUi: Ui
     props: seq[InfoSection]   ## File > Properties report
     propScroll: float32
     propPageH: float32        ## height of its scrolling body, for Page Up / Down
@@ -367,10 +389,22 @@ proc applyKeepAwake(a: App) =
 # out as absolute positions, clamped to each file's duration. The master (the
 # player that started the group) owns the membership and keeps its playlist;
 # the others' playlists are emptied and locked while synchronized.
+#
+# The others (slaves) follow the master's clock: times on the wire are the
+# master's, and every action and the master's periodic ticks update a slave's
+# view of that clock (MasterClock); `follow` then keeps its file where the
+# clock says, offset (Synchronize > Properties) and looping included.
 
 proc synced(a: App): bool = a.syncMaster != 0
 
 proc isSyncMaster(a: App): bool = a.synced and a.syncMaster == a.peers.pid
+
+proc isSlave(a: App): bool = a.synced and not a.isSyncMaster
+
+proc masterNow(a: App): float =
+  ## Slave: the master's time now, from its last known time and rate.
+  let c = a.clock
+  c.t + (if c.playing: (now() - c.at) * c.speed else: 0.0)
 
 proc playlistLocked(a: App): bool = a.synced and not a.isSyncMaster
 
@@ -389,8 +423,67 @@ template quietly(a: App, body: untyped) =
 proc syncSend(a: App, fields: varargs[string]) =
   ## Repeats a playback action on the other synchronized players.
   if a.syncQuiet or not a.synced: return
+  a.clockHeldUntil = now() + 0.5
   for m in a.syncMembers:
     if m != a.peers.pid: a.peers.send(m, fields)
+
+proc clockAction(a: App, f: openArray[string]) =
+  ## Slave: a playback action of the group (master time) moves our view of
+  ## the master's clock; following does the rest.
+  template num(i: int): float =
+    (try: parseFloat(f[i]) except ValueError, IndexDefect: 0.0)
+  let c = addr a.clock
+  c.t = a.masterNow
+  c.at = now()
+  case f[0]
+  of "play":
+    c.playing = true
+    c.stopped = false
+  of "pause":
+    c.playing = false
+    c.t = num(1)
+  of "stop":
+    c.playing = false
+    c.stopped = true
+    c.t = 0
+  of "seek":
+    c.t = max(num(1), 0)
+    c.stopped = false
+  of "speed": c.speed = num(1)
+  of "frame": c.playing = false  # a frame step pauses
+  else: discard
+
+proc followTarget(a: App): tuple[t: float, run: bool] =
+  ## Slave: where the master's clock puts our file, and whether it plays.
+  ## It waits at its start until the master reaches the offset, then goes
+  ## along; past its end it loops on its own (Continue looping) or holds the
+  ## last frame until the master loops.
+  let dur = a.player.duration
+  let rel = a.masterNow - a.followOffset
+  if rel < 0: (0.0, false)
+  elif rel < dur: (rel, a.clock.playing)
+  elif a.followLoop: (floorMod(rel, dur), a.clock.playing)
+  else: (dur, false)
+
+proc slaveFrame(a: App, forward: bool) =
+  ## Slave: a frame step of the group. It pauses the master; our file steps
+  ## too when within reach, and the master's next tick sets the exact time.
+  a.clockAction(["frame"])
+  a.followRunning = false
+  let (t, _) = a.followTarget
+  a.followSought = t  # no seek back to where the step began
+  let rel = a.masterNow - a.followOffset
+  if a.player.loaded and rel >= 0 and (rel < a.player.duration or a.followLoop):
+    a.player.stopped = false
+    a.player.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
+
+proc slaveDo(a: App, fields: varargs[string]): bool =
+  ## Slave: a playback control used here goes to the group, in master time,
+  ## and drives our view of the master's clock. False when not a slave.
+  if not a.isSlave or a.syncQuiet: return false
+  a.syncSend(fields)
+  a.clockAction(fields)
+  true
 
 proc clampTime(a: App, t: float): float =
   ## A group member's time on this player's (perhaps shorter) file.
@@ -608,16 +701,19 @@ proc reopenLast(a: App): bool =
 
 proc play(a: App) =
   if a.reopenLast(): return
+  if a.slaveDo("play"): return
   let restart = a.player.eofReached  # Play at the end starts over
   a.player.play()
   if restart: a.syncSend("seek", "0", "true")
   a.syncSend("play")
 
 proc pause(a: App) =
+  if a.slaveDo("pause", $a.masterNow): return
   a.player.pause()
   a.syncSend("pause", $a.player.timePos)
 
 proc stop(a: App) =
+  if a.slaveDo("stop"): return
   a.player.stop()
   a.syncSend("stop")
 
@@ -630,6 +726,7 @@ proc playPause(a: App) =
   if not a.reopenLast(): a.togglePlay()
 
 proc seekTo(a: App, t: float, exact = true) =
+  if a.slaveDo("seek", $(t + a.followOffset), $exact): return
   a.player.stopped = false
   a.player.seek(a.clampTime(t), exact)
   a.syncSend("seek", $t, $exact)
@@ -889,6 +986,7 @@ proc changeRate(a: App, dir: float) =
   if not a.player.loaded: return
   let s = clamp(a.player.speed + dir * a.cfg.rateStep, 0.1, 100.0)  # 100 = mpv's own maximum
   a.player.h.setProp("speed", s)
+  if a.isSlave: a.clock.speed = s
   a.syncSend("speed", $s)
   a.osd(&"Speed: {s:.2f}x")
 
@@ -901,12 +999,17 @@ proc setTrack(a: App, prop: string, id: int) =
 
 proc frameStep(a: App, forward: bool) =
   if not a.player.loaded: return
+  if a.isSlave and not a.syncQuiet:
+    a.syncSend("frame", $forward)
+    a.slaveFrame(forward)
+    return
   a.player.stopped = false
   a.player.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
   a.syncSend("frame", $forward)
 
 proc seekRelative(a: App, d: float) =
   if a.player.loaded:
+    if a.slaveDo("seek", $(a.masterNow + d), "false"): return
     a.player.stopped = false
     a.player.h.commandAsync("seek", $d, "relative")
     a.syncSend("seek", $(a.player.timePos + d), "false")
@@ -992,9 +1095,12 @@ proc chapterStep(a: App, d: int) =
       a.osd(marks[bi].label(bi))
       return
   if p.chapters.len > 0:
+    let j = cur + d
+    if a.isSlave:  # the master's clock moves, not just this file
+      if j >= 0 and j < p.chapters.len: a.seekTo(p.chapters[j].time)
+      return
     p.h.commandStr("osd-msg add chapter " & $d)
     # The others' files have chapters of their own: send where this one lands.
-    let j = cur + d
     if j >= 0 and j < p.chapters.len: a.syncSend("seek", $p.chapters[j].time, "true")
 
 proc nearestBookmark(a: App, t: float): int =
@@ -1052,7 +1158,7 @@ proc xfChanged(a: App, msg: string) =
 proc syncState(a: App): seq[string] =
   ## Where the master's playback is, for players joining the group.
   let p = a.player
-  @["state", $p.loaded, $p.timePos, $p.paused, $p.stopped, $p.speed]
+  @["state", $p.loaded, $p.timePos, $(p.paused or p.eofReached), $p.stopped, $p.speed]
 
 proc setGroup(a: App, members: seq[int]) =
   ## Master (or a player about to become one): the new membership. Newcomers
@@ -1094,39 +1200,112 @@ proc syncRequest(a: App, op: string, pid = 0) =
   else:
     a.handleSyncRequest(op, pid)
 
+proc leftGroup(a: App) =
+  ## No longer synchronized: our own repeat setting is back, the master's
+  ## clock forgotten.
+  a.syncMaster = 0
+  a.syncMembers.setLen 0
+  a.clock = MasterClock()
+  a.followLoopSet = ""
+  a.applyLoop()
+
 proc leaveGroup(a: App) =
   ## Before joining another group.
   if a.isSyncMaster: a.setGroup(@[])
   elif a.synced: a.peers.send(a.syncMaster, "request", "remove", $a.peers.pid)
-  a.syncMaster = 0
-  a.syncMembers.setLen 0
+  a.leftGroup()
 
 proc joined(a: App) =
   ## Just joined a group: the playlist empties (and stays locked); the open
-  ## file keeps playing.
+  ## file follows the master from where it is.
   a.playlist.setLen 0
   a.plIndex = -1
   a.plSelected = -1
   a.plScroll = 0
+  a.clock = MasterClock()
+  a.followRunning = a.player.playing
+  a.followSought = NaN
+  a.followFixAt = 0
+  a.followLoopSet = ""
+
+proc setFollow(a: App, offset: float, loop: bool) =
+  ## Our settings as a slave (Synchronize > Properties); the file is placed
+  ## again right away.
+  a.followOffset = max(offset, 0)
+  a.followLoop = loop
+  a.followSought = NaN
+  a.followFixAt = 0
 
 proc remotePlay(a: App) =
-  ## Unlike Play here, doesn't restart a file that ended: one shorter than the
-  ## master's stays at its end until the group seeks back.
+  ## Unlike Play here, doesn't restart a file that ended.
   let p = a.player
   if not p.loaded: return
   p.stopped = false
   p.h.setProp("pause", false)
 
-proc applyState(a: App, loaded: bool, t: float, paused, stopped: bool, speed: float) =
-  ## Joins the master's playback: same time (clamped), pause state and rate.
+proc setClock(a: App, loaded: bool, t: float, paused, stopped: bool, speed: float) =
+  ## Slave: the master's playback as it reported it.
+  a.clock = MasterClock(known: true, loaded: loaded, playing: not paused and not stopped,
+    stopped: stopped, t: t, at: now(), speed: speed)
+  if a.player.loaded and speed > 0 and speed != a.player.speed:
+    a.player.h.setProp("speed", speed)
+
+proc follow(a: App) =
+  ## Slave: keeps our file where the master's clock puts it. Seeks while
+  ## playing only on real drift (or a jump of the master), so both play on
+  ## undisturbed.
   let p = a.player
-  if not loaded or not p.loaded: return
-  p.h.setProp("speed", speed)
-  if stopped:
-    a.stop()
+  if not a.isSlave or not a.clock.known or not a.clock.loaded or not p.loaded or
+     p.duration <= 0: return
+  if a.clock.stopped:
+    if not p.stopped:
+      p.stop()
+      a.followRunning = false
+      a.followSought = 0
+    return
+  p.stopped = false
+  let (t, run) = a.followTarget
+  # mpv loops the file itself, without a seek's hitch.
+  let loop = if a.followLoop and a.masterNow >= a.followOffset: "inf" else: "no"
+  if loop != a.followLoopSet:
+    a.followLoopSet = loop
+    p.h.setProp("loop-file", loop)
+  let tnow = now()
+  if run:
+    if not a.followRunning:
+      a.followRunning = true
+      a.followSought = NaN
+      a.followFixAt = tnow
+      p.seek(t)
+      p.h.setProp("pause", false)
+    elif tnow - a.followFixAt > 1 and not p.seeking:
+      var d = abs(p.timePos - t)
+      if a.followLoop: d = min(d, p.duration - d)
+      if d > 0.35 or p.paused:  # drifted, or the master jumped
+        a.followFixAt = tnow
+        p.seek(t)
+        p.h.setProp("pause", false)
   else:
-    a.seekTo(t)
-    if paused: a.pause() else: a.remotePlay()
+    if a.followRunning:
+      a.followRunning = false
+      p.pause()
+    if t >= p.duration and p.eofReached: a.followSought = t  # on the last frame already
+    if math.isNaN(a.followSought) or abs(t - a.followSought) > 0.0005:
+      a.followSought = t
+      p.seek(t)
+
+proc syncTick(a: App) =
+  ## Master: where playback is, to the slaves a few times a second, and right
+  ## away when the file looped. Held back while an action is in flight.
+  if not a.isSyncMaster: return
+  let p = a.player
+  let t = now()
+  if t < a.clockHeldUntil or p.seeking: return
+  if t - a.tickAt < 0.25 and p.timePos >= a.tickT - 0.5: return
+  a.tickAt = t
+  a.tickT = p.timePos
+  for m in a.syncMembers:
+    if m != a.peers.pid: a.peers.send(m, a.syncState)
 
 proc handlePeerMessage(a: App, m: Message) =
   let f = m.fields
@@ -1146,24 +1325,41 @@ proc handlePeerMessage(a: App, m: Message) =
       a.syncMembers = members
       if isNew: a.joined()
     elif a.syncMaster == m.sender:  # left the group, or it was dissolved
-      a.syncMaster = 0
-      a.syncMembers.setLen 0
+      a.leftGroup()
     return
-  of "request":
-    if a.isSyncMaster and m.sender in a.syncMembers:
-      a.handleSyncRequest(arg(1), int(num(2)))
+  of "request":  # op pid
+    # Members ask the master; Synchronize > Properties on any player asks
+    # the master to be (or a slave's master) to take or let go of a player.
+    let op = arg(1)
+    if a.isSyncMaster and m.sender in a.syncMembers or
+       op in ["add", "remove"] and not a.isSlave:
+      a.handleSyncRequest(op, int(num(2)))
+    return
+  of "follow":  # offset loop: our settings as a slave, from any player's Properties
+    a.setFollow(num(1), flag(2))
     return
   else: discard
   # Everything else only from our own group.
   if not a.synced or m.sender notin a.syncMembers: return
-  a.quietly:
+  if a.isSlave:  # all of it moves the master's clock; following does the rest
     case f[0]
     of "state":
-      if m.sender == a.syncMaster: a.applyState(flag(1), num(2), flag(3), flag(4), num(5))
+      if m.sender == a.syncMaster and (not a.clock.known or now() >= a.clockHeldUntil):
+        a.setClock(flag(1), num(2), flag(3), flag(4), num(5))
+    of "play", "pause", "stop", "seek": a.clockAction(f)
+    of "frame": a.slaveFrame(flag(1))
+    of "speed":
+      a.clockAction(f)
+      if a.player.loaded: a.player.h.setProp("speed", num(1))
+    else: discard
+    return
+  # Master: a slave's playback controls, in our time.
+  a.clockHeldUntil = now() + 0.5
+  a.quietly:
+    case f[0]
     of "open":  # files launched on a member go into the master's playlist
-      if a.isSyncMaster:
-        a.syncQuiet = false
-        a.openPaths(f[1 .. ^1])
+      a.syncQuiet = false
+      a.openPaths(f[1 .. ^1])
     of "play": a.remotePlay()
     of "pause":
       a.pause()
@@ -1184,12 +1380,49 @@ proc pollPeers(a: App): bool =
   for pid in a.peers.takeGone():
     result = true
     if pid == a.syncMaster:
-      a.syncMaster = 0
-      a.syncMembers.setLen 0
+      a.leftGroup()
       a.osd("Synchronization ended: the master player closed")
     elif a.isSyncMaster and pid in a.syncMembers:
       a.setGroup(a.syncMembers.filterIt(it != pid))
-  a.peers.announce(a.player.path.extractFilename, a.syncMaster)
+  a.syncTick()
+  a.follow()
+  a.peers.announce(a.player.path.extractFilename, a.syncMaster, a.followOffset, a.followLoop)
+
+# --- synchronize: Properties window ---------------------------------------
+
+proc syncInstances(a: App): seq[SyncInstance] =
+  ## Every player found, this one included, by pid.
+  if a.peers == nil: return
+  result.add SyncInstance(pid: a.peers.pid, title: a.player.path.extractFilename,
+    master: a.syncMaster, offset: a.followOffset, loop: a.followLoop, me: true)
+  for p in a.peers.peers:
+    result.add SyncInstance(pid: p.pid, title: p.title, master: p.master, offset: p.offset,
+      loop: p.loop)
+  result.sort(proc (x, y: SyncInstance): int = cmp(x.pid, y.pid))
+
+proc setMasterOf(a: App, pid, master: int) =
+  ## pid follows master from now on (0: none). Membership is the master's:
+  ## the new master takes pid in (it leaves its old group by itself), or the
+  ## current one lets it go.
+  let me = a.peers.pid
+  proc ask(on: int, op: string) =
+    if on == me: a.handleSyncRequest(op, pid)
+    else: a.peers.send(on, "request", op, $pid)
+  if master != 0: ask(master, "add")
+  else:
+    let peer = a.peers.find(pid)
+    let cur = if pid == me: a.syncMaster elif peer != nil: peer.master else: 0
+    if cur != 0 and cur != pid: ask(cur, "remove")
+
+proc setFollowOf(a: App, pid: int, offset: float, loop: bool) =
+  ## pid's offset and looping as a slave; it keeps them itself. The list
+  ## shows them right away, before pid announces them.
+  if pid == a.peers.pid:
+    a.setFollow(offset, loop)
+    return
+  a.peers.send(pid, "follow", $offset, $loop)
+  let peer = a.peers.find(pid)
+  if peer != nil: (peer.offset, peer.loop) = (max(offset, 0), loop)
 
 # --- dialogs ----------------------------------------------------------------
 
@@ -1489,13 +1722,14 @@ proc applyUiScale(a: App) =
   if s == a.sk.uiScale: return
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
     sk.atlasScale = s
     sk.uploadAtlas()
-  for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize)]:
+  for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
+                    (a.syncWin, SyncSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
@@ -1524,6 +1758,24 @@ proc closeRename(a: App) =
   a.overlay = ovNone
   if a.renWin.visible:
     a.renWin.visible = false
+    a.window.activate()
+
+proc showSyncProps(a: App) =
+  ## Opens Synchronize > Properties on this player.
+  a.menus.close()
+  if a.syncWin == nil:
+    (a.syncWin, a.syncSk, a.syncUi) = a.newDialogWindow("Synchronize Properties", SyncSize)
+    a.syncDlg = newSyncDialog()
+  a.syncDlg.selected = a.peers.pid
+  a.syncUi.focusId = ""
+  a.showDialog(a.syncWin, SyncSize)
+  a.overlay = ovSync
+
+proc closeSyncProps(a: App) =
+  a.syncUi.focusId = ""
+  a.overlay = ovNone
+  if a.syncWin.visible:
+    a.syncWin.visible = false
     a.window.activate()
 
 proc latestCommandLine(a: App): CommandLine =
@@ -1927,6 +2179,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   syn.item("Connect All", enabled = others.anyIt(it.pid notin a.syncMembers),
     action = proc () = a.syncRequest("all"))
   syn.item("Disconnect All", enabled = a.synced, action = proc () = a.syncRequest("none"))
+  syn.item("Properties...", enabled = a.peers != nil, action = proc () = a.showSyncProps())
   syn.sep()
   if others.len == 0:
     syn.item("No other players running", enabled = false)
@@ -2393,9 +2646,11 @@ proc runAction(a: App, act: KeyAction) =
   of kaSeek10 .. kaSeek90:
     if a.player.loaded:
       let k = act.ord - kaSeek10.ord + 1
-      a.player.stopped = false
-      a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
-      a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
+      if a.isSlave: a.seekTo(a.player.duration * k.float / 10)
+      else:
+        a.player.stopped = false
+        a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
+        a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
   of kaNextChapter: a.chapterStep(1)
   of kaPrevChapter: a.chapterStep(-1)
   of kaNextFile: a.navigate(1)
@@ -2436,7 +2691,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovPick}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovPick, ovSync}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -3536,9 +3791,7 @@ proc syncOutline(a: App, r: Rect) =
   ## master, dashed around the others.
   if not a.synced: return
   let ui = a.ui
-  # A hue per master, kept semi-saturated so it reads on dark and on video.
-  let hue = float32((a.syncMaster * 137) mod 360)
-  let col = hsl(hue, 55, 60).color.rgbx
+  let col = groupColor(a.syncMaster)
   const t = 1'f32
   if a.isSyncMaster:
     ui.border(r, col, t)
@@ -3671,6 +3924,42 @@ proc renderRename(a: App, shot: string) =
     a.closeRename()
   elif esc:
     a.closeRename()
+
+proc renderSyncProps(a: App, shot: string) =
+  ## Draws Synchronize > Properties; its changes apply as they are made.
+  if a.overlay != ovSync: return
+  let w = a.syncWin
+  let ui = a.syncUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeSyncProps()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let all = a.syncInstances
+  if not a.beginDialogDraw(w, a.syncSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.syncSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let d = a.syncDlg
+  let action = d.draw(ui, rect(vec2(0, 0), ui.size), all)
+  ui.drawTooltip()
+  a.syncSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-sync.png")
+  a.endDialogDraw(w, a.syncSk, size)
+  let sel = all.filterIt(it.pid == d.selected)
+  case action
+  of saNone: discard
+  of saClose: a.closeSyncProps()
+  of saMaster: a.setMasterOf(d.selected, d.newMaster)
+  of saOffset:
+    if sel.len > 0: a.setFollowOf(d.selected, d.newOffset, sel[0].loop)
+  of saLoop:
+    if sel.len > 0: a.setFollowOf(d.selected, sel[0].offset, d.newLoop)
 
 proc renderCommands(a: App, shot: string) =
   ## Draws the Commands window window and carries out its buttons.
@@ -4147,6 +4436,8 @@ proc frame(a: App) =
       if ui.pressed(): a.cmdWin.activate()
     of ovPick:
       if ui.pressed() and a.rectEdit == nil: a.pickWin.activate()
+    of ovSync:
+      if ui.pressed(): a.syncWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -4224,6 +4515,7 @@ proc frame(a: App) =
   a.renderRename(shot)
   a.renderCommands(shot)
   a.renderPick(shot)
+  a.renderSyncProps(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -4234,6 +4526,7 @@ proc keyUi(a: App): Ui =
   of ovRename: a.renUi
   of ovCommands: a.cmdUi
   of ovPick: a.pickUi
+  of ovSync: a.syncUi
   else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
@@ -4328,10 +4621,21 @@ proc runScriptStep(a: App, st: ScriptStep) =
     if arg == "addany":
       if a.peers != nil and a.peers.peers.len > 0: a.syncRequest("add", a.peers.peers[0].pid)
     else: a.syncRequest(st.args[0], if st.args.len > 1: parseInt(st.args[1]) else: 0)
+  of "syncprops": a.showSyncProps()  # Synchronize > Properties
+  of "syncmaster":  # pid master: the Properties window's Master (pid 0: this player; p: the first peer)
+    let v = st.args.mapIt(if it == "p": a.peers.peers[0].pid else: parseInt(it))
+    a.setMasterOf(if v[0] == 0: a.peers.pid else: v[0], v[1])
+  of "syncselect":  # index [open]: select the Properties window's nth player, opening its Master list
+    let all = a.syncInstances
+    a.syncDlg.selected = all[parseInt(st.args[0])].pid
+    a.syncDlg.listOpen = st.args.len > 1
+  of "syncfollow":  # offset loop: this player's settings as a slave
+    a.setFollow(parseFloat(st.args[0]), st.args[1] == "1")
   of "syncdump":
     if a.peers == nil: return
     stderr.writeLine "sync ", a.peers.pid, " master=", a.syncMaster, " members=", $a.syncMembers,
-      " peers=", $a.peers.peers.mapIt((it.pid, it.title, it.master)),
+      " offset=", a.followOffset, " loop=", a.followLoop, " clock=", a.masterNow,
+      " peers=", $a.peers.peers.mapIt((it.pid, it.title, it.master, it.offset, it.loop)),
       " playlist=", $a.playlist.mapIt(it.extractFilename), " index=", a.plIndex,
       " path=", a.player.path.extractFilename, " t=", a.player.timePos,
       " paused=", a.player.paused, " stopped=", a.player.stopped, " speed=", a.player.speed
@@ -4471,6 +4775,7 @@ proc main() =
     if a.renWin != nil: a.renWin.runeInputEnabled = true
     if a.cmdWin != nil: a.cmdWin.runeInputEnabled = true
     if a.pickWin != nil: a.pickWin.runeInputEnabled = true
+    if a.syncWin != nil: a.syncWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
@@ -4486,6 +4791,7 @@ proc main() =
       if a.overlay == ovRename: a.closeRename()
       if a.overlay == ovCommands: a.closeCommands()
       if a.overlay == ovPick: a.closePick()
+      if a.overlay == ovSync: a.closeSyncProps()
       a.overlay = ovNone
       a.ui.focusId = ""
       a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))
@@ -4510,8 +4816,9 @@ proc main() =
       a.lookDragging = false
       a.updateTitle()
       # The master moved to another file: the group follows to its start time.
-      a.syncSend("seek", $a.resumedAt, "true")
-      a.syncSend("play")
+      if not a.isSlave:
+        a.syncSend("seek", $a.resumedAt, "true")
+        a.syncSend("play")
       if a.resumedAt > 0:
         a.osd("Resumed at " & fmtTime(a.resumedAt))
         a.resumedAt = 0

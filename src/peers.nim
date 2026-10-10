@@ -12,6 +12,8 @@ type
     pid*: int
     title*: string            ## what its window shows
     master*: int              ## its synchronization master, 0 when none
+    offset*: float            ## as a slave: seconds behind its master
+    loop*: bool               ## as a slave: loops on its own until the master ends
     sock: Socket
     buf: string
 
@@ -26,7 +28,8 @@ type
     peers*: seq[Peer]
     unnamed: seq[Peer]        ## accepted, waiting for their hello
     lastScan: float
-    title, master: string     ## last announced, repeated to new peers
+    title: string             ## last announced, repeated to new peers
+    status: seq[string]       ## master, offset, loop: likewise
     gone*: seq[int]           ## peers lost since the last poll
 
 proc escape(s: string): string =
@@ -59,7 +62,7 @@ proc write(p: Peer, data: string): bool =
 
 proc greet(n: PeerNet, p: Peer): bool =
   p.write(encode(["hello", $n.pid])) and p.write(encode(["title", n.title])) and
-    p.write(encode(["status", n.master]))
+    p.write(encode(@["status"] & n.status))
 
 proc startPeerNet*(): PeerNet =
   ## Listens for other players; nil when the socket can't be made.
@@ -75,7 +78,7 @@ proc startPeerNet*(): PeerNet =
   except CatchableError as e:
     stderr.writeLine "synchronize: cannot listen on ", path, ": ", e.msg
     return nil
-  PeerNet(pid: pid, dir: dir, path: path, server: s, master: "0")
+  PeerNet(pid: pid, dir: dir, path: path, server: s, status: @["0", "0", "false"])
 
 proc find*(n: PeerNet, pid: int): Peer =
   if n == nil: return
@@ -93,16 +96,17 @@ proc send*(n: PeerNet, pid: int, fields: varargs[string]) =
   let p = n.find(pid)
   if p != nil and not p.write(encode(fields)): n.drop(p)
 
-proc announce*(n: PeerNet, title: string, master: int) =
-  ## Tells every peer this player's title and master when they change.
+proc announce*(n: PeerNet, title: string, master: int, offset: float, loop: bool) =
+  ## Tells every peer this player's title, master and slave settings when
+  ## they change.
   if n == nil: return
-  let m = $master
+  let st = @[$master, $offset, $loop]
   if title != n.title:
     n.title = title
     for p in n.peers: n.send(p.pid, "title", title)
-  if m != n.master:
-    n.master = m
-    for p in n.peers: n.send(p.pid, "status", m)
+  if st != n.status:
+    n.status = st
+    for p in n.peers: n.send(p.pid, @["status"] & st)
 
 proc scan(n: PeerNet) =
   ## Connects to players with a higher pid that we don't know yet; removes
@@ -177,11 +181,14 @@ proc poll*(n: PeerNet): seq[Message] =
       if f.len == 0: continue
       case f[0]
       of "title": p.title = if f.len > 1: f[1] else: ""
-      of "status":
+      of "status":  # master offset loop
         p.master = 0
-        if f.len > 1:
-          try: p.master = parseInt(f[1])
-          except ValueError: discard
+        p.offset = 0
+        try:
+          if f.len > 1: p.master = parseInt(f[1])
+          if f.len > 2: p.offset = parseFloat(f[2])
+        except ValueError: discard
+        p.loop = f.len > 3 and f[3] == "true"
       else: result.add Message(sender: p.pid, fields: f)
     if not open: n.drop(p)
 
