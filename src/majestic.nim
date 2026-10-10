@@ -2556,17 +2556,19 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     sb.item("Add Bookmark", enabled = loaded and not on, action = proc () = a.addBookmark(t))
     sb.item("Edit Bookmark...", enabled = on, action = proc () = a.showRename(i))
     sb.item("Remove Bookmark", enabled = on, action = proc () = a.removeBookmark(bt))
-    if a.ctxOnMarker:
-      let mt = a.ctxMarkerT
-      sb.sep()
-      for (isB, has, lt, name) in [(false, a.hasLoopA, a.loopA, "Loop A"),
-                                   (true, a.hasLoopB, a.loopB, "Loop B")]:
-        if has and abs(lt - mt) < 0.001:
-          sb.check(name, checked = true, action = bindAct(proc (b: bool) = a.unsetLoopMark(b), isB))
-        else:
-          sb.check(name, checked = false, action = bindAct(proc (b: bool) = a.setLoopMark(b, mt), isB))
-      sb.item("Clear Loop", enabled = a.hasLoopA or a.hasLoopB, action = proc () =
-        a.clearLoopMarks(); a.osd("Loop cleared"))
+    # Loop marks go at the marker clicked on, else at the time clicked.
+    let mt = if a.ctxOnMarker: a.ctxMarkerT else: t
+    sb.sep()
+    for (isB, has, lt, name) in [(false, a.hasLoopA, a.loopA, "Loop A"),
+                                 (true, a.hasLoopB, a.loopB, "Loop B")]:
+      if has and abs(lt - mt) < 0.001:
+        sb.check(name, checked = true, enabled = loaded,
+          action = bindAct(proc (b: bool) = a.unsetLoopMark(b), isB))
+      else:
+        sb.check(name, checked = false, enabled = loaded,
+          action = bindAct(proc (b: bool) = a.setLoopMark(b, mt), isB))
+    sb.item("Clear Loop", enabled = a.hasLoopA or a.hasLoopB, action = proc () =
+      a.clearLoopMarks(); a.osd("Loop cleared"))
     sb.sep()
     sb.check("Bookmarks as chapters", checked = a.cfg.bookmarksAsChapters, action = proc () =
       a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
@@ -3422,15 +3424,19 @@ proc seekBarContext(a: App, pos: Vec2) =
     if d <= best:
       best = d
       a.ctxBookmark = i
-  # Nearest chapter or bookmark, for the loop marks.
+  # Nearest chapter, bookmark or loop mark, for the loop marks.
   a.ctxOnMarker = a.ctxBookmark >= 0
   if a.ctxOnMarker: a.ctxMarkerT = a.fileBookmarks[a.ctxBookmark].time
-  for c in a.player.chapters:
-    let d = abs(x0 + w * (c.time / dur) - pos.x)
+  var times: seq[float]
+  for c in a.player.chapters: times.add c.time
+  if a.hasLoopA: times.add a.loopA
+  if a.hasLoopB: times.add a.loopB
+  for mt in times:
+    let d = abs(x0 + w * (mt / dur) - pos.x)
     if d < best or (d <= best and not a.ctxOnMarker):
       best = d
       a.ctxOnMarker = true
-      a.ctxMarkerT = c.time
+      a.ctxMarkerT = mt
   a.ctxMenu = cmSeekBar
   a.menus.openContext(pos)
 
@@ -3464,22 +3470,29 @@ proc seekBar(a: App, r: Rect) =
         let lx = round(x0 + w * (lt / dur))
         ui.rect(rect(lx - 1, cy - 9, 2, 18), colLoop)
 
-  # Markers: chapters and bookmarks, both snapped to.
-  var markers: seq[(float, string, ColorRGBX)]
+  # Markers: chapters, bookmarks and loop marks, all snapped to. Loop marks
+  # are drawn above, and name the hover label only while snapped to.
+  var markers: seq[(float, string, ColorRGBX, bool)]
   for i, c in p.chapters:
-    markers.add (c.time, (if c.title.len > 0: c.title else: &"Chapter {i + 1}"), colMarker)
+    markers.add (c.time, (if c.title.len > 0: c.title else: &"Chapter {i + 1}"), colMarker, false)
   for i, b in a.fileBookmarks:
-    markers.add (b.time, b.label(i), colBookmark)
-  markers.sort(proc (x, y: (float, string, ColorRGBX)): int = cmp(x[0], y[0]))
+    markers.add (b.time, b.label(i), colBookmark, false)
+  if a.hasLoopA: markers.add (a.loopA, "Loop A", colLoop, true)
+  if a.hasLoopB: markers.add (a.loopB, "Loop B", colLoop, true)
+  markers.sort(proc (x, y: (float, string, ColorRGBX, bool)): int = cmp(x[0], y[0]))
 
+  # While the seek bar's context menu is open, the hover label and thumbnail
+  # stay where it was opened.
+  let pinned = a.menus.contextOpen and a.ctxMenu == cmSeekBar and dur > 0 and p.loaded
+  let mx = if pinned: a.menus.contextAnchor.x else: ui.mouse.x
   var t = 0.0
   var snapped = -1
-  if hov:
-    t = clamp((ui.mouse.x - x0) / w, 0, 1) * dur
+  if hov or pinned:
+    t = clamp((mx - x0) / w, 0, 1) * dur
     if a.cfg.snapWithShift == a.window.shift:
       var best = a.cfg.snapDistance
       for i, m in markers:
-        let d = abs(x0 + w * (m[0] / dur) - ui.mouse.x)
+        let d = abs(x0 + w * (m[0] / dur) - mx)
         if d <= best:
           best = d
           snapped = i
@@ -3489,6 +3502,7 @@ proc seekBar(a: App, r: Rect) =
     if dur <= 0: break
     let mx = round(x0 + w * (m[0] / dur))
     let hl = i == snapped
+    if m[3] and not hl: continue
     ui.rect(rect(mx - (if hl: 1.5 else: 1), cy - (if hl: 8 else: 6), (if hl: 3 else: 2), (if hl: 16 else: 12)),
       if hl: colWhite else: m[2])
 
@@ -3517,12 +3531,12 @@ proc seekBar(a: App, r: Rect) =
 
   # Hover label and thumbnail
   a.showPreview = false
-  if hov:
+  if hov or pinned:
     var label = fmtTime(t, a.cfg.showMillis)
     if snapped >= 0: label.add "  " & markers[snapped][1]
     else:
       for i in countdown(markers.high, 0):
-        if markers[i][0] <= t:
+        if markers[i][0] <= t and not markers[i][3]:
           label.add "  " & markers[i][1]
           break
     let ts = ui.textSize(label, FontSmall)
@@ -3538,8 +3552,14 @@ proc seekBar(a: App, r: Rect) =
       a.preview.request(p.path, t)
       a.preview.target.ensureSize(int(pw * ui.scale), int(imgH * ui.scale))
     let boxH = ts.y + 8 + (if imgH > 0: imgH + 4 else: 0)
-    var bx = clamp(ui.mouse.x - boxW / 2, 4, ui.size.x - boxW - 4)
+    var bx = clamp(mx - boxW / 2, 4, ui.size.x - boxW - 4)
     let by = r.y - boxH - 6
+    if pinned:
+      # Keep clear of the menu: beside it when they would overlap.
+      let mr = a.menus.contextRect
+      if mr.w > 0 and overlaps(rect(bx, by, boxW, boxH), mr):
+        bx = if mr.x - boxW - 4 >= 4: mr.x - boxW - 4
+             else: min(mr.x + mr.w + 4, ui.size.x - boxW - 4)
     ui.sk.pushLayer(PopupsLayer)
     ui.rect(rect(bx, by, boxW, boxH), colPopup)
     ui.border(rect(bx, by, boxW, boxH), colBorder)

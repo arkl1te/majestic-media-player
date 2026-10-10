@@ -77,6 +77,14 @@ proc sep*(parent: MenuNode) =
 
 proc isOpen*(m: MenuSystem): bool = m.mode != mmClosed
 
+proc contextOpen*(m: MenuSystem): bool = m.mode == mmContext
+
+proc contextAnchor*(m: MenuSystem): Vec2 = m.contextPos
+
+proc contextRect*(m: MenuSystem): Rect =
+  ## The open context menu's top level as last laid out, or empty.
+  if m.mode == mmContext and m.levels.len > 0: m.levels[0].rect else: Rect()
+
 proc close*(m: MenuSystem) =
   m.mode = mmClosed
   m.path.setLen 0
