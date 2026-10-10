@@ -2304,7 +2304,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.setFullscreen(not a.fullscreen))
   let fullScreen = view.children[^1]
 
-  let grab = view.sub("Pan, Rotate && Scale".replace("&&", "&"))
+  let grab = view.sub("Pan, Rotate && Zoom".replace("&&", "&"))
   grab.item("Center", k(kaCenter), action = proc () =
     a.xf.pan = vec2(0, 0); a.xfChanged("Pan: center"))
   for (label, key, d) in [("Move Up", kaMoveUp, vec2(0, -1)), ("Move Down", kaMoveDown, vec2(0, 1)),
@@ -2964,7 +2964,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaOptions: a.showOverlay(ovOptions)
   of kaShortcuts: a.showOverlay(ovShortcuts)
   of kaCenter .. kaPanReset:
-    a.runMenuPath(@["View", "Pan, Rotate & Scale", PanMenuLabels[act]])
+    a.runMenuPath(@["View", "Pan, Rotate & Zoom", PanMenuLabels[act]])
 
 proc rectKeys(a: App): bool  # rectangle drawing, below
 
@@ -4580,7 +4580,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
     ("Keyboard shortcuts", @[kaShortcuts], "")]).rows
   result[1] = @[
     view,
-    a.keyRows("Pan, Rotate & Scale", [
+    a.keyRows("Pan, Rotate & Zoom", [
       ("Center", @[kaCenter], ""), ("Move up / down", @[kaMoveUp, kaMoveDown], "Numpad 8 / 2"),
       ("Move left / right", @[kaMoveLeft, kaMoveRight], "Numpad 4 / 6"),
       ("0 degrees", @[kaRotate0], ""),
@@ -5107,7 +5107,7 @@ proc main() =
     a.osdLayer = newOsdLayer()
     a.osdLayer.initRender()
   except MpvError as e:
-    stderr.writeLine "OSD layer disabled (OSD follows pan/rotate/scale): ", e.msg
+    stderr.writeLine "OSD layer disabled (OSD follows pan/rotate/zoom): ", e.msg
     a.osdLayer = nil
 
   # Any input schedules redraws for a short while (hover effects, tooltips).

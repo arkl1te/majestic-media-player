@@ -20,7 +20,7 @@ type
     kgNavigate = "Navigate"
     kgSubtitles = "Subtitles"
     kgView = "View"
-    kgPan = "Pan, Rotate & Scale"
+    kgPan = "Pan, Rotate & Zoom"
 
   KeyAction* = enum
     ## The string is the command's id in the config.
@@ -183,7 +183,7 @@ const
     (kgPan, "Decrease width", "-Width", "Ctrl+Numpad 4"),
     (kgPan, "Increase height", "+Height", "Ctrl+Numpad 8"),
     (kgPan, "Decrease height", "-Height", "Ctrl+Numpad 2"),
-    (kgPan, "Reset", "Reset Pan, Rotate & Scale", "")]
+    (kgPan, "Reset", "Reset Pan, Rotate & Zoom", "")]
 
   SeekActions* = [kaSeek10, kaSeek20, kaSeek30, kaSeek40, kaSeek50,
                  kaSeek60, kaSeek70, kaSeek80, kaSeek90]

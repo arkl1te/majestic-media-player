@@ -21,8 +21,8 @@ type
     apShutdown, apLogOff, apLock
 
   SavedTransform* = object
-    ## Pan, rotate & scale state, kept when "Remember last pan, rotation
-    ## and scale" is on.
+    ## Pan, rotate & zoom state, kept when "Remember last pan, rotation
+    ## and zoom" is on.
     panX*, panY*, rotation*: float
     zoom*: float = 1
     scaleX*: float = 1

@@ -237,7 +237,7 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rtime", "Remember time (continue where the file was left off)", c.rememberTime)
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
-  ui.checkRow(p, "o-rxf", "Remember last pan, rotation and scale", c.rememberTransform)
+  ui.checkRow(p, "o-rxf", "Remember last pan, rotation and zoom", c.rememberTransform)
   ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
   ui.group(p, "Timestamps")
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
