@@ -1,7 +1,8 @@
-## mpv-backed playback core: one instance for playback and a lightweight
-## second instance that renders seek-bar thumbnails.
+## mpv-backed playback core: one instance for playback (the app runs a second
+## as a seamless loop's standby) and a lightweight instance that renders
+## seek-bar thumbnails.
 
-import std/[algorithm, atomics, json, strutils, os, times]
+import std/[algorithm, atomics, json, strutils, os, tables, times]
 import mpv, videogl, spherical
 from config import AudioExtensions
 
@@ -11,6 +12,7 @@ type
     kind*: string           ## "video", "audio", "sub"
     title*, lang*, codec*: string
     selected*, external*, albumArt*: bool
+    file*: string           ## an external track's file
     channels*: int
 
   Chapter* = object
@@ -31,6 +33,8 @@ type
     paused*: bool
     seeking*: bool
     timePos*, duration*: float
+    timeAt: float             ## when timePos last changed, epochTime
+    frameDur: float           ## the last step of timePos while playing, a frame
     eofReached*: bool
     volume*: float
     muted*: bool
@@ -45,6 +49,11 @@ type
     sphere*: SphereInfo       ## 360° metadata of the open file
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
+    props*: Table[string, string]  ## MirroredProps as they are now
+    hidden*: bool             ## a seamless loop's standby: copies the shown
+                              ## player's file details instead of finding them
+    startDelay*: float = 0.04 ## seamless loops: how long it takes to get going
+                              ## from paused, media seconds
 
   Preview* = ref object
     h*: MpvHandle
@@ -61,6 +70,21 @@ var
   # (other globals).
   frameReady: Atomic[int]
   previewReady: Atomic[int]
+
+const
+  MirroredProps* = ["aid", "vid", "sid", "secondary-sid", "volume", "speed",
+    "sub-delay", "audio-delay", "sub-visibility", "slang", "alang",
+    "sub-file-paths", "sub-align-x", "sub-align-y", "sub-margin-x",
+    "sub-margin-y", "sub-pos", "sub-scale", "video-margin-ratio-left",
+    "video-margin-ratio-right", "video-margin-ratio-top",
+    "video-margin-ratio-bottom", "keepaspect", "video-scale-x",
+    "video-scale-y", "osd-level", "osd-msg3", "osd-fractions", "osd-scale",
+    "osd-margin-x", "osd-margin-y", "osd-outline-size", "osd-bar-align-x",
+    "osd-bar-align-y", "osd-bar-w", "osd-bar-h", "osd-bar-outline-size",
+    "osd-bar-marker-min-size", "loop-file", "ab-loop-a", "ab-loop-b"]
+    ## What the app sets at runtime, observed (into `props`) so a second
+    ## player can be made to look and sound the same (seamless loops)
+  MirrorBase = 1000           ## observation ids of MirroredProps
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
 proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
@@ -108,6 +132,8 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
       (pAudioChannels, "audio-params/channel-count", fmtInt64),
       (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag)]:
     discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
+  for i, name in MirroredProps:
+    discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
 
 proc initRender*(p: Player) =
   ## Must run with the window's GL context current.
@@ -125,6 +151,7 @@ proc parseTracks(p: Player, j: JsonNode) =
       title: t{"title"}.getStr, lang: t{"lang"}.getStr,
       codec: t{"codec"}.getStr, selected: t{"selected"}.getBool,
       external: t{"external"}.getBool, albumArt: t{"albumart"}.getBool,
+      file: t{"external-filename"}.getStr,
       channels: t{"demux-channel-count"}.getInt)
 
 proc parseChapters(p: Player, j: JsonNode) =
@@ -133,13 +160,25 @@ proc parseChapters(p: Player, j: JsonNode) =
   for c in j:
     p.chapters.add Chapter(time: c{"time"}.getFloat, title: c{"title"}.getStr)
 
+proc posNow*(p: Player): float =
+  ## The playback position now, finer than timePos (which moves a frame at a
+  ## time): what has played since the shown frame's time came in. Never past
+  ## the next frame, so a stalled player (just looped or sought) isn't taken
+  ## for a playing one.
+  if p.paused or p.seeking or p.eofReached or p.stopped or not p.loaded: return p.timePos
+  p.timePos + min((epochTime() - p.timeAt) * p.speed, p.frameDur)
+
 proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   let d = ev.data
   template f: float = (if d == nil: 0.0 else: cast[ptr cdouble](d)[].float)
   template b: bool = (d != nil and cast[ptr cint](d)[] != 0)
   case id
   of pPause: p.paused = b
-  of pTimePos: p.timePos = f
+  of pTimePos:
+    let step = f - p.timePos
+    if step > 0.001 and step < 0.1: p.frameDur = step
+    p.timePos = f
+    p.timeAt = epochTime()
   of pDuration: p.duration = f
   of pEof:
     p.eofReached = b
@@ -206,11 +245,16 @@ proc pollEvents*(p: Player): bool =
       let id = ev.replyUserdata.int
       if id in Prop.low.int .. Prop.high.int:
         p.handleProp(Prop(id), cast[ptr MpvEventProperty](ev.data))
+      elif id in MirrorBase ..< MirrorBase + MirroredProps.len:
+        let e = cast[ptr MpvEventProperty](ev.data)
+        p.props[MirroredProps[id - MirrorBase]] =
+          if e.data == nil or e.format != fmtString: "" else: $cast[ptr cstring](e.data)[]
     of evFileLoaded:
       # Read here rather than in load: the previous file may still show a
       # frame or two until mpv switches over.
-      p.sphere = detectSphere(p.path)
-      p.addSameNameAudio()
+      if not p.hidden:
+        p.sphere = detectSphere(p.path)
+        p.addSameNameAudio()
       p.loaded = true
       p.justLoaded = true
       p.loadError = ""

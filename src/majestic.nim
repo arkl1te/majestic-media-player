@@ -54,6 +54,13 @@ type
     scaleX: float32 = 1
     scaleY: float32 = 1
 
+  StandbyState = enum
+    sbOff       ## no loop to serve
+    sbLoading   ## opening the file
+    sbSeeking   ## going to its spot before A
+    sbReady     ## waiting there, decoded
+    sbRolling   ## playing unseen, muted, about to take over
+
   MasterClock = object
     ## A slave's view of its master's playback, in the master's time.
     known: bool               ## heard from the master since joining
@@ -61,6 +68,9 @@ type
     t: float                  ## master time at `at`
     at: float                 ## when, our clock
     speed: float = 1
+    loopA, loopB: float       ## the master's loop (A-B or its file), master time;
+                              ## none unless loopB > loopA
+    dur: float                ## the master's file's duration, 0 when unknown
 
   SubLayout = object
     alignX: int = 1           ## 0 left, 1 center, 2 right
@@ -75,6 +85,13 @@ type
     menus: MenuSystem
     quad: QuadRenderer
     player: Player
+    standby: Player           ## seamless loops: the hidden second player
+    sbState: StandbyState
+    sbPath: string            ## the file it holds
+    sbA, sbB, sbStart: float  ## the loop it serves; where it waits
+    sbPending: bool           ## the standby has a frame to draw
+    sbLastPos: float          ## the playing player's last position while rolling
+    sbPlayingB: float = NaN   ## ab-loop-b as set on the playing player here
     preview: Preview
     cfg: Config
     playlist: seq[string]
@@ -153,6 +170,11 @@ type
     followSought: float       ## slave: time following last sought to while held, NaN when none
     followFixAt: float        ## slave: when following last corrected the playing file
     followLoopSet: string     ## slave: loop-file as following last set it
+    followAbSet: string       ## slave: ab-loop-a/b as following last set them
+    followAb: tuple[a, b: float]  ## slave: that loop, b = 0 when none
+    followPrevT: float        ## slave: following's last target time
+    followWrapped: bool       ## slave: the master looped, our file must jump back
+    followSettleAt: float     ## slave: drift is played off from then on (after a loop)
     syncDlg: SyncDialog       ## Synchronize > Properties, its window created on first use
     syncWin: Window
     syncSk: Silky
@@ -402,9 +424,19 @@ proc isSyncMaster(a: App): bool = a.synced and a.syncMaster == a.peers.pid
 proc isSlave(a: App): bool = a.synced and not a.isSyncMaster
 
 proc masterNow(a: App): float =
-  ## Slave: the master's time now, from its last known time and rate.
+  ## Slave: the master's time now, from its last known time and rate. Inside
+  ## its loop it wraps from B back to A just as the master's player does.
   let c = a.clock
-  c.t + (if c.playing: (now() - c.at) * c.speed else: 0.0)
+  let raw = c.t + (if c.playing: (now() - c.at) * c.speed else: 0.0)
+  let len = c.loopB - c.loopA
+  if len > 0 and c.t < c.loopB and raw >= c.loopB:
+    c.loopA + floorMod(raw - c.loopB, len)
+  elif c.dur > 0 and c.t <= c.dur: min(raw, c.dur)  # it stops at its end
+  else: raw
+
+proc baseSpeed(a: App): float =
+  ## The playback rate as set: a slave's own is nudged to keep up (follow).
+  if a.isSlave and a.clock.known: a.clock.speed else: a.player.speed
 
 proc playlistLocked(a: App): bool = a.synced and not a.isSyncMaster
 
@@ -499,6 +531,10 @@ proc loopReady(a: App): bool =
   a.hasLoopA and a.hasLoopB and a.loopB > a.loopA
 
 proc applyAbLoop(a: App) =
+  a.sbPlayingB = NaN  # seamless loops: set again from this
+  if a.isSlave:  # the master's loop rules; following sets it
+    a.followAbSet = ""
+    return
   let on = a.abLoop and a.loopReady
   for (prop, t) in [("ab-loop-a", a.loopA), ("ab-loop-b", a.loopB)]:
     if on: a.player.h.setProp(prop, t) else: a.player.h.setProp(prop, "no")
@@ -984,7 +1020,7 @@ proc setMute(a: App, on: bool) =
 
 proc changeRate(a: App, dir: float) =
   if not a.player.loaded: return
-  let s = clamp(a.player.speed + dir * a.cfg.rateStep, 0.1, 100.0)  # 100 = mpv's own maximum
+  let s = clamp(a.baseSpeed + dir * a.cfg.rateStep, 0.1, 100.0)  # 100 = mpv's own maximum
   a.player.h.setProp("speed", s)
   if a.isSlave: a.clock.speed = s
   a.syncSend("speed", $s)
@@ -1157,8 +1193,24 @@ proc xfChanged(a: App, msg: string) =
 
 proc syncState(a: App): seq[string] =
   ## Where the master's playback is, for players joining the group.
+  ## Its loop goes along, so slaves wrap when it does.
   let p = a.player
-  @["state", $p.loaded, $p.timePos, $(p.paused or p.eofReached), $p.stopped, $p.speed]
+  var (la, lb) = (0.0, 0.0)
+  if a.abLoop and a.loopReady: (la, lb) = (a.loopA, a.loopB)
+  elif a.cfg.repeatForever and (a.cfg.repeatMode == rmFile or a.playlist.len <= 1):
+    (la, lb) = (0.0, p.duration)
+  @["state", $p.loaded, $p.posNow, $(p.paused or p.eofReached), $p.stopped, $p.speed,
+    $la, $lb, $p.duration]
+
+proc ownPlayback(a: App) =
+  ## No longer a slave: our own looping is back, and the group's rate
+  ## without following's nudge.
+  if a.clock.known and a.player.loaded: a.player.h.setProp("speed", a.clock.speed)
+  a.clock = MasterClock()
+  a.followLoopSet = ""
+  a.followAbSet = ""
+  a.applyLoop()
+  a.applyAbLoop()
 
 proc setGroup(a: App, members: seq[int]) =
   ## Master (or a player about to become one): the new membership. Newcomers
@@ -1168,8 +1220,10 @@ proc setGroup(a: App, members: seq[int]) =
   let keep = if members.len > 1: members else: @[]
   for m in old:
     if m != me and m notin keep: a.peers.send(m, "group", "")
+  let wasSlave = a.isSlave
   a.syncMembers = keep
   a.syncMaster = if keep.len > 0: me else: 0
+  if wasSlave: a.ownPlayback()
   if keep.len == 0: return
   let list = keep.mapIt($it).join(",")
   for m in keep:
@@ -1205,9 +1259,7 @@ proc leftGroup(a: App) =
   ## clock forgotten.
   a.syncMaster = 0
   a.syncMembers.setLen 0
-  a.clock = MasterClock()
-  a.followLoopSet = ""
-  a.applyLoop()
+  a.ownPlayback()
 
 proc leaveGroup(a: App) =
   ## Before joining another group.
@@ -1227,6 +1279,9 @@ proc joined(a: App) =
   a.followSought = NaN
   a.followFixAt = 0
   a.followLoopSet = ""
+  a.followAbSet = ""
+  a.followPrevT = 0
+  a.followWrapped = false
 
 proc setFollow(a: App, offset: float, loop: bool) =
   ## Our settings as a slave (Synchronize > Properties); the file is placed
@@ -1243,12 +1298,17 @@ proc remotePlay(a: App) =
   p.stopped = false
   p.h.setProp("pause", false)
 
-proc setClock(a: App, loaded: bool, t: float, paused, stopped: bool, speed: float) =
+proc setClock(a: App, loaded: bool, t: float, paused, stopped: bool, speed: float,
+              loopA, loopB, dur: float) =
   ## Slave: the master's playback as it reported it.
   a.clock = MasterClock(known: true, loaded: loaded, playing: not paused and not stopped,
-    stopped: stopped, t: t, at: now(), speed: speed)
-  if a.player.loaded and speed > 0 and speed != a.player.speed:
-    a.player.h.setProp("speed", speed)
+    stopped: stopped, t: t, at: now(), speed: (if speed > 0: speed else: 1.0),
+    loopA: loopA, loopB: loopB, dur: dur)
+
+proc followSpeed(a: App, nudge: float) =
+  ## Slave: the group's rate, nudged to catch up.
+  let s = a.clock.speed * nudge
+  if abs(s - a.player.speed) > 0.0005: a.player.h.setProp("speed", s)
 
 proc follow(a: App) =
   ## Slave: keeps our file where the master's clock puts it. Seeks while
@@ -1270,21 +1330,59 @@ proc follow(a: App) =
   if loop != a.followLoopSet:
     a.followLoopSet = loop
     p.h.setProp("loop-file", loop)
+  # The master's loop, in our time: where it fits our file, our player loops
+  # natively, at the same moment as the master's.
+  let c = a.clock
+  let (la, lb) = (c.loopA - a.followOffset, c.loopB - a.followOffset)
+  let ab = if c.loopB > c.loopA and la >= 0 and lb <= p.duration: $la & " " & $lb else: ""
+  a.followAb = if ab.len > 0: (la, lb) else: (0.0, 0.0)
+  if ab != a.followAbSet:
+    a.followAbSet = ab
+    a.sbPlayingB = NaN
+    p.h.setProp("ab-loop-a", if ab.len > 0: $la else: "no")
+    p.h.setProp("ab-loop-b", if ab.len > 0: $lb else: "no")
+  # The master looped: our file jumps back with it right away, not on the
+  # next drift check.
   let tnow = now()
+  if run and a.followRunning and t < a.followPrevT - 0.35:
+    a.followWrapped = true
+    # A player stutters for a moment after jumping back, the master's known
+    # here only from its next tick: no catching up on that. Seamless loops
+    # (a standby taking over) don't stutter, and a short loop needs the time.
+    a.followSettleAt = tnow + (if a.sbState == sbOff: 0.5 else: 0.0)
+  a.followPrevT = t
   if run:
     if not a.followRunning:
       a.followRunning = true
       a.followSought = NaN
       a.followFixAt = tnow
+      a.followWrapped = false
+      a.followSpeed(1)
       p.seek(t)
       p.h.setProp("pause", false)
-    elif tnow - a.followFixAt > 1 and not p.seeking:
-      var d = abs(p.timePos - t)
-      if a.followLoop: d = min(d, p.duration - d)
-      if d > 0.35 or p.paused:  # drifted, or the master jumped
+    elif not p.seeking:
+      # How far ahead we are (behind: negative), across a loop's seam.
+      var e = p.posNow - t
+      let span = if a.followAbSet.len > 0: c.loopB - c.loopA
+                 elif a.followLoop: p.duration
+                 else: 0.0
+      if span > 0: e -= span * round(e / span)
+      if (tnow - a.followFixAt > 1 or a.followWrapped) and (abs(e) > 0.35 or p.paused):
+        # drifted far, or the master jumped
         a.followFixAt = tnow
+        a.followWrapped = false
         p.seek(t)
         p.h.setProp("pause", false)
+      elif tnow - a.followFixAt > 0.5:
+        # Small drift (each player's loop takes its own time to jump back,
+        # decoders and outputs differ) is played off: a touch slower when
+        # ahead, faster when behind, so it never adds up.
+        a.followWrapped = false
+        # Not while a seamless loop's standby runs up at our rate: it would
+        # take over off by the change.
+        if a.sbState != sbRolling:
+          let nudge = if tnow < a.followSettleAt or abs(e) < 0.004: 1.0 else: 1 - clamp(round(e * 2, 3), -0.05, 0.05)
+          a.followSpeed(nudge)
   else:
     if a.followRunning:
       a.followRunning = false
@@ -1345,7 +1443,7 @@ proc handlePeerMessage(a: App, m: Message) =
     case f[0]
     of "state":
       if m.sender == a.syncMaster and (not a.clock.known or now() >= a.clockHeldUntil):
-        a.setClock(flag(1), num(2), flag(3), flag(4), num(5))
+        a.setClock(flag(1), num(2), flag(3), flag(4), num(5), num(6), num(7), num(8))
     of "play", "pause", "stop", "seek": a.clockAction(f)
     of "frame": a.slaveFrame(flag(1))
     of "speed":
@@ -1387,6 +1485,171 @@ proc pollPeers(a: App): bool =
   a.syncTick()
   a.follow()
   a.peers.announce(a.player.path.extractFilename, a.syncMaster, a.followOffset, a.followLoop)
+
+# --- seamless loops ---------------------------------------------------------
+# Jumping back from a loop's B to its A is a seek, and a seek decodes from the
+# keyframe before A: with keyframes far apart, picture and sound freeze for a
+# moment every round. A second, hidden player (the standby) waits paused a
+# little before A with that work done; shortly before B it starts playing,
+# muted and unseen, and at B it takes over, the other one becoming the
+# standby for the next round. mpv's own A-B loop stays set as the fallback.
+
+const
+  StandbyPreroll = 0.2    ## how far before A the standby waits, media seconds
+  StandbyMinLoop = 0.5    ## shorter loops jump the plain way
+
+proc loopRegion(a: App): tuple[a, b: float] =
+  ## The A-B loop the playing player is in, b = 0 when none: ours, or as a
+  ## slave the master's (follow).
+  if a.isSlave: a.followAb
+  elif a.abLoop and a.loopReady: (a.loopA, a.loopB)
+  else: (0.0, 0.0)
+
+proc mirrorStandby(a: App) =
+  ## The playing player's settings and added tracks, onto the standby.
+  ## Nothing here waits on the standby: it may be busy loading or seeking.
+  let (p, sb) = (a.player, a.standby)
+  let have = sb.tracks.filterIt(it.external).mapIt(it.file)
+  for t in p.tracks:  # in the same order, so track ids match
+    if t.external and t.file notin have and t.kind in ["sub", "audio"]:
+      sb.h.commandAsync(t.kind & "-add", t.file, "auto")
+  for name in MirroredProps:
+    if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
+      sb.h.setProp(name, p.props[name])
+
+proc standbyAt(a: App, path: string, start: float) =
+  ## Sends the standby (paused, muted) to `start` in `path`.
+  let sb = a.standby
+  sb.h.setProp("mute", true)
+  sb.stopped = false
+  a.sbStart = start
+  if path != a.sbPath or not sb.loaded:
+    a.sbPath = path
+    sb.path = path
+    sb.loaded = false
+    sb.loadError = ""
+    sb.sphere = a.player.sphere  # its added tracks come with mirroring
+    sb.h.setProp("pause", true)
+    # Before opening: changed later, it would reopen the sound output.
+    sb.h.setProp("audio-device", a.player.h.getStr("audio-device"))
+    sb.h.commandAsync("loadfile", path, "replace", "-1",
+      "start=" & formatFloat(start, ffDecimal, 6))
+    a.sbState = sbLoading
+  else:
+    # Seeking first: pausing first would have it wait for its sound to stop.
+    sb.h.commandAsync("seek", formatFloat(start, ffDecimal, 6), "absolute", "exact")
+    sb.h.setProp("pause", true)
+    sb.seeking = true  # until mpv says otherwise
+    a.sbState = sbSeeking
+
+proc standbyOff(a: App) =
+  if a.sbState == sbOff: return
+  a.sbState = sbOff
+  if not math.isNaN(a.sbPlayingB): a.applyAbLoop()  # B back where it was
+  a.sbPath = ""
+  a.standby.h.setProp("pause", true)
+  a.standby.close()
+
+proc takeOver(a: App) =
+  ## At B: the standby, rolling, becomes the playing player; the other one
+  ## goes back to wait before A.
+  let (old, sb) = (a.player, a.standby)
+  a.mirrorStandby()  # anything changed during its run-up
+  sb.h.setProp("mute", old.muted)
+  old.h.setProp("mute", true)
+  # Its own A-B loop would jump back to A first, a second slow seek.
+  old.h.setProp("ab-loop-b", "no")
+  # Each player's own time to get going, learned from where it got to.
+  let want = a.sbA + max(old.posNow - a.sbB, 0)
+  sb.startDelay = clamp(sb.startDelay + (want - sb.posNow) / 2, -0.1, 0.15)  # it varies a little
+  sb.muted = old.muted
+  sb.volume = old.volume
+  a.player = sb
+  a.standby = old
+  (sb.hidden, old.hidden) = (false, true)
+  a.sbPlayingB = NaN
+  a.framePending = false
+  a.renderNow = true  # the new one's frame, right away
+  a.sbPending = false
+  a.standbyAt(a.sbPath, a.sbStart)
+
+proc standbyStep(a: App, la, lb, start: float) =
+  ## One step of the standby's round: ready, rolling, taking over.
+  let (p, sb) = (a.player, a.standby)
+  case a.sbState
+  of sbOff: discard
+  of sbLoading:
+    if sb.justLoaded:
+      sb.justLoaded = false
+      a.mirrorStandby()
+      a.sbState = sbSeeking
+  of sbSeeking:
+    if not sb.seeking and abs(sb.timePos - start) < 0.1:
+      a.sbState = sbReady
+  of sbReady:
+    # Its run-up before A takes as long as the playing one's before B,
+    # started that much earlier as it takes to get going.
+    let rollAt = lb - (la - start) - sb.startDelay
+    let pos = p.posNow
+    if p.playing and not p.seeking and pos >= rollAt and pos < lb:
+      a.mirrorStandby()
+      sb.h.setProp("pause", false)
+      a.sbState = sbRolling
+      a.sbLastPos = pos
+  of sbRolling:
+    let pos = p.posNow
+    let jumped = p.seeking or p.timePos < a.sbLastPos - 0.3
+    # A little early: the frame at B is due then, and shown later this pass.
+    if pos >= lb - 0.004 or p.eofReached or (jumped and a.sbLastPos >= lb - 0.05):
+      a.takeOver()  # at B, or mpv's own loop just beat us to it
+    elif jumped or not p.playing:  # sought or paused meanwhile: wait again
+      a.standbyAt(p.path, start)
+    else:
+      a.sbLastPos = pos
+
+proc seamlessLoop(a: App) =
+  ## Keeps a standby ready for the loop playing, and hands over at B.
+  let p = a.player
+  let (la, lb) = a.loopRegion
+  let need = lb > la and lb - la >= StandbyMinLoop and p.loaded and not p.stopped and
+    p.path.len > 0 and not p.path.contains("://") and p.hasRealVideo and not p.isSpherical
+  if not need:
+    a.standbyOff()
+    return
+  if a.standby == nil: return
+  let sb = a.standby
+  discard sb.pollEvents()
+  if sb.loadError.len > 0 and p.path == a.sbPath: return  # can't open it: plain jumps
+  let start = max(la - StandbyPreroll, 0)
+  if p.path != a.sbPath or la != a.sbA or lb != a.sbB or a.sbState == sbOff:
+    if a.sbState == sbRolling: sb.h.setProp("pause", true)
+    (a.sbA, a.sbB) = (la, lb)
+    a.standbyAt(p.path, start)
+  else: a.standbyStep(la, lb, start)
+  # mpv's own jump back comes a moment before B: while the standby can take
+  # over, it moves a little past B, still there should the takeover not come.
+  let q = a.player  # the other one, after a takeover
+  let b = if a.sbState in {sbReady, sbRolling} and lb + 0.1 < q.duration: lb + 0.1 else: lb
+  if b != a.sbPlayingB:
+    a.sbPlayingB = b
+    q.h.setProp("ab-loop-b", b)
+
+proc renderStandby(a: App) =
+  ## The standby's frames go to its own target, unseen, so it plays on and
+  ## shows the right one the moment it takes over.
+  let sb = a.standby
+  if sb == nil or a.sbState notin {sbSeeking, sbReady, sbRolling}: return
+  if (mpv_render_context_update(sb.render) and MpvRenderUpdateFrame) != 0:
+    a.sbPending = true
+  if not a.sbPending: return
+  if a.sbState == sbRolling:
+    let due = sb.render.nextFrameTarget()
+    if due != 0 and mpv_get_time_ns(sb.h) < due - 1_500_000: return
+  a.sbPending = false
+  sb.target.ensureSize(a.player.target.w, a.player.target.h)
+  sb.render.render(sb.target)
+  # Once told of swaps (while it was the shown one), mpv waits for each.
+  mpv_render_context_report_swap(sb.render)
 
 # --- synchronize: Properties window ---------------------------------------
 
@@ -3029,6 +3292,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   a.player.target.ensureSize(tw, th)
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
+  a.renderStandby()
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
   # Size and shift the padded quad so the texels mpv filled with video land
@@ -3434,8 +3698,8 @@ proc status(a: App, r: Rect) =
   var timeText =
     (if a.cfg.showRemaining: "-" & fmtTime(max(0.0, p.duration - pos), ms) else: fmtTime(pos, ms)) &
     " / " & fmtTime(p.duration, ms)
-  if p.loaded and abs(p.speed - 1) > 0.001:
-    timeText = &"{p.speed:g}x   " & timeText
+  if p.loaded and abs(a.baseSpeed - 1) > 0.001:
+    timeText = &"{a.baseSpeed:g}x   " & timeText
   let tw = ui.textSize(timeText, FontSmall).x
   let timeRect = rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h)
   ui.textIn(timeText, timeRect, colText, FontSmall)
@@ -4716,6 +4980,13 @@ proc main() =
   a.applyLoop()
   a.syncSettings()
   try:
+    a.standby = newPlayer(a.cfg.volume, true, a.cfg.showOsd)
+    a.standby.hidden = true
+    a.standby.initRender()
+  except MpvError as e:
+    stderr.writeLine "seamless loops disabled: ", e.msg
+    a.standby = nil
+  try:
     a.preview = newPreview()
     if a.preview != nil: a.preview.initRender()
   except MpvError as e:
@@ -4802,6 +5073,7 @@ proc main() =
     if takePreviewReady(): a.previewFlag = true
     let peerNews = a.pollPeers()
     let changed = a.player.pollEvents() or peerNews
+    a.seamlessLoop()
     a.pollProbe()
     a.pollMediaKey()
     a.preview.pollEvents()
@@ -4872,8 +5144,10 @@ proc main() =
   if a.preview != nil:
     mpv_render_context_free(a.preview.render)
     mpv_terminate_destroy(a.preview.h)
-  mpv_render_context_free(a.player.render)
-  mpv_terminate_destroy(a.player.h)
+  for p in [a.player, a.standby]:
+    if p != nil:
+      mpv_render_context_free(p.render)
+      mpv_terminate_destroy(p.h)
 
 when isMainModule:
   main()
