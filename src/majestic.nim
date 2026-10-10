@@ -196,7 +196,7 @@ type
     rotRef: float32           ## cursor angle around the pivot the turn counts from
     rotRefSet: bool
     rotPressPos: Vec2         ## window pixels where the press began
-    panDrag: bool             ## Shift+Middle drag is panning the zoomed frame
+    panDrag: bool             ## Ctrl+Left drag is panning the zoomed frame
     panFrom: Vec2             ## window pixels where the pan drag began
     panStart: Vec2            ## pan when the drag began
     # 360° video camera, degrees
@@ -206,6 +206,10 @@ type
     lookLast: Vec2            ## pointer position the drag last turned from
     osdMsg: string            ## OSD message drawn by us over a 360° view
     osdUntil: float
+    osdLayer: OsdLayer        ## draws the OSD while the video is transformed
+    osdFlag: bool             ## the OSD layer asked for a redraw
+    osdApart: bool            ## the OSD is drawn by osdLayer now
+    osdStatus: string         ## the layer's status line as last sent
     rotMoved: bool            ## past the click threshold; a click resets rotation
     lastMouse: Vec2
     lastMouseMove: float
@@ -260,7 +264,10 @@ proc ctrl(w: Window): bool = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRig
 proc shift(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
 proc alt(w: Window): bool = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]
 
+proc updateOsdApart(a: App)
+
 proc osd(a: App, msg: string) =
+  a.updateOsdApart()  # the transform may have just changed
   # mpv draws the OSD into the picture, which a 360° view would warp onto
   # the sphere (out of sight): show the message over the frame instead.
   if a.player.isSpherical:
@@ -268,6 +275,8 @@ proc osd(a: App, msg: string) =
       a.osdMsg = msg
       a.osdUntil = now() + 1.5
       a.dirtyUntil = max(a.dirtyUntil, a.osdUntil + 0.1)
+  elif a.osdApart:
+    a.osdLayer.h.commandAsync("show-text", msg, "1500")
   else:
     a.player.osd(msg)
 
@@ -1028,7 +1037,12 @@ proc changeRate(a: App, dir: float) =
 
 proc cycleTrack(a: App, kind: string, up: bool) =
   if a.player.loaded:
-    a.player.h.commandStr("osd-msg cycle " & kind & (if up: " up" else: " down"))
+    if a.osdApart:
+      a.player.h.commandStr("cycle " & kind & (if up: " up" else: " down"))
+      # mpv's own message for it, shown by the OSD layer
+      a.player.expandText(kind & ": ${" & kind & "}")
+    else:
+      a.player.h.commandStr("osd-msg cycle " & kind & (if up: " up" else: " down"))
 
 proc setTrack(a: App, prop: string, id: int) =
   a.player.h.setProp(prop, if id <= 0: "no" else: $id)
@@ -1135,7 +1149,11 @@ proc chapterStep(a: App, d: int) =
     if a.isSlave:  # the master's clock moves, not just this file
       if j >= 0 and j < p.chapters.len: a.seekTo(p.chapters[j].time)
       return
-    p.h.commandStr("osd-msg add chapter " & $d)
+    if a.osdApart:
+      p.h.commandStr("add chapter " & $d)
+      p.expandText("Chapter: ${chapter}")
+    else:
+      p.h.commandStr("osd-msg add chapter " & $d)
     # The others' files have chapters of their own: send where this one lands.
     if j >= 0 and j < p.chapters.len: a.syncSend("seek", $p.chapters[j].time, "true")
 
@@ -1898,9 +1916,12 @@ proc subPathList(s: string): string =
   s.split(';').mapIt(it.strip.expandTilde).filterIt(it.len > 0).join(":")
 
 proc applyOsd(a: App) =
-  ## Level 3 adds the time / duration status line to the OSD.
-  a.player.h.setProp("osd-level",
-    if not a.cfg.showOsd: "0" elif a.cfg.osdTimestamp: "3" else: "1")
+  ## Level 3 adds the time / duration status line to the OSD. With the OSD
+  ## apart (see osdLayer), mpv's own stays off.
+  let level = if not a.cfg.showOsd: "0" elif a.cfg.osdTimestamp: "3" else: "1"
+  a.player.h.setProp("osd-level", if a.osdApart: "0" else: level)
+  if a.osdLayer != nil:
+    a.osdLayer.h.setProp("osd-level", if a.osdApart: level else: "0")
   # Empty osd-msg3 is mpv's built-in elapsed-time line.
   let f = if a.cfg.showMillis: "/full" else: ""
   a.player.h.setProp("osd-msg3", if not a.cfg.showRemaining: "" else:
@@ -2984,7 +3005,7 @@ proc handleKeys(a: App) =
 
 # --- video geometry ---------------------------------------------------------
 
-proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
+proc videoGeometry(a: App, area: Rect, xf: VideoTransform): tuple[center, size: Vec2] =
   let nat = a.naturalSize
   var base =
     case a.cfg.frameMode
@@ -2996,10 +3017,78 @@ proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
       if a.cfg.preserveAspect and nat.x > 0 and nat.y > 0:
         nat * min(area.w / nat.x, area.h / nat.y)
       else: area.wh
-  base *= a.xf.zoom
-  base.x *= a.xf.scaleX
-  base.y *= a.xf.scaleY
-  (area.xy + area.wh / 2 + a.xf.pan, base)
+  base *= xf.zoom
+  base.x *= xf.scaleX
+  base.y *= xf.scaleY
+  (area.xy + area.wh / 2 + xf.pan, base)
+
+proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
+  a.videoGeometry(area, a.xf)
+
+proc osdStatusText(a: App): string =
+  ## The status line mpv's OSD level 3 shows (see applyOsd), as the OSD
+  ## layer's literal text: its own player has no file to take it from.
+  let p = a.player
+  let ms = a.cfg.showMillis
+  # osd-sym-cc: mpv's escape for a glyph of its OSD symbol font
+  result = "\xC2\x91" & (if p.paused or p.stopped: '\x02' else: '\x01') & " "
+  if a.cfg.showRemaining: result.add "-" & fmtTime(max(0, p.duration - p.timePos), ms)
+  else: result.add fmtTime(p.timePos, ms)
+  result.add " / " & fmtTime(p.duration, ms)
+  if p.duration > 0: result.add &" ({int(clamp(p.timePos / p.duration, 0, 1) * 100)}%)"
+
+proc updateOsdApart(a: App) =
+  ## mpv draws its OSD into the picture, which pan, rotation and scaling
+  ## would carry along: while any applies, the OSD layer draws it instead,
+  ## over the untransformed frame.
+  let l = a.osdLayer
+  if l == nil: return
+  while mpv_wait_event(l.h, 0).eventId != evNone: discard  # nothing to act on
+  let p = a.player
+  let apart = p.hasVideo and not p.stopped and not p.isSpherical and a.xf != VideoTransform()
+  if apart != a.osdApart:
+    a.osdApart = apart
+    a.osdStatus = ""
+    a.osdFlag = true
+    a.applyOsd()
+  if not apart and a.osdFlag:  # nothing to draw: just take the update
+    a.osdFlag = false
+    discard mpv_render_context_update(l.render)
+  if apart and a.cfg.showOsd and a.cfg.osdTimestamp:
+    let s = a.osdStatusText()
+    if s != a.osdStatus:
+      a.osdStatus = s
+      l.h.setProp("osd-msg3", s.replace("$", "$$"))
+  for t in p.expanded:
+    if apart: l.h.commandAsync("show-text", t, "1500")
+    else: p.osd(t)
+  p.expanded.setLen 0
+
+proc osdLayerRect(a: App, area: Rect): Rect =
+  ## Where the OSD layer goes: over the frame as it would be untransformed.
+  let (center, size) = a.videoGeometry(area, VideoTransform())
+  let (w, h) = (max(1'f32, round(size.x)), max(1'f32, round(size.y)))
+  rect(round(center.x - w / 2), round(center.y - h / 2), w, h)
+
+proc renderOsdLayer(a: App, area: Rect) =
+  ## Brings the OSD layer's texture up to date. Outside the frame's scissor
+  ## clip, like the video's own render, which it would otherwise cut.
+  let l = a.osdLayer
+  if l == nil: return
+  let redraw = a.osdFlag
+  if a.osdFlag:
+    a.osdFlag = false
+    discard mpv_render_context_update(l.render)
+  if not a.osdApart: return
+  let r = a.osdLayerRect(area)
+  let resized = int(r.w) != l.target.w or int(r.h) != l.target.h
+  l.target.ensureSize(int(r.w), int(r.h))
+  if redraw or resized: l.render.render(l.target)
+
+proc drawOsdLayer(a: App, area: Rect, fb: IVec2) =
+  if a.osdLayer == nil or not a.osdApart: return
+  let r = a.osdLayerRect(area)
+  a.quad.draw(a.osdLayer.target.tex, rectCorners(r.xy, r.wh), fb.vec2, premul = true)
 
 proc zoomAt(a: App, area: Rect, at: Vec2, notches: float32) =
   ## Ctrl+Wheel: zooms by the Resize step per notch (up = in), keeping the
@@ -3053,7 +3142,7 @@ proc canPan(a: App, area: Rect): bool =
   a.xf.zoom > 1 and (b.x > area.w + 0.5 or b.y > area.h + 0.5)
 
 proc panDragTo(a: App, area: Rect, at: Vec2) =
-  ## Shift+Middle drag: the frame follows the pointer, stopping where its
+  ## Ctrl+Left drag: the frame follows the pointer, stopping where its
   ## edges meet the window's. A pan already past that (Numpad moves) doesn't
   ## jump back, it just can't go further out. `area` and `at` are window pixels.
   let lim = a.panLimit(area)
@@ -3293,6 +3382,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
   a.renderStandby()
+  a.renderOsdLayer(area)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
   # Size and shift the padded quad so the texels mpv filled with video land
@@ -3303,6 +3393,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   let rad = a.xf.rotation * PI.float32 / 180
   let shift = vec2(sh.x * cos(rad) - sh.y * sin(rad), sh.x * sin(rad) + sh.y * cos(rad))
   a.quad.draw(a.player.target.tex, transformedCorners(center + shift, quadSize, a.xf.rotation), fb.vec2)
+  a.drawOsdLayer(area, fb)
   glDisable(GL_SCISSOR_TEST)
 
 proc drawPreview(a: App, fb: IVec2) =
@@ -3580,15 +3671,14 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
       # 360° view: the wheel changes the field of view; Ctrl swaps what a drag does.
       mouse = @[("Wheel", "Field Of View"),
         ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
-    else: mouse = @[("Wheel", "Zoom At Cursor")]
+    else: mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video")]
   elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
   elif mods == {kmAlt, kmShift}: mouse = @[("MDrag", "Rotate In " & rot & " Steps")]
   elif mods == {kmCtrl, kmAlt}: mouse = @[("MDrag", "Rotate Around Cursor")]
   elif mods == {kmCtrl, kmAlt, kmShift}:
     mouse = @[("MDrag", "Rotate Around Cursor In " & rot & " Steps")]
   elif mods == {kmShift}:
-    mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping"),
-      ("MDrag", "Pan Zoomed Video")]
+    mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
   if mouse.len > 0: result.add mouse
 
@@ -4485,7 +4575,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
-      ("Pan zoomed video", "Shift+Middle-drag video"),
+      ("Pan zoomed video", "Ctrl+Drag video"),
       ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
       ("Reset rotation", "Alt+Middle-click video"),
       ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
@@ -4615,7 +4705,12 @@ proc frame(a: App) =
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
      not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
      not (a.cfg.showRunLog and ui.mouse.inside(rlRect)):
-    if ui.pressed():
+    if ui.pressed() and w.ctrl and not a.player.isSpherical and
+       a.rectEdit == nil and a.canPan(a.px(videoArea)):
+      a.panDrag = true
+      a.panFrom = ui.mouse * a.sk.uiScale
+      a.panStart = a.xf.pan
+    elif ui.pressed():
       a.videoPress = true
       a.videoPressPos = ui.mouse
     if a.window.buttonPressed[DoubleClick]:
@@ -4633,10 +4728,6 @@ proc frame(a: App) =
       a.resetLook(); a.osd("View reset")
     elif ui.pressed(MouseMiddle) and w.alt:
       a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
-    elif ui.pressed(MouseMiddle) and w.shift and a.canPan(a.px(videoArea)):
-      a.panDrag = true
-      a.panFrom = ui.mouse * a.sk.uiScale
-      a.panStart = a.xf.pan
     elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
       a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
   if a.rotDrag:
@@ -4646,7 +4737,7 @@ proc frame(a: App) =
         a.xf.rotation = 0; a.xfChanged("Rotation: 0°")
     else: a.rotateDrag(a.px(videoArea), ui.mouse * a.sk.uiScale, w.shift)
   if a.panDrag:
-    if not ui.down(MouseMiddle): a.panDrag = false
+    if not ui.down(): a.panDrag = false
     else: a.panDragTo(a.px(videoArea), ui.mouse * a.sk.uiScale)
   if a.videoPress:
     if not ui.down():
@@ -4992,6 +5083,12 @@ proc main() =
   except MpvError as e:
     stderr.writeLine "seek preview disabled: ", e.msg
     a.preview = nil
+  try:
+    a.osdLayer = newOsdLayer()
+    a.osdLayer.initRender()
+  except MpvError as e:
+    stderr.writeLine "OSD layer disabled (OSD follows pan/rotate/scale): ", e.msg
+    a.osdLayer = nil
 
   # Any input schedules redraws for a short while (hover effects, tooltips).
   let touch = proc () = a.dirtyUntil = now() + 1.2
@@ -5071,6 +5168,7 @@ proc main() =
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
+    if takeOsdReady(): a.osdFlag = true
     let peerNews = a.pollPeers()
     let changed = a.player.pollEvents() or peerNews
     a.seamlessLoop()
@@ -5119,7 +5217,8 @@ proc main() =
 
     let t = now()
     a.pollVideoFrame()
-    let wantDraw = a.renderNow or a.previewFlag or changed or t < a.dirtyUntil or
+    a.updateOsdApart()
+    let wantDraw = a.renderNow or a.previewFlag or a.osdFlag or changed or t < a.dirtyUntil or
       t - lastFrame > 0.25 or a.dialog != nil and t - lastFrame > 0.1
     # Due video frames and input draw immediately (a skipped frame would lose
     # the press); other UI-only redraws are capped at ~240 fps.
@@ -5148,6 +5247,9 @@ proc main() =
     if p != nil:
       mpv_render_context_free(p.render)
       mpv_terminate_destroy(p.h)
+  if a.osdLayer != nil:
+    mpv_render_context_free(a.osdLayer.render)
+    mpv_terminate_destroy(a.osdLayer.h)
 
 when isMainModule:
   main()

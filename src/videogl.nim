@@ -31,7 +31,7 @@ type
   QuadRenderer* = object
     program: GLuint
     vao, vbo: GLuint
-    uViewport, uTex, uAlpha: GLint
+    uViewport, uTex, uAlpha, uPremul: GLint
     sphere: GLuint            ## 360° program: equirectangular texture -> camera view
     sViewport, sTex, sTanHalf, sRot, sBounds, sEye: GLint
 
@@ -118,9 +118,11 @@ void main() {
 in vec2 vUv;
 uniform sampler2D tex;
 uniform float alpha;
+uniform bool premul;    // keep the texture's (premultiplied) alpha
 out vec4 color;
 void main() {
-  color = vec4(texture(tex, vUv).rgb, 1.0) * alpha;
+  vec4 t = texture(tex, vUv);
+  color = (premul ? t : vec4(t.rgb, 1.0)) * alpha;
 }
 """
 
@@ -179,6 +181,7 @@ proc newQuadRenderer*(): QuadRenderer =
   result.uViewport = glGetUniformLocation(result.program, "viewport")
   result.uTex = glGetUniformLocation(result.program, "tex")
   result.uAlpha = glGetUniformLocation(result.program, "alpha")
+  result.uPremul = glGetUniformLocation(result.program, "premul")
   result.sphere = glCreateProgram()
   glAttachShader(result.sphere, compile(GL_VERTEX_SHADER, vertSrc))
   glAttachShader(result.sphere, compile(GL_FRAGMENT_SHADER, sphereFragSrc))
@@ -213,16 +216,26 @@ proc upload(q: QuadRenderer, corners: array[4, Vec2]) =
   glBindBuffer(GL_ARRAY_BUFFER, q.vbo)
   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(data), data[0].addr)
 
-proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2, alpha = 1.0'f32) =
+proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2, alpha = 1.0'f32,
+           premul = false) =
   ## Draws a texture onto a quad given by its corners in window pixels:
   ## top-left, top-right, bottom-right, bottom-left (as the image should look).
   ## mpv renders into the FBO with flip_y=0, which stores the image top row
-  ## first (v=0 is the top of the picture).
+  ## first (v=0 is the top of the picture). `premul` blends a texture with
+  ## premultiplied alpha over what's there instead of covering it.
   glViewport(0, 0, viewport.x.GLsizei, viewport.y.GLsizei)
+  let blend = glIsEnabled(GL_BLEND)
+  var funcs: array[4, GLint]  # restored after: the UI draws with its own
+  if premul:
+    for i, e in [GL_BLEND_SRC_RGB, GL_BLEND_DST_RGB, GL_BLEND_SRC_ALPHA, GL_BLEND_DST_ALPHA]:
+      glGetIntegerv(e, funcs[i].addr)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
   glUseProgram(q.program)
   glUniform2f(q.uViewport, viewport.x, viewport.y)
   glUniform1i(q.uTex, 0)
   glUniform1f(q.uAlpha, alpha)
+  glUniform1i(q.uPremul, GLint(premul))
   glActiveTexture(GL_TEXTURE0)
   glBindTexture(GL_TEXTURE_2D, tex)
   q.upload(corners)
@@ -230,6 +243,9 @@ proc draw*(q: QuadRenderer, tex: GLuint, corners: array[4, Vec2], viewport: Vec2
   glBindVertexArray(0)
   glBindTexture(GL_TEXTURE_2D, 0)
   glUseProgram(0)
+  if premul:
+    glBlendFuncSeparate(funcs[0].GLenum, funcs[1].GLenum, funcs[2].GLenum, funcs[3].GLenum)
+    if not blend.bool: glDisable(GL_BLEND)
 
 proc rectCorners*(pos, size: Vec2): array[4, Vec2] =
   [pos, pos + vec2(size.x, 0), pos + size, pos + vec2(0, size.y)]

@@ -54,6 +54,7 @@ type
                               ## player's file details instead of finding them
     startDelay*: float = 0.04 ## seamless loops: how long it takes to get going
                               ## from paused, media seconds
+    expanded*: seq[string]    ## expandText results, in order
 
   Preview* = ref object
     h*: MpvHandle
@@ -70,6 +71,7 @@ var
   # (other globals).
   frameReady: Atomic[int]
   previewReady: Atomic[int]
+  osdReady: Atomic[int]
 
 const
   MirroredProps* = ["aid", "vid", "sid", "secondary-sid", "volume", "speed",
@@ -85,12 +87,15 @@ const
     ## What the app sets at runtime, observed (into `props`) so a second
     ## player can be made to look and sound the same (seamless loops)
   MirrorBase = 1000           ## observation ids of MirroredProps
+  ExpandReply = 77'u64        ## reply id of expandText
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
 proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
+proc onOsdUpdate(d: pointer) {.cdecl.} = osdReady.store(1)
 
 proc takeFrameReady*(): bool = frameReady.exchange(0) != 0
 proc takePreviewReady*(): bool = previewReady.exchange(0) != 0
+proc takeOsdReady*(): bool = osdReady.exchange(0) != 0
 
 proc newPlayer*(volume: float, muted, osd: bool): Player =
   result = Player(volume: volume, muted: muted)
@@ -264,6 +269,10 @@ proc pollEvents*(p: Player): bool =
       if e.reason == efError:
         p.loadError = $mpv_error_string(e.error)
         p.loaded = false
+    of evCommandReply:
+      if ev.replyUserdata == ExpandReply and ev.error >= 0:
+        let n = cast[ptr MpvNode](ev.data)
+        if n.format == fmtString: p.expanded.add $n.u.str
     of evLogMessage:
       type LogMsg = object
         prefix, level, text: cstring
@@ -351,6 +360,12 @@ proc seek*(p: Player, t: float, exact = true) =
 proc osd*(p: Player, msg: string) =
   p.h.commandAsync("show-text", msg, "1500")
 
+proc expandText*(p: Player, text: string) =
+  ## Expands mpv ${property} references as the OSD would show them; the
+  ## result lands in `expanded` once mpv gets to it (after earlier requests).
+  var args = ["expand-text".cstring, text.cstring, nil]
+  discard mpv_command_async(p.h, ExpandReply, args[0].addr)
+
 proc setVolume*(p: Player, v: float) =
   p.volume = clamp(v, 0, 200)
   p.h.setProp("volume", p.volume)
@@ -366,6 +381,42 @@ proc trackLabel*(t: Track): string =
   if t.lang.len > 0: result.add " [" & t.lang & "]"
   if t.codec.len > 0: result.add " (" & t.codec & ")"
   if t.external: result.add " · external"
+
+# --- detached OSD -----------------------------------------------------------
+
+type
+  OsdLayer* = ref object
+    ## A video-less mpv that only draws OSD, onto a transparent target, so
+    ## the OSD can stay put while the video is panned, rotated and scaled.
+    h*: MpvHandle
+    render*: MpvRenderContext
+    target*: VideoTarget
+
+proc newOsdLayer*(): OsdLayer =
+  let h = mpv_create()
+  if h == nil: raise newException(MpvError, "mpv_create failed")
+  result = OsdLayer(h: h)
+  h.setOpt("config", "no")
+  h.setOpt("vo", "libmpv")
+  h.setOpt("idle", "yes")
+  h.setOpt("gpu-hwdec-interop", "no")  # nothing to decode
+  h.setOpt("audio", "no")
+  h.setOpt("terminal", "no")
+  h.setOpt("input-default-bindings", "no")
+  h.setOpt("input-vo-keyboard", "no")
+  h.setOpt("osc", "no")
+  h.setOpt("load-scripts", "no")
+  h.setOpt("background", "color")
+  h.setOpt("background-color", "#00000000")
+  h.setOpt("osd-level", "0")
+  check mpv_initialize(h), "osd mpv_initialize"
+
+proc initRender*(o: OsdLayer) =
+  o.render = createRenderContext(o.h, blockForTargetTime = false)
+  mpv_render_context_set_update_callback(o.render, onOsdUpdate, nil)
+  # Only now: a VO (which keeps the OSD while idle) opened before the render
+  # context exists fails for good.
+  o.h.setProp("force-window", "yes")
 
 # --- thumbnail preview ------------------------------------------------------
 
