@@ -90,6 +90,8 @@ type
     panStep*: float = 10           # pixels
     rotateStep*: float = 5         # degrees
     sizeStep*: float = 5           # percent
+    # Options > System
+    loopFramesMB*: int = 768       # short loops' frames held in video memory, MB
     # Remembered state
     windowX*, windowY*: int
     windowW*, windowH*: int        # 0 = never saved
@@ -97,7 +99,9 @@ type
     playlist*: seq[string]         # kept when "Remember playlist" is on
     playlistIndex*: int = -1
 
-const MaxRecent = 15
+const
+  MaxRecent = 15
+  LoopFramesMaxMB* = 4096          ## hard cap of loopFramesMB (4 GB)
 
 proc expandPath*(p: string): string =
   ## A folder typed in Options: trimmed, with ~ expanded.

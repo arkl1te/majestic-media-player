@@ -15,6 +15,7 @@ type
     opPlayback = "Playback"
     opSubtitles = "Subtitles"
     opMisc = "Miscellaneous"
+    opSystem = "System"
 
   OptionsAction* = enum
     oaNone, oaOk, oaCancel
@@ -50,7 +51,7 @@ type
 
 const
   Tree = [(opPlayer, 0), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opSubtitles, 0), (opMisc, 0)]
+          (opSubtitles, 0), (opMisc, 0), (opSystem, 0)]
   PlayerChildren = {opFormats, opPaths, opKeys}
   TreeWidth = 180'f32
   TreeRow = 22'f32
@@ -618,6 +619,14 @@ proc miscPage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-rot", "Rotate (degrees)", c.rotateStep, 1, 1, 90)
   ui.numberRow(p, "o-size", "Resize (percent)", c.sizeStep, 1, 1, 50)
 
+proc systemPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Memory")
+  var mb = c.loopFramesMB.float
+  ui.numberRow(p, "o-lfmem", "Loop frames (MB)", mb, 64, 64, LoopFramesMaxMB.float)
+  c.loopFramesMB = clamp(int(round(mb)), 64, LoopFramesMaxMB)
+  ui.hint(p, "Video memory for short A-B loops' frames, which keep them moving.")
+  ui.hint(p, &"Loops needing more play the plain way, often frozen. At most {LoopFramesMaxMB} MB.")
+
 # --- window -----------------------------------------------------------------------
 
 proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
@@ -646,6 +655,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   of opPlayback: playbackPage(ui, c, p)
   of opSubtitles: subtitlesPage(ui, c, p)
   of opMisc: miscPage(ui, c, p)
+  of opSystem: systemPage(ui, c, p)
   ui.hitClip = outerClip
   ui.sk.popClipRect()
   let pageStopsEnd = ui.tabStops.len

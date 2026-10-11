@@ -88,6 +88,13 @@ proc ensureSize*(t: var VideoTarget, w, h: int) =
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0)
   glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
+proc free*(t: var VideoTarget) =
+  ## Deletes the target's texture and framebuffer (GL context current).
+  if t.fbo != 0:
+    glDeleteFramebuffers(1, t.fbo.addr)
+    glDeleteTextures(1, t.tex.addr)
+  t = VideoTarget()
+
 proc render*(ctx: MpvRenderContext, t: VideoTarget) =
   ## Renders the current mpv frame into the target texture.
   var

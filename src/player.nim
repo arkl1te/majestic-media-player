@@ -1,6 +1,6 @@
 ## mpv-backed playback core: one instance for playback (the app runs a second
-## as a seamless loop's standby) and a lightweight instance that renders
-## seek-bar thumbnails.
+## as a seamless loop's standby, and a video-less third for a loop's sound)
+## and a lightweight instance that renders seek-bar thumbnails.
 
 import std/[algorithm, atomics, json, strutils, os, tables, times]
 import mpv, videogl, spherical
@@ -54,6 +54,10 @@ type
                               ## player's file details instead of finding them
     startDelay*: float = 0.04 ## seamless loops: how long it takes to get going
                               ## from paused, media seconds
+    jumps*: int               ## seeks, steps and stops asked for through
+                              ## this module (not a loop's own jumps back)
+    soundKey: string          ## a loop sound's filters and track as set
+    restarts*: int            ## playback restarts (after loads and seeks)
     expanded*: seq[string]    ## expandText results, in order
 
   Preview* = ref object
@@ -97,6 +101,19 @@ proc takeFrameReady*(): bool = frameReady.exchange(0) != 0
 proc takePreviewReady*(): bool = previewReady.exchange(0) != 0
 proc takeOsdReady*(): bool = osdReady.exchange(0) != 0
 
+proc observe(h: MpvHandle) =
+  for (p, name, fmt) in [
+      (pPause, "pause", fmtFlag), (pTimePos, "time-pos", fmtDouble),
+      (pDuration, "duration", fmtDouble), (pEof, "eof-reached", fmtFlag),
+      (pTracks, "track-list", fmtNode), (pChapters, "chapter-list", fmtNode),
+      (pVolume, "volume", fmtDouble), (pMute, "mute", fmtFlag),
+      (pSpeed, "speed", fmtDouble), (pVideoParams, "video-params", fmtNode),
+      (pAudioChannels, "audio-params/channel-count", fmtInt64),
+      (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag)]:
+    discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
+  for i, name in MirroredProps:
+    discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
+
 proc newPlayer*(volume: float, muted, osd: bool): Player =
   result = Player(volume: volume, muted: muted)
   let h = mpv_create()
@@ -116,6 +133,7 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("osc", "no")
   h.setOpt("keepaspect", "no")         # we size the target to the aspect
   h.setOpt("volume-max", "200")
+  h.setOpt("volume-gain-min", "-150")  # silent enough while a loop sound plays
   h.setOpt("volume", $volume)
   h.setOpt("mute", if muted: "yes" else: "no")
   h.setOpt("osd-level", if osd: "1" else: "0")
@@ -128,17 +146,54 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   # in the status bar regardless.
   if existsEnv("MMP_DEBUG"):
     discard mpv_request_log_messages(h, "warn")
-  for (p, name, fmt) in [
-      (pPause, "pause", fmtFlag), (pTimePos, "time-pos", fmtDouble),
-      (pDuration, "duration", fmtDouble), (pEof, "eof-reached", fmtFlag),
-      (pTracks, "track-list", fmtNode), (pChapters, "chapter-list", fmtNode),
-      (pVolume, "volume", fmtDouble), (pMute, "mute", fmtFlag),
-      (pSpeed, "speed", fmtDouble), (pVideoParams, "video-params", fmtNode),
-      (pAudioChannels, "audio-params/channel-count", fmtInt64),
-      (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag)]:
-    discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
-  for i, name in MirroredProps:
-    discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
+  observe(h)
+
+proc newLoopSound*(volume: float): Player =
+  ## A video-less player for an A-B loop's sound (loopSoundAt); paused,
+  ## muted and hidden until the app has it play.
+  result = Player(volume: volume, muted: true, hidden: true, startDelay: 0.02)
+  let h = mpv_create()
+  if h == nil: raise newException(MpvError, "mpv_create failed")
+  result.h = h
+  for (k, v) in [("config", "no"), ("vid", "no"), ("sid", "no"),
+                 ("audio-display", "no"), ("sub-auto", "no"),
+                 ("audio-file-auto", "no"), ("cover-art-auto", "no"),
+                 ("load-scripts", "no"), ("keep-open", "yes"), ("idle", "yes"),
+                 ("pause", "yes"), ("terminal", "no"),
+                 ("input-default-bindings", "no"), ("volume-max", "200"),
+                 ("volume", $volume), ("mute", "yes"),
+                 ("audio-client-name", "majestic-media-player")]:
+    h.setOpt(k, v)
+  check mpv_initialize(h), "loop sound mpv_initialize"
+  if existsEnv("MMP_DEBUG"):
+    discard mpv_request_log_messages(h, "warn")
+  observe(h)
+
+proc loopSoundAt*(p: Player, path, aid: string, a, b, start: float) =
+  ## Has the loop sound wait, paused, at A of the loop from A to B (path's
+  ## audio track `aid`): from there it plays A to B over and over, seamless
+  ## to the sample, as ffmpeg's atrim and aloop filters keep the loop's sound
+  ## and repeat it. Decoding begins at `start`, a little before A, so A
+  ## sounds as in continuous play. Again on the same loop: back to A.
+  let f = (proc (t: float): string = formatFloat(t, ffDecimal, 6))
+  let af = "lavfi=[atrim=start=" & f(a) & ":end=" & f(b) &
+    ",aloop=loop=-1:size=2147483647]"  # its size: all there is
+  p.h.setProp("pause", true)
+  p.stopped = false
+  p.eofReached = false
+  p.timePos = a
+  if af & aid != p.soundKey:
+    p.soundKey = af & aid
+    p.h.setProp("aid", aid)
+    p.h.setProp("af", af)
+  if path != p.path or not p.loaded:
+    p.path = path
+    p.loaded = false
+    p.loadError = ""
+    p.h.commandAsync("loadfile", path, "replace", "-1", "start=" & f(start))
+  else:
+    # A seek starts the filters over, so the loop's sound with them.
+    p.h.commandAsync("seek", f(start), "absolute", "exact")
 
 proc initRender*(p: Player) =
   ## Must run with the window's GL context current.
@@ -269,6 +324,7 @@ proc pollEvents*(p: Player): bool =
       if e.reason == efError:
         p.loadError = $mpv_error_string(e.error)
         p.loaded = false
+    of evPlaybackRestart: inc p.restarts
     of evCommandReply:
       if ev.replyUserdata == ExpandReply and ev.error >= 0:
         let n = cast[ptr MpvNode](ev.data)
@@ -332,6 +388,7 @@ proc togglePause*(p: Player) =
     p.stopped = false
     p.h.setProp("pause", false)
   elif p.eofReached:
+    inc p.jumps
     p.h.commandAsync("seek", "0", "absolute")
     p.h.setProp("pause", false)
   else:
@@ -340,7 +397,9 @@ proc togglePause*(p: Player) =
 proc play*(p: Player) =
   if p.loaded:
     p.stopped = false
-    if p.eofReached: p.h.commandAsync("seek", "0", "absolute")
+    if p.eofReached:
+      inc p.jumps
+      p.h.commandAsync("seek", "0", "absolute")
     p.h.setProp("pause", false)
 
 proc pause*(p: Player) =
@@ -348,14 +407,28 @@ proc pause*(p: Player) =
 
 proc stop*(p: Player) =
   if not p.loaded: return
+  inc p.jumps
   p.h.setProp("pause", true)
   p.h.commandAsync("seek", "0", "absolute", "exact")
   p.stopped = true
 
 proc seek*(p: Player, t: float, exact = true) =
   if not p.loaded: return
+  inc p.jumps
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
+
+proc seekRelative*(p: Player, d: float) =
+  inc p.jumps
+  p.h.commandAsync("seek", $d, "relative")
+
+proc seekPercent*(p: Player, percent: float) =
+  inc p.jumps
+  p.h.commandAsync("seek", $percent, "absolute-percent")
+
+proc frameStep*(p: Player, forward: bool) =
+  inc p.jumps
+  p.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
 
 proc osd*(p: Player, msg: string) =
   p.h.commandAsync("show-text", msg, "1500")

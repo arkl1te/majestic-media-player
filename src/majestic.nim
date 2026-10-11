@@ -13,7 +13,7 @@ const
   AppVersion = staticRead("../VERSION").strip  # single source of truth: /VERSION
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
-  OptionsSize = ivec2(780, 512)
+  OptionsSize = ivec2(780, 600)
   RenameSize = ivec2(400, 116)
   CommandsSize = ivec2(880, 520)
   PlaylistRowH = 26'f32
@@ -61,6 +61,24 @@ type
     sbReady     ## waiting there, decoded
     sbRolling   ## playing unseen, muted, about to take over
 
+  LoopSoundState = enum
+    lsOff       ## no loop to serve
+    lsLoading   ## going to A
+    lsReady     ## waiting at A
+    lsRolling   ## started, to be heard from the shown player's jump back on
+    lsOn        ## heard; the shown players are silent and keep with it
+
+  LoopFramesState = enum
+    lfOff       ## no short loop to serve
+    lfSeeking   ## the standby going to A
+    lfStepping  ## stepping it through to B, a frame taken each step
+    lfDone      ## all of the loop's frames taken
+    lfFailed    ## couldn't (no memory, stuck): the plain way for this loop
+
+  LoopFrame = object
+    t: float                  ## its time
+    target: VideoTarget
+
   MasterClock = object
     ## A slave's view of its master's playback, in the master's time.
     known: bool               ## heard from the master since joining
@@ -92,6 +110,48 @@ type
     sbPending: bool           ## the standby has a frame to draw
     sbLastPos: float          ## the playing player's last position while rolling
     sbPlayingB: float = NaN   ## ab-loop-b as set on the playing player here
+    lsound: Player            ## a loop's sound, seamless (loopSound)
+    lsState: LoopSoundState
+    lsKey: string             ## the file, track and loop it serves
+    lsSrc, lsTrack: string    ## the file it plays and its track there
+    lsA, lsB: float           ## that loop
+    lsAsked: int              ## its restarts when it was sent to A
+    lsShown: Player           ## the playing player as last seen
+    lsJumps: int              ## and its jumps then
+    lsSilent: bool            ## the shown players' own sound is turned down
+    lsRollAt: float           ## when it started rolling
+    lsHeard: float = NaN      ## when its A was due to be heard, until learned from
+    lsLead: float = 0.05      ## short loops: how long the playing player's
+                              ## seek back to A takes, media seconds
+    lsRound, lsSoughtRound: int  ## short loops: rounds of the sound, and the
+                              ## last one the playing player was sent back for
+    lsCheck: int = -1         ## short loops: the playing player's restarts
+                              ## once sent back, to see how it landed; -1 none
+    lsPhase: float            ## where in the loop it was last seen
+    lsMoved: float            ## its position last seen, and since when
+    lsMovedAt: float
+    lfState: LoopFramesState
+    lfKey: string             ## the file, loop, size and look its frames are for
+    lfFrames: seq[LoopFrame]  ## a short loop's frames, as shown, in order
+    lfTrash: seq[LoopFrame]   ## frames to free in the next GL pass
+    lfAsked: int              ## the standby's restarts when it was sent to A
+    lfLastT: float            ## its time at the frame last taken
+    lfStart: float            ## where it was sent, a little before A
+    lfPending: bool           ## it has a new frame to take
+    lfSlot: LoopFrame         ## the frame being taken, until it settles
+    lfSlotOpen: bool
+    lfSettleAt: float         ## when it was last rendered
+    lfAskedAt: float          ## when the last seek or step was asked for
+    lfBytes: int              ## memory the frames take
+    lfSize: (int, int)        ## the playing player's render size, last drawn
+    lfLook: string            ## its settings that show in a frame, last drawn
+    lfShow: int = -1          ## the frame to show, -1 for the player's own
+    lfOn: bool                ## frames are being shown
+    lfClock: float            ## without a loop sound: media time into the loop
+    lfClockAt: float          ## when it last moved
+    lfClockSet: bool          ## it has been put where the playing player is
+    lfJumps: int              ## the playing player's jumps, as last seen
+    lfDue: bool               ## a frame to draw, or to take, right away
     preview: Preview
     cfg: Config
     playlist: seq[string]
@@ -516,7 +576,7 @@ proc slaveFrame(a: App, forward: bool) =
   let rel = a.masterNow - a.followOffset
   if a.player.loaded and rel >= 0 and (rel < a.player.duration or a.followLoop):
     a.player.stopped = false
-    a.player.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
+    a.player.frameStep(forward)
 
 proc slaveDo(a: App, fields: varargs[string]): bool =
   ## Slave: a playback control used here goes to the group, in master time,
@@ -1054,14 +1114,14 @@ proc frameStep(a: App, forward: bool) =
     a.slaveFrame(forward)
     return
   a.player.stopped = false
-  a.player.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
+  a.player.frameStep(forward)
   a.syncSend("frame", $forward)
 
 proc seekRelative(a: App, d: float) =
   if a.player.loaded:
     if a.slaveDo("seek", $(a.masterNow + d), "false"): return
     a.player.stopped = false
-    a.player.h.commandAsync("seek", $d, "relative")
+    a.player.seekRelative(d)
     a.syncSend("seek", $(a.player.timePos + d), "false")
 
 proc entryOf(a: App, path: string): string =
@@ -1151,6 +1211,7 @@ proc chapterStep(a: App, d: int) =
     if a.isSlave:  # the master's clock moves, not just this file
       if j >= 0 and j < p.chapters.len: a.seekTo(p.chapters[j].time)
       return
+    inc p.jumps
     if a.osdApart:
       p.h.commandStr("add chapter " & $d)
       p.expandText("Chapter: ${chapter}")
@@ -1513,10 +1574,13 @@ proc pollPeers(a: App): bool =
 # little before A with that work done; shortly before B it starts playing,
 # muted and unseen, and at B it takes over, the other one becoming the
 # standby for the next round. mpv's own A-B loop stays set as the fallback.
+# While the loop sound plays (loopSound), the takeovers keep time with it.
 
 const
   StandbyPreroll = 0.2    ## how far before A the standby waits, media seconds
   StandbyMinLoop = 0.5    ## shorter loops jump the plain way
+
+proc soundTarget(a: App): float
 
 proc loopRegion(a: App): tuple[a, b: float] =
   ## The A-B loop the playing player is in, b = 0 when none: ours, or as a
@@ -1570,9 +1634,9 @@ proc standbyOff(a: App) =
   a.standby.h.setProp("pause", true)
   a.standby.close()
 
-proc takeOver(a: App) =
+proc takeOver(a: App, past = NaN) =
   ## At B: the standby, rolling, becomes the playing player; the other one
-  ## goes back to wait before A.
+  ## goes back to wait before A. `past`: how far the loop sound is past A.
   let (old, sb) = (a.player, a.standby)
   a.mirrorStandby()  # anything changed during its run-up
   sb.h.setProp("mute", old.muted)
@@ -1580,8 +1644,14 @@ proc takeOver(a: App) =
   # Its own A-B loop would jump back to A first, a second slow seek.
   old.h.setProp("ab-loop-b", "no")
   # Each player's own time to get going, learned from where it got to.
-  let want = a.sbA + max(old.posNow - a.sbB, 0)
-  sb.startDelay = clamp(sb.startDelay + (want - sb.posNow) / 2, -0.1, 0.15)  # it varies a little
+  # With the loop sound starting or playing, a miss puts picture and sound
+  # apart for the round: learned in one go, for the other player too (they're
+  # alike).
+  let want = a.sbA + (if math.isNaN(past): max(old.posNow - a.sbB, 0) else: past)
+  let miss = want - sb.posNow
+  let sound = a.lsState in {lsRolling, lsOn}
+  sb.startDelay = clamp(sb.startDelay + (if sound: miss else: miss / 2), -0.1, 0.15)  # it varies a little
+  if sound: old.startDelay = sb.startDelay
   sb.muted = old.muted
   sb.volume = old.volume
   a.player = sb
@@ -1610,13 +1680,21 @@ proc standbyStep(a: App, la, lb, start: float) =
     # Its run-up before A takes as long as the playing one's before B,
     # started that much earlier as it takes to get going.
     let rollAt = lb - (la - start) - sb.startDelay
-    let pos = p.posNow
+    let pos = if a.lsState == lsOn: a.soundTarget else: p.posNow
     if p.playing and not p.seeking and pos >= rollAt and pos < lb:
       a.mirrorStandby()
       sb.h.setProp("pause", false)
       a.sbState = sbRolling
       a.sbLastPos = pos
   of sbRolling:
+    if a.lsState == lsOn:
+      # At the loop sound's B; the playing player may be a little off it.
+      let pos = a.soundTarget
+      let wrapped = pos < a.sbLastPos - (lb - la) / 2
+      if wrapped or pos >= lb - 0.004: a.takeOver(if wrapped: pos - la else: 0.0)
+      elif not p.playing: a.standbyAt(p.path, start)
+      else: a.sbLastPos = pos
+      return
     let pos = p.posNow
     let jumped = p.seeking or p.timePos < a.sbLastPos - 0.3
     # A little early: the frame at B is due then, and shown later this pass.
@@ -1646,10 +1724,23 @@ proc seamlessLoop(a: App) =
     (a.sbA, a.sbB) = (la, lb)
     a.standbyAt(p.path, start)
   else: a.standbyStep(la, lb, start)
-  # mpv's own jump back comes a moment before B: while the standby can take
-  # over, it moves a little past B, still there should the takeover not come.
+
+proc placeLoopEnd(a: App) =
+  ## mpv's own jump back comes a moment before B: while the standby can take
+  ## over, or the loop sound times the jumps, it moves a little past B, still
+  ## there should they not come. Without video, mpv jumps once it has decoded
+  ## up to B, its sound buffered ahead: so far past B that what's heard gets
+  ## there, for the loop sound to start at.
+  let (la, lb) = a.loopRegion
   let q = a.player  # the other one, after a takeover
-  let b = if a.sbState in {sbReady, sbRolling} and lb + 0.1 < q.duration: lb + 0.1 else: lb
+  if lb <= la:
+    if not math.isNaN(a.sbPlayingB): a.applyAbLoop()  # B back where it was
+    return
+  let video = q.hasRealVideo
+  let timed = a.sbState in {sbReady, sbRolling} or a.sbState == sbOff and
+    (a.lsState == lsOn or not video and a.lsState in {lsReady, lsRolling})
+  let past = if video: 0.1 else: 0.5
+  let b = if timed and lb + past < q.duration: lb + past else: lb
   if b != a.sbPlayingB:
     a.sbPlayingB = b
     q.h.setProp("ab-loop-b", b)
@@ -1670,6 +1761,374 @@ proc renderStandby(a: App) =
   sb.render.render(sb.target)
   # Once told of swaps (while it was the shown one), mpv waits for each.
   mpv_render_context_report_swap(sb.render)
+
+# --- loop sound -------------------------------------------------------------
+# A jump back from B to A, a seek or a standby's takeover, is never exact to
+# the sample: every round the sound breaks off, or skips or repeats a little,
+# which in a short loop is much of what's heard. While a loop plays, its
+# sound comes from a third, video-less player instead (Player.loopSoundAt),
+# with no seam at all. It starts at one of the playing player's jumps back,
+# from then on silent like the standby; their jumps back keep time with it.
+
+const
+  LoopSoundMax = 60.0     ## longer loops keep their own sound: it holds the
+                          ## loop's whole sound in memory
+  LoopSoundPreroll = 0.1  ## decoding starts this much before A
+
+proc soundPhase(a: App): float =
+  ## Where in the loop the loop sound is heard now (at A until it gets there).
+  a.lsA + floorMod(max(a.lsound.posNow - a.lsA, 0), a.lsB - a.lsA)
+
+proc soundTarget(a: App): float =
+  ## Where in the loop the picture belongs now: the loop sound's place, and
+  ## audio-delay's (sound that late shows with the picture that far on).
+  let delay = try: parseFloat(a.player.props.getOrDefault("audio-delay", "0"))
+              except ValueError: 0.0
+  a.lsA + floorMod(a.soundPhase + delay - a.lsA, a.lsB - a.lsA)
+
+proc silenceShown(a: App, on: bool) =
+  ## The playing player's own sound, and the standby's, down while the loop
+  ## sound is heard: volume-gain, which nothing else uses or shows.
+  if on == a.lsSilent: return
+  a.lsSilent = on
+  for p in [a.player, a.standby]:
+    if p != nil: p.h.setProp("volume-gain", if on: -150.0 else: 0.0)
+
+proc armLoopSound(a: App) =
+  ## The loop sound to A, to wait there; the playing player's own sound until
+  ## it's heard.
+  let s = a.lsound
+  a.silenceShown(false)
+  if a.lsSrc != s.path or not s.loaded:
+    # Before opening: changed later, it would reopen the sound output.
+    s.h.setProp("audio-device", a.player.h.getStr("audio-device"))
+  s.loopSoundAt(a.lsSrc, a.lsTrack, a.lsA, a.lsB, max(a.lsA - LoopSoundPreroll, 0))
+  a.lsAsked = s.restarts
+  a.lsState = lsLoading
+  a.lsCheck = -1
+
+proc loopSoundOff(a: App) =
+  a.silenceShown(false)
+  a.lsKey = ""
+  if a.lsState == lsOff: return
+  a.lsState = lsOff
+  a.lsound.h.setProp("pause", true)
+  a.lsound.close()
+
+proc nativeJumps(a: App) =
+  ## The playing player's own jumps back to A (no standby to take over) while
+  ## the loop sound plays: a seek takes a while, so it goes that much before
+  ## the sound's B, learned from how each one landed.
+  let p = a.player
+  let (la, lb) = (a.lsA, a.lsB)
+  let span = lb - la
+  if a.lsCheck >= 0 and p.restarts > a.lsCheck and not p.seeking and p.timePos > la + 0.001:
+    a.lsCheck = -1
+    var e = p.posNow - a.soundTarget  # ahead of the sound: went too early
+    e -= span * round(e / span)
+    a.lsLead = clamp(a.lsLead - clamp(e, -0.1, 0.1) / 2, 0.01, 0.9 * span)
+  let late = a.lsSoughtRound < a.lsRound - 1  # missed last round's B
+  if late or a.lsSoughtRound < a.lsRound and a.soundTarget >= lb - a.lsLead:
+    a.lsSoughtRound = if late: a.lsRound - 1 else: a.lsRound
+    a.lsCheck = p.restarts
+    p.h.commandAsync("seek", formatFloat(la, ffDecimal, 6), "absolute", "exact")
+
+proc soundHeard(a: App, tookOver: bool, late = false) =
+  ## The playing player's jump back: from here on, the loop sound is heard.
+  ## `late`: it only started now, nothing to learn its start from.
+  let p = a.player
+  a.silenceShown(true)
+  if not tookOver and not p.seeking and not p.hasRealVideo and not late:
+    p.h.commandAsync("seek", formatFloat(a.lsA, ffDecimal, 6), "absolute", "exact")
+  a.lsState = lsOn
+  a.lsHeard = if late: NaN else: now()
+  a.lsRound = 0
+  a.lsSoughtRound = -1
+  a.lsCheck = if tookOver: -1 else: p.restarts
+  a.lsPhase = a.lsA
+  a.lsMoved = NaN
+
+proc loopSound(a: App) =
+  ## Keeps the loop sound ready for the loop playing, has it take over the
+  ## sound at a jump back, and the jumps back in time with it.
+  let s = a.lsound
+  if s == nil: return
+  discard s.pollEvents()
+  let p = a.player
+  let (la, lb) = a.loopRegion
+  var (src, track) = (p.path, $p.selectedTrack("audio"))
+  for t in p.tracks:
+    if t.kind == "audio" and t.selected and t.external: (src, track) = (t.file, "auto")
+  let need = lb > la and lb - la <= LoopSoundMax and track != "0" and p.loaded and
+    not p.stopped and p.path.len > 0 and not p.path.contains("://")
+  if not need:
+    a.loopSoundOff()
+    return
+  let key = src & "\n" & track & "\n" & $la & "\n" & $lb
+  if key != a.lsKey:
+    a.loopSoundOff()
+    a.lsKey = key
+    (a.lsSrc, a.lsTrack, a.lsA, a.lsB) = (src, track, la, lb)
+    a.lsShown = p
+    a.lsJumps = p.jumps
+    a.armLoopSound()
+    return
+  if s.loadError.len > 0: return  # can't open it: the playing player's sound
+  # The playing player sent elsewhere (seek, step): from A again. Not a
+  # standby taking over.
+  let tookOver = p != a.lsShown
+  let jumped = not tookOver and p.jumps != a.lsJumps
+  a.lsShown = p
+  a.lsJumps = p.jumps
+  if jumped and a.lsState in {lsRolling, lsOn}:
+    if a.sbState == sbRolling:  # not to take over from where it went
+      a.standby.h.setProp("pause", true)
+      a.standbyAt(a.sbPath, a.sbStart)
+    a.armLoopSound()
+    return
+  let heard = a.lsState in {lsRolling, lsOn}
+  if abs(s.volume - p.volume) > 0.001: s.setVolume(p.volume)
+  if s.muted != (p.muted or not heard):
+    s.muted = p.muted or not heard
+    s.h.setProp("mute", s.muted)
+  if abs(s.speed - p.speed) > 1e-6:
+    s.speed = p.speed
+    s.h.setProp("speed", p.speed)
+  let pos = p.posNow
+  case a.lsState
+  of lsOff: discard
+  of lsLoading:
+    if s.loaded and s.restarts > a.lsAsked:
+      a.lsState = lsReady
+  of lsReady:
+    # Started as long before the playing player's B as it takes to get
+    # going, or at A for loops shorter than that. Missed (the jump back came
+    # first): right away, a moment late.
+    let at = max(lb - s.startDelay, la)
+    let wrapped = not jumped and (tookOver or
+      a.lsPhase >= lb - 0.05 and p.timePos < a.lsPhase - (lb - la) / 2)
+    if p.playing and (wrapped or not p.seeking and pos >= at and pos < lb):
+      s.muted = p.muted
+      s.h.setProp("mute", s.muted)
+      s.h.setProp("pause", false)
+      s.paused = false
+      a.lsState = lsRolling
+      a.lsRollAt = now()
+      a.lsPhase = pos
+      if wrapped: a.soundHeard(tookOver, late = true)
+    elif jumped: a.lsPhase = 0  # where the playing player was before B
+    elif not p.seeking: a.lsPhase = pos
+  of lsRolling:
+    if tookOver or p.seeking or pos >= lb - 0.004 or p.timePos < a.lsPhase - 0.3:
+      a.soundHeard(tookOver)
+    elif not p.playing or now() - a.lsRollAt > (lb - la) / max(p.speed, 0.01) + 1:
+      a.armLoopSound()  # paused, or never got there
+    else: a.lsPhase = max(a.lsPhase, pos)
+  of lsOn:
+    if not math.isNaN(a.lsHeard) and s.timePos > la + 0.0005:
+      # How long it took to be heard: when its A was, against when wanted.
+      # Learned in one go, there being one such start a loop.
+      let late = (now() - a.lsHeard) * s.speed - (s.posNow - la)
+      s.startDelay = clamp(s.startDelay + late, 0, 0.3)
+      a.lsHeard = NaN
+    if not p.playing:
+      if not s.paused:
+        s.h.setProp("pause", true)
+        s.paused = true
+      return
+    if s.paused:
+      s.h.setProp("pause", false)
+      s.paused = false
+      a.lsMoved = NaN
+    # A sound that stopped coming (its output gone, say): the playing
+    # player's own again.
+    if s.timePos != a.lsMoved:
+      (a.lsMoved, a.lsMovedAt) = (s.timePos, now())
+    elif now() - a.lsMovedAt > 0.5:
+      a.armLoopSound()
+      return
+    let ph = a.soundPhase
+    if ph < a.lsPhase - (lb - la) / 2: inc a.lsRound
+    a.lsPhase = ph
+    if a.sbState == sbOff: a.nativeJumps()  # no standby for this loop
+
+# --- loop frames ------------------------------------------------------------
+# A loop too short for the standby jumps back by seeking, and a seek decodes
+# from the keyframe before A: taking about as long as the loop, it leaves the
+# picture all but frozen. The loop's frames are taken once instead, stepping
+# the (otherwise idle) standby from A to B and rendering each frame into a
+# texture of its own, then shown in turn, in time with the loop sound (or a
+# clock of their own when there's no sound).
+
+const
+  LoopFrameLook = ["vid", "sid", "secondary-sid", "sub-delay", "sub-visibility",
+    "sub-align-x", "sub-align-y", "sub-margin-x", "sub-margin-y", "sub-pos",
+    "sub-scale", "video-margin-ratio-left", "video-margin-ratio-right",
+    "video-margin-ratio-top", "video-margin-ratio-bottom", "keepaspect",
+    "video-scale-x", "video-scale-y"]  ## what shows in a frame
+
+proc loopFramesMax(a: App): int =
+  ## Memory the frames may take, bytes (Options > System).
+  clamp(a.cfg.loopFramesMB, 64, LoopFramesMaxMB) * 1024 * 1024
+
+proc dropLoopFrames(a: App) =
+  ## Frees them (in the next GL pass).
+  a.lfTrash.add a.lfFrames
+  a.lfFrames.setLen 0
+  a.lfBytes = 0
+
+proc loopFramesOff(a: App) =
+  if a.lfState in {lfSeeking, lfStepping}: a.standby.h.setProp("pause", true)
+  if a.lfSlotOpen:
+    a.lfSlotOpen = false
+    a.lfTrash.add a.lfSlot
+  a.dropLoopFrames()
+  a.lfState = lfOff
+  a.lfKey = ""
+
+proc loopFramesFailed(a: App) =
+  ## The plain way for this loop: no retrying until it changes.
+  let key = a.lfKey
+  a.loopFramesOff()
+  a.lfKey = key
+  a.lfState = lfFailed
+
+proc takeLoopFrames(a: App, tw, th: int) =
+  ## GL pass: renders the standby's frame, once it has a new one, into a
+  ## texture of its own, and steps it on to the next, up to B. The new time
+  ## and the new frame come separately: each is rendered again on every
+  ## update until they stop, so the frame kept is the one of that time.
+  a.lfSize = (tw, th)
+  if a.lfState notin {lfSeeking, lfStepping}: return
+  let sb = a.standby
+  if (mpv_render_context_update(sb.render) and MpvRenderUpdateFrame) != 0:
+    a.lfPending = true
+  if a.lfSlotOpen:
+    if a.lfPending:
+      a.lfPending = false
+      sb.render.render(a.lfSlot.target)
+      mpv_render_context_report_swap(sb.render)
+      a.lfSettleAt = now()
+    elif now() - a.lfSettleAt > 0.025:
+      a.lfSlotOpen = false
+      a.lfFrames.add a.lfSlot
+      a.lfBytes += tw * th * 4
+      a.lfLastT = a.lfSlot.t
+      a.lfState = lfStepping
+      sb.h.commandAsync("frame-step")
+      a.lfAskedAt = now()
+    return
+  # (A restart from before the load would still be at its old place.)
+  let fresh = if a.lfState == lfSeeking:
+                sb.loaded and sb.restarts > a.lfAsked and
+                  sb.timePos >= a.lfStart - 0.001 and sb.timePos < a.lfStart + 0.1
+              else: sb.timePos != a.lfLastT
+  if not fresh:
+    # Frames not to keep (from before the seek) still go somewhere: mpv
+    # waits for each to be rendered before it gets on with the next.
+    if a.lfPending:
+      a.lfPending = false
+      sb.target.ensureSize(tw, th)
+      sb.render.render(sb.target)
+      mpv_render_context_report_swap(sb.render)
+    return
+  sb.justLoaded = false  # not to be taken for the standby's own loading
+  let t = sb.timePos
+  let (la, lb) = a.loopRegion
+  if t >= lb - 0.0005 or a.lfState == lfStepping and t < a.lfLastT or sb.eofReached:
+    # Past B (or the end): all there is.
+    if a.lfFrames.len == 0: a.loopFramesFailed()
+    else: a.lfState = lfDone
+    return
+  if a.lfBytes + tw * th * 4 > a.loopFramesMax:
+    a.loopFramesFailed()
+    return
+  if t <= la + 0.0005:  # showing at A, so the ones before it never are
+    a.dropLoopFrames()
+  for _ in 1 .. 8:  # errors from before, not to be taken for this one's
+    if glGetError() == GL_NO_ERROR: break
+  a.lfSlot = LoopFrame(t: t)
+  a.lfSlot.target.ensureSize(tw, th)
+  if glGetError() == GL_OUT_OF_MEMORY:
+    a.lfTrash.add a.lfSlot
+    a.loopFramesFailed()
+    return
+  a.lfPending = false
+  sb.render.render(a.lfSlot.target)
+  mpv_render_context_report_swap(sb.render)
+  a.lfSlotOpen = true
+  a.lfSettleAt = now()
+
+proc loopFrames(a: App) =
+  ## Keeps a short loop's frames taken, and picks the one to show.
+  let p = a.player
+  let sb = a.standby
+  let (la, lb) = a.loopRegion
+  let need = sb != nil and lb > la and lb - la < StandbyMinLoop and a.sbState == sbOff and
+    p.loaded and not p.stopped and p.hasRealVideo and not p.isSpherical and
+    p.path.len > 0 and not p.path.contains("://") and a.lfSize[0] > 1
+  var want = -1
+  a.lfOn = false
+  if not need:
+    if a.lfState != lfOff: a.loopFramesOff()
+  else:
+    # The memory allowed too: changed, a loop that didn't fit may now.
+    var key = p.path & "\n" & $la & "\n" & $lb & "\n" & $a.lfSize & "\n" & $a.loopFramesMax
+    for name in LoopFrameLook: key.add "\n" & p.props.getOrDefault(name)
+    if key != a.lfKey:
+      # Taken from A on: the standby there, looking like the playing player,
+      # its sound, OSD and loops off.
+      a.loopFramesOff()
+      a.lfKey = key
+      a.mirrorStandby()
+      for (k, v) in [("aid", "no"), ("osd-level", "0"), ("ab-loop-a", "no"),
+                     ("ab-loop-b", "no"), ("loop-file", "no"), ("mute", "yes"),
+                     ("pause", "yes")]:
+        sb.h.setProp(k, v)
+      sb.stopped = false
+      # A little before A: a seek lands on the first frame from there on, and
+      # the one showing at A may have started before it. Opened anew: a seek
+      # in the middle of a step lands anywhere.
+      a.lfStart = max(la - 0.1, 0)
+      sb.path = p.path
+      sb.loaded = false
+      sb.loadError = ""
+      sb.sphere = p.sphere
+      sb.h.commandAsync("loadfile", p.path, "replace", "-1",
+        "start=" & formatFloat(a.lfStart, ffDecimal, 6))
+      a.lfAsked = sb.restarts
+      a.lfAskedAt = now()
+      a.lfPending = false
+      a.lfFrames.setLen 0
+      a.lfState = lfSeeking
+    if a.lfState in {lfSeeking, lfStepping}:
+      discard sb.pollEvents()
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # GL passes to take them in
+      if sb.loadError.len > 0 or now() - a.lfAskedAt > 3: a.loopFramesFailed()
+    # Where the picture is: with the loop sound, once it's heard; without
+    # sound, a clock of its own, from where the playing player is.
+    var t = NaN
+    if a.lsState == lsOn: t = a.soundTarget
+    elif a.lsState == lsOff:
+      if p.jumps != a.lfJumps:
+        a.lfJumps = p.jumps
+        a.lfClockSet = false
+      if not a.lfClockSet and not p.seeking:
+        a.lfClock = if p.timePos >= la and p.timePos < lb: p.timePos - la else: 0.0
+        a.lfClockSet = true
+        a.lfClockAt = now()
+      if a.lfClockSet:
+        if p.playing: a.lfClock += (now() - a.lfClockAt) * p.speed
+        a.lfClockAt = now()
+        t = la + floorMod(a.lfClock, lb - la)
+    if a.lfState == lfDone and not math.isNaN(t):
+      a.lfOn = true
+      want = 0
+      for i, f in a.lfFrames:
+        if f.t <= t + 0.0005: want = i
+  if want != a.lfShow:
+    a.lfShow = want
+    a.lfDue = true
 
 # --- synchronize: Properties window ---------------------------------------
 
@@ -2937,7 +3396,7 @@ proc runAction(a: App, act: KeyAction) =
       if a.isSlave: a.seekTo(a.player.duration * k.float / 10)
       else:
         a.player.stopped = false
-        a.player.h.commandAsync("seek", $(k * 10), "absolute-percent")
+        a.player.seekPercent(float(k * 10))
         a.syncSend("seek", $(a.player.duration * k.float / 10), "true")
   of kaNextChapter: a.chapterStep(1)
   of kaPrevChapter: a.chapterStep(-1)
@@ -3049,7 +3508,8 @@ proc updateOsdApart(a: App) =
   if l == nil: return
   while mpv_wait_event(l.h, 0).eventId != evNone: discard  # nothing to act on
   let p = a.player
-  let apart = p.hasVideo and not p.stopped and not p.isSpherical and a.xf != VideoTransform()
+  let apart = p.hasVideo and not p.stopped and not p.isSpherical and
+    (a.xf != VideoTransform() or a.lfOn)  # loop frames hold no OSD
   if apart != a.osdApart:
     a.osdApart = apart
     a.osdStatus = ""
@@ -3357,6 +3817,9 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   if a.renderNow:
     a.renderNow = false
     a.framePending = false
+  a.lfDue = false
+  for f in a.lfTrash.mitems: f.target.free()
+  a.lfTrash.setLen 0
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
   glClearColor(0, 0, 0, 1)
@@ -3386,6 +3849,7 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   if resized or (flags and MpvRenderUpdateFrame) != 0:
     a.player.render.render(a.player.target)
   a.renderStandby()
+  a.takeLoopFrames(tw, th)
   a.renderOsdLayer(area)
   glEnable(GL_SCISSOR_TEST)
   glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
@@ -3396,7 +3860,11 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   let sh = vec2((mx[1] - mx[0]).float32 * k.x / 2, (my[1] - my[0]).float32 * k.y / 2)
   let rad = a.xf.rotation * PI.float32 / 180
   let shift = vec2(sh.x * cos(rad) - sh.y * sin(rad), sh.x * sin(rad) + sh.y * cos(rad))
-  a.quad.draw(a.player.target.tex, transformedCorners(center + shift, quadSize, a.xf.rotation), fb.vec2)
+  let tex = if a.lfShow >= 0 and a.lfShow < a.lfFrames.len and
+                a.lfFrames[a.lfShow].target.w == tw and a.lfFrames[a.lfShow].target.h == th:
+              a.lfFrames[a.lfShow].target.tex
+            else: a.player.target.tex
+  a.quad.draw(tex, transformedCorners(center + shift, quadSize, a.xf.rotation), fb.vec2)
   a.drawOsdLayer(area, fb)
   glDisable(GL_SCISSOR_TEST)
 
@@ -4990,6 +5458,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.subs = SubLayout(alignX: parseInt(st.args[0]), alignY: parseInt(st.args[1]),
       offset: vec2(parseFloat(st.args[2]), parseFloat(st.args[3])), scale: parseFloat(st.args[4]))
   of "seek": a.seekTo(parseFloat(arg))
+  of "abloop":  # a b: sets both loop marks, starting the loop
+    a.setLoopMark(false, parseFloat(st.args[0]))
+    a.setLoopMark(true, parseFloat(st.args[1]))
   of "look":  # yaw pitch fov: the 360° camera, degrees
     (a.lookYaw, a.lookPitch, a.lookFov) = (parseFloat(st.args[0]).float32,
       parseFloat(st.args[1]).float32, parseFloat(st.args[2]).float32)
@@ -5100,6 +5571,11 @@ proc main() =
     stderr.writeLine "seamless loops disabled: ", e.msg
     a.standby = nil
   try:
+    a.lsound = newLoopSound(a.cfg.volume)
+  except MpvError as e:
+    stderr.writeLine "seamless loop sound disabled: ", e.msg
+    a.lsound = nil
+  try:
     a.preview = newPreview()
     if a.preview != nil: a.preview.initRender()
   except MpvError as e:
@@ -5194,6 +5670,9 @@ proc main() =
     let peerNews = a.pollPeers()
     let changed = a.player.pollEvents() or peerNews
     a.seamlessLoop()
+    a.loopSound()
+    a.placeLoopEnd()
+    a.loopFrames()
     a.pollProbe()
     a.pollMediaKey()
     a.preview.pollEvents()
@@ -5240,12 +5719,12 @@ proc main() =
     let t = now()
     a.pollVideoFrame()
     a.updateOsdApart()
-    let wantDraw = a.renderNow or a.previewFlag or a.osdFlag or changed or t < a.dirtyUntil or
+    let wantDraw = a.renderNow or a.lfDue or a.previewFlag or a.osdFlag or changed or t < a.dirtyUntil or
       t - lastFrame > 0.25 or a.dialog != nil and t - lastFrame > 0.1
     # Due video frames and input draw immediately (a skipped frame would lose
     # the press); other UI-only redraws are capped at ~240 fps.
     let needDraw = wantDraw and
-      (a.renderNow or a.inputPending or t - lastFrame >= 1 / 240)
+      (a.renderNow or a.lfDue or a.inputPending or t - lastFrame >= 1 / 240)
     if needDraw:
       a.inputPending = false
       a.handleKeys()
@@ -5269,6 +5748,7 @@ proc main() =
     if p != nil:
       mpv_render_context_free(p.render)
       mpv_terminate_destroy(p.h)
+  if a.lsound != nil: mpv_terminate_destroy(a.lsound.h)
   if a.osdLayer != nil:
     mpv_render_context_free(a.osdLayer.render)
     mpv_terminate_destroy(a.osdLayer.h)
