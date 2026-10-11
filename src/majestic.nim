@@ -1119,7 +1119,9 @@ proc fileChapters(a: App): seq[Bookmark] =
 
 proc timeChoices(a: App): seq[TimeChoice] =
   ## What the Run window's timestamp rows pick from, at the current time.
-  timeChoices(a.player.timePos, a.player.duration, a.fileBookmarks, a.fileChapters)
+  timeChoices(a.player.timePos, a.player.duration,
+    (if a.hasLoopA: a.loopA else: -1), (if a.hasLoopB: a.loopB else: -1),
+    a.fileBookmarks, a.fileChapters)
 
 proc chapterStep(a: App, d: int) =
   let p = a.player

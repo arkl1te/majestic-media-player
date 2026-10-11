@@ -416,7 +416,8 @@ type
   RunValue* = object
     default*: string              ## the card's own content when this was given
     value*: string                ## value cards: the value
-    which*: string                ## timestamp cards: "start", "current" or "end" chosen,
+    which*: string                ## timestamp cards: "start", "current", "end", "loopA"
+                                  ## or "loopB" chosen,
     time*: float                  ## else the time of the bookmark or chapter chosen
     crossed*: bool                ## rectangle cards: a drawn rectangle leaves it alone
 

@@ -3,7 +3,8 @@
 ## line; it holds a value, or refers to the current media file, a timestamp
 ## of it or an external file. When the command runs, a file dialog asks for
 ## each external file, then the Run window asks for the timestamps (the
-## start, the current time, the end, a bookmark or a chapter) and lets the
+## start, the current time, the end, a loop mark, a bookmark or a chapter)
+## and lets the
 ## values be changed. Value cards can be numbers of a rectangle (its width,
 ## height, x or y) that the Run window lets be drawn over the video, or a
 ## file path it lets be browsed for with a save dialog; a path card can have
@@ -876,13 +877,15 @@ type
     ## An entry of a timestamp row's list: a time, or a separator.
     label*: string
     time*: float              ## seconds, < 0 when unknown
-    which*: string            ## "start", "current" or "end"; "" for a bookmark or chapter
+    which*: string            ## "start", "current", "end", "loopA" or "loopB";
+                              ## "" for a bookmark or chapter
     sep*: bool
 
   PickDialog* = ref object
     ## Shown when a command line with value or timestamp cards runs: one row
     ## per card, its name and a dropdown of times (the start, the current
-    ## time, the end, the media file's bookmarks and chapters) or a field
+    ## time, the end, the A-B loop marks, the media file's bookmarks and
+    ## chapters) or a field
     ## holding the card's value.
     cmd*: CommandLine
     rows*: seq[CmdPart]       ## the cards asked about
@@ -901,13 +904,17 @@ const
   PickRowH = 36'f32
   PickLabelW = 150'f32
 
-proc timeChoices*(pos, duration: float, marks, chapters: seq[Bookmark]): seq[TimeChoice] =
+proc timeChoices*(pos, duration, loopA, loopB: float,
+    marks, chapters: seq[Bookmark]): seq[TimeChoice] =
   ## What a timestamp row picks from: the start, the current time and the
-  ## end, then the bookmarks, then the chapters (named), each group after a
-  ## separator.
+  ## end, then the A-B loop marks (< 0 when not set), then the bookmarks,
+  ## then the chapters (named), each group after a separator.
   result = @[TimeChoice(label: "Start", which: "start"),
     TimeChoice(label: "Current time", time: pos, which: "current"),
-    TimeChoice(label: "End", time: (if duration > 0: duration else: -1), which: "end")]
+    TimeChoice(label: "End", time: (if duration > 0: duration else: -1), which: "end"),
+    TimeChoice(sep: true),
+    TimeChoice(label: "Loop A", time: loopA, which: "loopA"),
+    TimeChoice(label: "Loop B", time: loopB, which: "loopB")]
   for group in [marks, chapters]:
     if group.len > 0: result.add TimeChoice(sep: true)
     for i, b in group: result.add TimeChoice(label: b.label(i), time: b.time)
@@ -925,12 +932,12 @@ proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
 proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
     last = initTable[string, RunValue]()) =
   ## Prepares the window for c. Cards start at what they were last run with
-  ## (last): a value, the start, current time or end, or the bookmark or
-  ## chapter at the same time (the same file). Otherwise values start at the
-  ## card's own, the first timestamp card at the first bookmark (else the
-  ## current time) and each later one at the entry after the previous card's,
-  ## so a command using bookmarks in order needs no changes for a file marked
-  ## in order.
+  ## (last): a value, the start, current time, end or a loop mark, or the
+  ## bookmark or chapter at the same time (the same file). Otherwise values
+  ## start at the card's own, the first timestamp card at the first bookmark
+  ## (else the current time) and each later one at the entry after the
+  ## previous card's, so a command using bookmarks in order needs no changes
+  ## for a file marked in order.
   d.cmd = c
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
