@@ -36,6 +36,11 @@ type
     timeAt: float             ## when timePos last changed, epochTime
     frameDur: float           ## the last step of timePos while playing, a frame
     eofReached*: bool
+    backward*: bool           ## playing in reverse (ping-pong loops)
+    threadless*: bool         ## opened without mpv's demuxer thread: turns
+                              ## around to backward at once (mpv's thread
+                              ## sleeps a second, or for good at the end of
+                              ## a file, before reading further back)
     volume*: float
     muted*: bool
     speed*: float = 1
@@ -226,7 +231,14 @@ proc posNow*(p: Player): float =
   ## the next frame, so a stalled player (just looped or sought) isn't taken
   ## for a playing one.
   if p.paused or p.seeking or p.eofReached or p.stopped or not p.loaded: return p.timePos
-  p.timePos + min((epochTime() - p.timeAt) * p.speed, p.frameDur)
+  let d = min((epochTime() - p.timeAt) * p.speed, p.frameDur)
+  if p.backward: p.timePos - d else: p.timePos + d
+
+proc setBackward*(p: Player, on: bool) =
+  ## Which way playback goes; mpv turns around where it is (a seek).
+  if on == p.backward: return
+  p.backward = on
+  p.h.setProp("play-direction", if on: "backward" else: "forward")
 
 proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   let d = ev.data
@@ -235,7 +247,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   case id
   of pPause: p.paused = b
   of pTimePos:
-    let step = f - p.timePos
+    let step = abs(f - p.timePos)
     if step > 0.001 and step < 0.1: p.frameDur = step
     p.timePos = f
     p.timeAt = epochTime()
@@ -336,8 +348,10 @@ proc pollEvents*(p: Player): bool =
       stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
-proc load*(p: Player, path: string, start = 0.0) =
+proc load*(p: Player, path: string, start = 0.0, threadless = false) =
   ## Opens path, starting at `start` seconds when given.
+  p.threadless = threadless
+  p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
   p.path = path
   p.stopped = false
   p.eofReached = false
@@ -345,12 +359,30 @@ proc load*(p: Player, path: string, start = 0.0) =
   p.timePos = start
   p.duration = 0
   p.loadError = ""
+  p.setBackward(false)
   if start > 0:
     p.h.commandAsync("loadfile", path, "replace", "-1",
       "start=" & formatFloat(start, ffDecimal, 3))
   else:
     p.h.commandAsync("loadfile", path, "replace")
   p.h.setProp("pause", false)
+
+proc reopen*(p: Player, threadless: bool) =
+  ## Opens the file again where it is, paused or playing as it was, for
+  ## options mpv reads only on opening one. Its added tracks are gone then.
+  p.threadless = threadless
+  p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
+  p.eofReached = false
+  p.eofHandled = false
+  inc p.jumps
+  p.h.commandAsync("loadfile", p.path, "replace", "-1",
+    "start=" & formatFloat(p.timePos, ffDecimal, 6))
+
+proc externalFiles*(p: Player): seq[string] =
+  ## The added tracks' files as mpv has them now (p.tracks may lag behind).
+  for i in 0 ..< p.h.getInt("track-list/count"):
+    let t = "track-list/" & $i & "/"
+    if p.h.getFlag(t & "external"): result.add p.h.getStr(t & "external-filename")
 
 proc close*(p: Player) =
   p.h.commandAsync("stop")
@@ -408,6 +440,7 @@ proc pause*(p: Player) =
 proc stop*(p: Player) =
   if not p.loaded: return
   inc p.jumps
+  p.setBackward(false)
   p.h.setProp("pause", true)
   p.h.commandAsync("seek", "0", "absolute", "exact")
   p.stopped = true

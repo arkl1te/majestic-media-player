@@ -49,6 +49,7 @@ type
     preserveAspect*: bool = true
     onTop*: OnTopMode = otDefault
     repeatForever*: bool = false
+    repeatPingPong*: bool = false  # loops turn around at either end
     repeatMode*: RepeatMode = rmPlaylist
     # Options > Player
     uiScale*: float = 100          # percent

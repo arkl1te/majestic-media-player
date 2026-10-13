@@ -286,6 +286,12 @@ type
     loopA, loopB: float
     hasLoopA, hasLoopB: bool
     abLoop: bool
+    pingPongOn: bool          ## a ping-pong loop as last applied
+    pingPongLast: float       ## its position the pass before, for crossing A or B
+    plDir: int = 1            ## ping-pong playlist: the way it goes next
+    reopening: bool           ## the file opens again (Player.reopen)
+    reopenTracks: seq[Track]  ## its added tracks then, to add back
+    reopenSel: seq[(string, int)]  ## and the tracks selected
     lastDragSeekAt: float
     previewQuad: Rect
     showPreview: bool
@@ -592,19 +598,30 @@ proc clampTime(a: App, t: float): float =
 
 # --- playback actions -------------------------------------------------------
 
-proc applyLoop(a: App) =
-  a.player.h.setProp("loop-file",
-    if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: "inf" else: "no")
-
 proc loopReady(a: App): bool =
   a.hasLoopA and a.hasLoopB and a.loopB > a.loopA
+
+proc pingPongFile(a: App): bool =
+  ## Repeat > Ping-Pong on a file repeating forever: back and forth through
+  ## it. Not in a synchronize group, whose clock only runs forward.
+  a.cfg.repeatPingPong and a.cfg.repeatForever and not a.synced and
+    (a.cfg.repeatMode == rmFile or a.playlist.len <= 1)
+
+proc pingPongAb(a: App): bool =
+  ## Repeat > Ping-Pong on the A-B loop: back and forth between A and B.
+  a.cfg.repeatPingPong and a.abLoop and a.loopReady and not a.synced
+
+proc applyLoop(a: App) =
+  a.player.h.setProp("loop-file",
+    if a.cfg.repeatForever and a.cfg.repeatMode == rmFile and not a.pingPongFile: "inf"
+    else: "no")
 
 proc applyAbLoop(a: App) =
   a.sbPlayingB = NaN  # seamless loops: set again from this
   if a.isSlave:  # the master's loop rules; following sets it
     a.followAbSet = ""
     return
-  let on = a.abLoop and a.loopReady
+  let on = a.abLoop and a.loopReady and not a.pingPongAb
   for (prop, t) in [("ab-loop-a", a.loopA), ("ab-loop-b", a.loopB)]:
     if on: a.player.h.setProp(prop, t) else: a.player.h.setProp(prop, "no")
 
@@ -693,7 +710,8 @@ proc playIndex(a: App, i: int, start = -1.0) =
     else: 0.0
   a.clearLoopMarks()
   a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
-  a.player.load(path, a.resumedAt)
+  a.reopening = false  # another file instead
+  a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
   a.applyLoop()
   a.cfg.addRecent(path)
   a.cfg.lastDir = path.parentDir
@@ -1058,7 +1076,11 @@ proc runAfterPlayback(a: App) =
 
 proc afterEof(a: App) =
   if a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playlist.len > 0:
-    a.playIndex((a.plIndex + 1) mod a.playlist.len)
+    if a.cfg.repeatPingPong and a.playlist.len > 1:
+      # Ping-pong: back the other way from either end.
+      if a.plIndex + a.plDir notin 0 ..< a.playlist.len: a.plDir = -a.plDir
+      a.playIndex(clamp(a.plIndex + a.plDir, 0, a.playlist.len - 1))
+    else: a.playIndex((a.plIndex + 1) mod a.playlist.len)
   elif a.plIndex + 1 < a.playlist.len:
     a.playIndex(a.plIndex + 1)
   else:
@@ -1068,6 +1090,10 @@ proc handleEof(a: App) =
   let p = a.player
   if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
   p.eofHandled = true
+  if a.pingPongFile or a.pingPongAb:  # at either end of the file: turn around
+    p.setBackward(not p.backward)
+    p.h.setProp("pause", false)
+    return
   # A synchronized player's file may be shorter than the master's: it waits at
   # the end (clamped) until the group seeks back.
   if not a.playlistLocked: a.afterEof()
@@ -1586,8 +1612,8 @@ proc loopRegion(a: App): tuple[a, b: float] =
   ## The A-B loop the playing player is in, b = 0 when none: ours, or as a
   ## slave the master's (follow).
   if a.isSlave: a.followAb
-  elif a.abLoop and a.loopReady: (a.loopA, a.loopB)
-  else: (0.0, 0.0)
+  elif a.abLoop and a.loopReady and not a.pingPongAb: (a.loopA, a.loopB)
+  else: (0.0, 0.0)  # a ping-pong loop turns around instead of jumping
 
 proc mirrorStandby(a: App) =
   ## The playing player's settings and added tracks, onto the standby.
@@ -1744,6 +1770,38 @@ proc placeLoopEnd(a: App) =
   if b != a.sbPlayingB:
     a.sbPlayingB = b
     q.h.setProp("ab-loop-b", b)
+
+proc pingPong(a: App) =
+  ## Ping-pong loops: turns around on crossing B forward or A backward (the
+  ## file's own ends come as EOF: handleEof). Back to forward when off.
+  let p = a.player
+  let on = a.pingPongFile or a.pingPongAb
+  if on != a.pingPongOn:
+    a.pingPongOn = on
+    # mpv plays backward a keyframe's span at a time, decoding all of it
+    # before showing its last frame: hardware decoders take several times
+    # as long to hand over a span's frames.
+    p.h.setProp("hwdec", if on: "no" else: "auto-safe")
+    if not a.isSlave:  # following sets its loops itself
+      a.applyLoop()
+      a.applyAbLoop()
+  # Ping-Pong turned on with a file open: it opens again without the
+  # demuxer thread, as files opened from now on do.
+  if a.cfg.repeatPingPong and not a.synced and p.loaded and not p.threadless and
+     not a.reopening and not p.path.contains("://"):
+    a.reopening = true
+    a.reopenTracks = p.tracks.filterIt(it.external and it.kind in ["sub", "audio"])
+    a.reopenSel = @[("aid", p.selectedTrack("audio")), ("sid", p.selectedTrack("sub")),
+                    ("vid", p.selectedTrack("video"))]
+    p.reopen(true)
+  if not on:
+    if p.backward: p.setBackward(false)
+    return
+  let pos = p.timePos
+  if a.pingPongAb and p.playing and not p.seeking:
+    if not p.backward and a.pingPongLast < a.loopB and pos >= a.loopB: p.setBackward(true)
+    elif p.backward and a.pingPongLast > a.loopA and pos <= a.loopA: p.setBackward(false)
+  a.pingPongLast = pos
 
 proc renderStandby(a: App) =
   ## The standby's frames go to its own target, unseen, so it plays on and
@@ -2847,6 +2905,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let rep = play.sub("Repeat")
   rep.check("Forever", k(kaRepeatForever), cfg.repeatForever, action = proc () =
     a.cfg.repeatForever = not a.cfg.repeatForever; a.applyLoop())
+  rep.check("Ping-Pong", k(kaRepeatPingPong), cfg.repeatPingPong, action = proc () =
+    a.cfg.repeatPingPong = not a.cfg.repeatPingPong; a.applyLoop(); a.applyAbLoop())
   rep.sep()
   rep.radio("File", "", cfg.repeatMode == rmFile, action = proc () =
     a.cfg.repeatMode = rmFile; a.applyLoop())
@@ -3380,6 +3440,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaFaster: a.changeRate(1)
   of kaSlower: a.changeRate(-1)
   of kaRepeatForever: a.runMenuPath(@["Play", "Repeat", "Forever"])
+  of kaRepeatPingPong: a.runMenuPath(@["Play", "Repeat", "Ping-Pong"])
   of kaVolumeUp: a.volumeStep(true)
   of kaVolumeDown: a.volumeStep(false)
   of kaMute: a.setMute(not a.player.muted)
@@ -5016,6 +5077,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Frame forward / back", @[kaFrameForward, kaFrameBack], ""),
       ("Faster / slower playback", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
       ("Repeat forever", @[kaRepeatForever], ""),
+      ("Repeat ping-pong", @[kaRepeatPingPong], ""),
       ("Volume up / down", @[kaVolumeUp, kaVolumeDown], ""), ("Mute", @[kaMute], ""),
       ("Next / previous audio track", @[kaNextAudio, kaPrevAudio], ""),
       ("Next / previous subtitle track", @[kaNextSub, kaPrevSub], "")]),
@@ -5672,6 +5734,7 @@ proc main() =
     a.seamlessLoop()
     a.loopSound()
     a.placeLoopEnd()
+    a.pingPong()
     a.loopFrames()
     a.pollProbe()
     a.pollMediaKey()
@@ -5681,6 +5744,15 @@ proc main() =
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
+    if a.player.justLoaded and a.reopening:
+      # The same file again (pingPong): its added tracks and choices back.
+      a.player.justLoaded = false
+      a.reopening = false
+      let have = a.player.externalFiles
+      for t in a.reopenTracks:
+        if t.file notin have: a.player.h.command(t.kind & "-add", t.file, "auto")
+      for (prop, id) in a.reopenSel:
+        a.player.h.setProp(prop, if id == 0: "no" else: $id)
     if a.player.justLoaded:
       a.player.justLoaded = false
       a.resetLook()

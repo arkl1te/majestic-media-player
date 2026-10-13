@@ -40,6 +40,7 @@ type
     kaFaster = "faster"
     kaSlower = "slower"
     kaRepeatForever = "repeat-forever"
+    kaRepeatPingPong = "repeat-ping-pong"
     kaVolumeUp = "volume-up"
     kaVolumeDown = "volume-down"
     kaMute = "mute"
@@ -119,6 +120,7 @@ const
     (kgPlayback, "Faster playback", "Faster Playback", "Shift+."),
     (kgPlayback, "Slower playback", "Slower Playback", "Shift+,"),
     (kgPlayback, "Repeat forever", "Repeat Forever", ""),
+    (kgPlayback, "Repeat ping-pong", "Repeat Ping-Pong", ""),
     (kgPlayback, "Volume up", "Volume Up", "Up"),
     (kgPlayback, "Volume down", "Volume Down", "Down"),
     (kgPlayback, "Mute", "Mute", "Ctrl+M"),
