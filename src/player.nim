@@ -5,6 +5,7 @@
 import std/[algorithm, atomics, json, strutils, os, tables, times]
 import mpv, videogl, spherical
 from config import AudioExtensions
+from ytdlp import YtdlSubLangs
 
 type
   Track* = object
@@ -21,7 +22,7 @@ type
 
   Prop = enum
     pPause, pTimePos, pDuration, pEof, pTracks, pChapters, pVolume, pMute,
-    pSpeed, pVideoParams, pAudioChannels, pIdle, pSeeking
+    pSpeed, pVideoParams, pAudioChannels, pIdle, pSeeking, pCacheState
 
   Player* = ref object
     h*: MpvHandle
@@ -29,6 +30,7 @@ type
     target*: VideoTarget
     path*: string
     loaded*: bool             ## a file is open
+    opening*: bool            ## a file is being opened (links take a while)
     stopped*: bool            ## our Stop state (paused at 0, video hidden)
     paused*: bool
     seeking*: bool
@@ -46,6 +48,7 @@ type
     speed*: float = 1
     tracks*: seq[Track]
     chapters*: seq[Chapter]
+    buffered*: seq[(float, float)]  ## spans read ahead into the cache, seconds
     videoW*, videoH*: int     ## display size (aspect-corrected)
     pixelW*, pixelH*: int     ## stored size, as upright as shown (what ffmpeg
                               ## filters see, autorotation included)
@@ -114,7 +117,8 @@ proc observe(h: MpvHandle) =
       (pVolume, "volume", fmtDouble), (pMute, "mute", fmtFlag),
       (pSpeed, "speed", fmtDouble), (pVideoParams, "video-params", fmtNode),
       (pAudioChannels, "audio-params/channel-count", fmtInt64),
-      (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag)]:
+      (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag),
+      (pCacheState, "demuxer-cache-state", fmtNode)]:
     discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
   for i, name in MirroredProps:
     discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
@@ -146,12 +150,24 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("screenshot-format", "png")
   h.setOpt("audio-client-name", "majestic-media-player")
   h.setOpt("audio-display", "embedded-first")
+  # Links go through yt-dlp (useYtdlp), which also fetches their subtitles.
+  h.setOpt("ytdl", "no")
+  h.setOpt("ytdl-raw-options", "sub-langs=%" & $YtdlSubLangs.len & "%" &
+    YtdlSubLangs)  # %n%: n bytes taken as they are
   check mpv_initialize(h), "mpv_initialize"
   # mpv's log goes to stderr only when MMP_DEBUG is set; load failures surface
   # in the status bar regardless.
   if existsEnv("MMP_DEBUG"):
     discard mpv_request_log_messages(h, "warn")
   observe(h)
+
+proc useYtdlp*(p: Player, path: string) =
+  ## Has mpv open links with the yt-dlp at path, through its built-in hook.
+  ## The hook looks for yt-dlp once, on the first link, and keeps what it
+  ## found (nothing included), so each path gets a hook of its own, loaded
+  ## once there is a yt-dlp to find (setting ytdl later loads none).
+  p.h.setProp("script-opts", "ytdl_hook-ytdl_path=" & path)
+  p.h.command("load-script", "@ytdl_hook.lua")
 
 proc newLoopSound*(volume: float): Player =
   ## A video-less player for an A-B loop's sound (loopSoundAt); paused,
@@ -262,6 +278,11 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pAudioChannels:
     p.audioChannels = if d == nil: 0 else: cast[ptr int64](d)[].int
   of pIdle: discard
+  of pCacheState:
+    p.buffered.setLen 0
+    if d != nil and ev.format == fmtNode:
+      for r in cast[ptr MpvNode](d)[].toJson{"seekable-ranges"}.getElems:
+        p.buffered.add (r{"start"}.getFloat, r{"end"}.getFloat)
   of pTracks, pChapters, pVideoParams:
     let j = if d == nil or ev.format != fmtNode: newJNull()
             else: cast[ptr MpvNode](d)[].toJson
@@ -328,6 +349,7 @@ proc pollEvents*(p: Player): bool =
         p.sphere = detectSphere(p.path)
         p.addSameNameAudio()
       p.loaded = true
+      p.opening = false
       p.justLoaded = true
       p.loadError = ""
       p.eofHandled = false
@@ -336,6 +358,7 @@ proc pollEvents*(p: Player): bool =
       if e.reason == efError:
         p.loadError = $mpv_error_string(e.error)
         p.loaded = false
+        p.opening = false
     of evPlaybackRestart: inc p.restarts
     of evCommandReply:
       if ev.replyUserdata == ExpandReply and ev.error >= 0:
@@ -348,8 +371,9 @@ proc pollEvents*(p: Player): bool =
       stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
-proc load*(p: Player, path: string, start = 0.0, threadless = false) =
-  ## Opens path, starting at `start` seconds when given.
+proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "") =
+  ## Opens path, starting at `start` seconds when given, with mpv's per-file
+  ## options `opts` ("name=value,...").
   p.threadless = threadless
   p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
   p.path = path
@@ -359,12 +383,14 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false) =
   p.timePos = start
   p.duration = 0
   p.loadError = ""
+  p.opening = true
+  p.buffered.setLen 0
   p.setBackward(false)
+  var o = opts
   if start > 0:
-    p.h.commandAsync("loadfile", path, "replace", "-1",
-      "start=" & formatFloat(start, ffDecimal, 3))
-  else:
-    p.h.commandAsync("loadfile", path, "replace")
+    o = "start=" & formatFloat(start, ffDecimal, 3) & (if o.len > 0: "," & o else: "")
+  if o.len > 0: p.h.commandAsync("loadfile", path, "replace", "-1", o)
+  else: p.h.commandAsync("loadfile", path, "replace")
   p.h.setProp("pause", false)
 
 proc reopen*(p: Player, threadless: bool) =
@@ -388,7 +414,9 @@ proc close*(p: Player) =
   p.h.commandAsync("stop")
   p.path = ""
   p.loaded = false
+  p.opening = false
   p.stopped = false
+  p.buffered.setLen 0
   p.sphere = SphereInfo()
   p.tracks.setLen 0
   p.chapters.setLen 0

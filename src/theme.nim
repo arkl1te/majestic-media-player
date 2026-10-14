@@ -22,6 +22,7 @@ let
   colAccent* = c("#9d8cff")
   colAccentHover* = c("#b5a8ff")
   colAccentDim* = c("#9d8cff", 0.35)
+  colBuffered* = c("#342e54")   ## colAccent at 33% brightness: the seek bar's read-ahead
   colTrack* = c("#30333b")
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")

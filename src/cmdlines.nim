@@ -703,22 +703,6 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
 
 # --- window ---------------------------------------------------------------------
 
-proc wrapText(ui: Ui, s: string, width: float32, maxLines: int, font: string): seq[string] =
-  ## Greedy word wrap; the last line is ellipsized when text remains.
-  var line = ""
-  let words = s.split(' ')
-  for i, word in words:
-    let next = if line.len == 0: word else: line & " " & word
-    if line.len > 0 and ui.textSize(next, font).x > width:
-      if result.len == maxLines - 1:
-        result.add ui.ellipsize(line & " " & words[i .. ^1].join(" "), width, font)
-        return
-      result.add ui.ellipsize(line, width, font)
-      line = word
-    else:
-      line = next
-  if line.len > 0: result.add ui.ellipsize(line, width, font)
-
 proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
   ## Draws the window's contents filling r. path is the current media file,
   ## offered as a reference.

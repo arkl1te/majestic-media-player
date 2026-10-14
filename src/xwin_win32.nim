@@ -2,7 +2,7 @@
 ## moves, always-on-top, aspect-ratio sizing, file drops, a hidden cursor,
 ## pointer capture and the popup windows menus are drawn into.
 
-import std/importutils
+import std/[importutils, strutils]
 import windy, vmath, chroma
 from pixie import Image, newImage
 import win32api
@@ -97,6 +97,158 @@ proc dropFiles(k: Hook, drop: HANDLE) =
       k.window.onFileDrop(path, "")
   DragFinish(drop)
 
+# --- OLE drops: files, and links and text from browsers -------------------------
+# WM_DROPFILES only ever carries files; a link dragged from a browser comes
+# through OLE drag and drop alone, which then takes over files as well.
+
+type
+  FormatEtc = object
+    cfFormat: uint16
+    ptd: pointer
+    dwAspect: int32
+    lindex: int32
+    tymed: int32
+  StgMedium = object
+    tymed: int32
+    hGlobal: HGLOBAL
+    pUnkForRelease: pointer
+  DataObject = object
+    vtbl: ptr DataObjectVtbl
+  DataObjectVtbl = object
+    queryInterface, addRef, release: pointer
+    getData: proc (this: ptr DataObject, fmt: ptr FormatEtc, medium: ptr StgMedium): HRESULT {.stdcall.}
+    getDataHere: pointer
+    queryGetData: proc (this: ptr DataObject, fmt: ptr FormatEtc): HRESULT {.stdcall.}
+  PointL = object
+    x, y: int32
+  DropTarget = object
+    vtbl: ptr DropTargetVtbl
+    hwnd: HWND
+    accept: bool               ## the drag being over us carries something we take
+  DropTargetVtbl = object
+    queryInterface: proc (this: ptr DropTarget, riid: ptr GUID, obj: ptr pointer): HRESULT {.stdcall.}
+    addRef, release: proc (this: ptr DropTarget): int32 {.stdcall.}
+    dragEnter: proc (this: ptr DropTarget, data: ptr DataObject, keys: int32, pt: PointL,
+                     effect: ptr int32): HRESULT {.stdcall.}
+    dragOver: proc (this: ptr DropTarget, keys: int32, pt: PointL, effect: ptr int32): HRESULT {.stdcall.}
+    dragLeave: proc (this: ptr DropTarget): HRESULT {.stdcall.}
+    drop: proc (this: ptr DropTarget, data: ptr DataObject, keys: int32, pt: PointL,
+                effect: ptr int32): HRESULT {.stdcall.}
+
+const
+  DvAspectContent = 1'i32
+  TymedHGlobal = 1'i32
+  DropEffectNone = 0'i32
+  DropEffectCopy = 1'i32
+  DropEffectLink = 4'i32
+  ENoInterface = cast[HRESULT](0x80004002'u32)
+
+proc OleInitialize(reserved: pointer): HRESULT {.stdcall, dynlib: "ole32", importc.}
+proc RegisterDragDrop(hwnd: HWND, target: pointer): HRESULT {.stdcall, dynlib: "ole32", importc.}
+proc ReleaseStgMedium(medium: ptr StgMedium) {.stdcall, dynlib: "ole32", importc.}
+proc RegisterClipboardFormatW(name: ptr WCHAR): uint32 {.stdcall, dynlib: "user32", importc.}
+
+var cfUrl: uint16  ## "UniformResourceLocatorW": a browser's link, UTF-16
+
+proc formatOf(cf: uint16): FormatEtc =
+  FormatEtc(cfFormat: cf, dwAspect: DvAspectContent, lindex: -1, tymed: TymedHGlobal)
+
+proc dropFormats(): seq[uint16] = @[CF_HDROP.uint16, cfUrl, CF_UNICODETEXT.uint16]
+
+proc offered(data: ptr DataObject): bool =
+  for cf in dropFormats():
+    var f = formatOf(cf)
+    if cf != 0 and data.vtbl.queryGetData(data, f.addr) == 0: return true
+
+proc dropped(data: ptr DataObject): seq[string] =
+  ## The files, else the link, else the text lines the drag carries.
+  for cf in dropFormats():
+    if cf == 0: continue
+    var f = formatOf(cf)
+    var m: StgMedium
+    if data.vtbl.getData(data, f.addr, m.addr) != 0: continue
+    let p = GlobalLock(m.hGlobal)
+    if p != nil:
+      if cf == CF_HDROP.uint16:
+        let drop = cast[HANDLE](m.hGlobal)
+        for i in 0'u32 ..< DragQueryFileW(drop, 0xFFFFFFFF'u32, nil, 0):
+          let len = DragQueryFileW(drop, i, nil, 0)
+          var buf = newSeq[uint16](len + 1)
+          discard DragQueryFileW(drop, i, cast[ptr WCHAR](buf[0].addr), len + 1)
+          result.add fromWide(cast[ptr WCHAR](buf[0].addr))
+      else:
+        for line in fromWide(cast[ptr WCHAR](p)).splitLines:
+          if line.strip.len > 0: result.add line.strip
+          if cf == cfUrl: break  # just the one link
+      discard GlobalUnlock(m.hGlobal)
+    ReleaseStgMedium(m.addr)
+    if result.len > 0: return
+
+proc effectFor(t: ptr DropTarget, allowed: int32): int32 =
+  if not t.accept: DropEffectNone
+  elif (allowed and DropEffectCopy) != 0: DropEffectCopy
+  elif (allowed and DropEffectLink) != 0: DropEffectLink  # some browsers' links
+  else: DropEffectNone
+
+proc trackDrag(t: ptr DropTarget, pt: PointL) =
+  ## Where the drop will land, for the drop handler.
+  let k = hookFor(t.hwnd)
+  if k == nil: return
+  privateAccess(Window)
+  var p = POINT(x: pt.x, y: pt.y)
+  discard ScreenToClient(t.hwnd, p.addr)
+  k.window.state.mousePos = ivec2(p.x, p.y)
+
+proc dtQueryInterface(this: ptr DropTarget, riid: ptr GUID, obj: ptr pointer): HRESULT {.stdcall.} =
+  # IUnknown {00000000-0000-0000-C000-000000000046}, IDropTarget {00000122-...}
+  let g = cast[ptr array[16, byte]](riid)
+  let tail = [0xC0'u8, 0, 0, 0, 0, 0, 0, 0x46]
+  let first = cast[ptr uint32](riid)[]
+  if (first == 0 or first == 0x122) and g[4 .. 7] == [0'u8, 0, 0, 0] and g[8 .. 15] == tail:
+    obj[] = this
+    return 0
+  obj[] = nil
+  ENoInterface
+
+proc dtAddRef(this: ptr DropTarget): int32 {.stdcall.} = 1  # lives as long as the app
+proc dtRelease(this: ptr DropTarget): int32 {.stdcall.} = 1
+
+proc dtDragEnter(this: ptr DropTarget, data: ptr DataObject, keys: int32, pt: PointL,
+                 effect: ptr int32): HRESULT {.stdcall.} =
+  this.accept = data.offered
+  this.trackDrag(pt)
+  effect[] = this.effectFor(effect[])
+
+proc dtDragOver(this: ptr DropTarget, keys: int32, pt: PointL, effect: ptr int32): HRESULT {.stdcall.} =
+  this.trackDrag(pt)
+  effect[] = this.effectFor(effect[])
+
+proc dtDragLeave(this: ptr DropTarget): HRESULT {.stdcall.} =
+  this.accept = false
+
+proc dtDrop(this: ptr DropTarget, data: ptr DataObject, keys: int32, pt: PointL,
+            effect: ptr int32): HRESULT {.stdcall.} =
+  this.trackDrag(pt)
+  effect[] = this.effectFor(effect[])
+  this.accept = false
+  let k = hookFor(this.hwnd)
+  if k == nil or k.window.onFileDrop == nil or effect[] == DropEffectNone: return
+  for item in data.dropped: k.window.onFileDrop(item, "")
+
+var dropVtbl = DropTargetVtbl(queryInterface: dtQueryInterface, addRef: dtAddRef,
+  release: dtRelease, dragEnter: dtDragEnter, dragOver: dtDragOver,
+  dragLeave: dtDragLeave, drop: dtDrop)
+
+proc registerDrops(hwnd: HWND): bool =
+  ## OLE drops on hwnd; false when OLE isn't to be had (WM_DROPFILES then).
+  if OleInitialize(nil) < 0: return false
+  let name = toWide("UniformResourceLocatorW")
+  cfUrl = RegisterClipboardFormatW(cast[ptr WCHAR](name[0].unsafeAddr)).uint16
+  let t = create(DropTarget)  # never freed: the window's for good
+  t.vtbl = dropVtbl.addr
+  t.hwnd = hwnd
+  RegisterDragDrop(hwnd, t) >= 0
+
 proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.stdcall.} =
   let k = hookFor(h)
   if k == nil: return DefWindowProcW(h, msg, wParam, lParam)
@@ -151,7 +303,7 @@ proc initMainWindow*(window: Window) =
   window.darkTitleBar()
   k.prev = cast[WNDPROC](GetWindowLongPtrW(window.hwnd, GWLP_WNDPROC))
   discard SetWindowLongPtrW(window.hwnd, GWLP_WNDPROC, cast[LONG_PTR](hookProc))
-  DragAcceptFiles(window.hwnd, 1)
+  if not registerDrops(window.hwnd): DragAcceptFiles(window.hwnd, 1)
 
 proc startWindowDrag*(window: Window) =
   ## Moves the window with the pointer until the left button comes up. Done

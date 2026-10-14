@@ -1,8 +1,36 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..0872a09 100644
+index 5b29e3c..67a7e66 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
-@@ -814,8 +814,11 @@ proc newWindow*(
+@@ -94,6 +94,8 @@ var
+   xaXdndActionPrivate: Atom
+   xaTextUriList: Atom
+   xaTextPlain: Atom
++  xaTextPlainUtf8: Atom
++  xaString: Atom
+   xaXdndAware: Atom
+ 
+ proc initConstants(display: Display) =
+@@ -133,6 +135,8 @@ proc initConstants(display: Display) =
+   xaXdndActionPrivate = display.XInternAtom("XdndActionPrivate", 0)
+   xaTextUriList = display.XInternAtom("text/uri-list", 0)
+   xaTextPlain = display.XInternAtom("text/plain", 0)
++  xaTextPlainUtf8 = display.XInternAtom("text/plain;charset=utf-8", 0)
++  xaString = display.XInternAtom("STRING", 0)
+   xaXdndAware = display.XInternAtom("XdndAware", 0)
+ 
+ proc atomIfExist(name: string): Atom =
+@@ -192,7 +196,8 @@ proc property(
+ 
+   result.kind = kind
+ 
+-  let len = length.int * format.int div 8
++  # Xlib hands format-32 data over as C longs (8 bytes on 64-bit systems).
++  let len = length.int * (if format == 32: sizeof(clong) else: format.int div 8)
+   result.data = newString(len)
+   if len != 0:
+     copyMem(result.data[0].addr, data, len)
+@@ -814,8 +819,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -16,7 +44,7 @@ index 5b29e3c..0872a09 100644
  
    makeContextCurrent result
  
-@@ -865,8 +868,8 @@ proc pollEvents(window: Window) =
+@@ -865,8 +873,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -27,7 +55,23 @@ index 5b29e3c..0872a09 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -941,6 +944,13 @@ proc pollEvents(window: Window) =
+@@ -925,9 +933,12 @@ proc pollEvents(window: Window) =
+             if ev.client.data.l[i] != 0:
+               formats.add(cast[Atom](ev.client.data.l[i]))
+ 
+-        # Look for text/uri-list or text/plain formats.
+-        for fmt in formats:
+-          if fmt == xaTextUriList or fmt == xaTextPlain:
++        # The best format offered: a URI list, else text (a browser's link,
++        # a dragged selection). KWin hands a Wayland drag's text/plain over
++        # as TEXT, and Chromium-based browsers on Wayland offer no URI list.
++        for fmt in [xaTextUriList, xaUTF8String, xaTextPlainUtf8, xaTextPlain,
++                    xaText, xaString]:
++          if fmt in formats:
+             window.xdndFormat = fmt
+             break
+ 
+@@ -941,6 +952,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -41,7 +85,7 @@ index 5b29e3c..0872a09 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -1055,10 +1065,13 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1073,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -58,9 +102,27 @@ index 5b29e3c..0872a09 100644
  
        let
          now = getTime()
-@@ -1128,12 +1141,14 @@ proc pollEvents(window: Window) =
+@@ -1122,18 +1143,30 @@ proc pollEvents(window: Window) =
+ 
+     of xeSelection:
+       # Handle XDnD selection data.
+-      if ev.selection.property == xaWindyXdndTargetProperty:
++      if ev.selection.property == 0 and window.xdndSource != 0 and
++         ev.selection.selection == xaXdndSelection:
++        # The source couldn't give the format asked for: the drop failed.
++        if window.xdndVersion >= 2:
++          window.xdndSource.send(window.xdndSource.newClientMessage(xaXdndFinished,
++            [cast[clong](window.handle), 0.clong, 0.clong]))
++          display.XFlush()
++        window.xdndSource = 0
++        window.xdndVersion = 0
++        window.xdndFormat = 0
++      elif ev.selection.property == xaWindyXdndTargetProperty:
+         let prop = window.handle.property(xaWindyXdndTargetProperty)
+         if prop.data.len > 0:
            # Parse URI list (files separated by newlines).
-           let uriList = prop.data
+-          let uriList = prop.data
++          let uriList = prop.data.strip(leading = false, chars = {'\0'})
            for line in uriList.splitLines():
 -            if line.len > 0 and line.startsWith("file://"):
 -              # Convert URI to local path and decode percent-encoding.
@@ -79,7 +141,7 @@ index 5b29e3c..0872a09 100644
  
          # Clean up the property.
          window.handle.delProperty(xaWindyXdndTargetProperty)
-@@ -1224,8 +1239,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1257,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -90,7 +152,7 @@ index 5b29e3c..0872a09 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1348,8 +1363,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1381,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -105,6 +167,11 @@ index 5b29e3c..0872a09 100644
  
    display.XChangeProperty(
      window.handle,
+@@ -1455,3 +1492,4 @@ proc saveFileDialog*(
+     args.add("--file-filter=" & filter.name & " | " &
+       filter.extensions.replace(";", " ").replace(",", " "))
+   result = runZenity(args)
++
 diff --git a/src/windy/platforms/linux/x11/xevent.nim b/src/windy/platforms/linux/x11/xevent.nim
 index 1147b56..f88aa59 100644
 --- a/src/windy/platforms/linux/x11/xevent.nim

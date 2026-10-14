@@ -83,34 +83,40 @@ proc bashExe(): string =
   else:
     "bash"
 
+proc nonBlocking*(p: Process) =
+  ## Makes p's output pipe readable with readPipe without stalling.
+  when not defined(windows):
+    let fd = p.outputHandle.cint
+    discard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) or O_NONBLOCK)
+
+proc readPipe*(p: Process): string =
+  ## What p's output pipe holds now, without blocking (see nonBlocking).
+  var buf: array[4096, char]
+  while true:
+    when defined(windows):
+      let h = p.outputHandle
+      var avail, got: int32
+      if not peekNamedPipe(h, nil, 0, nil, avail.addr) or avail <= 0: break
+      if readFile(h, buf[0].addr, min(avail, buf.len.int32), got.addr, nil) == 0: break
+      let n = got.int
+    else:
+      let n = read(p.outputHandle.cint, buf[0].addr, buf.len)
+    if n <= 0: break
+    let at = result.len
+    result.setLen(at + n)
+    copyMem(result[at].addr, buf[0].addr, n)
+
 proc start*(e: RunEntry, script: string) =
   ## Runs script with bash in e.dir, its output piped to us. No stdin: tools
   ## like ffmpeg would otherwise read our terminal's keys. poDaemon: no
   ## console window pops up on Windows.
   e.p = startProcess(bashExe(), e.dir, ["-c", "exec </dev/null\n" & script],
     options = {poUsePath, poStdErrToStdOut, poDaemon})
-  when not defined(windows):
-    let fd = e.p.outputHandle.cint
-    discard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) or O_NONBLOCK)
-
-proc readSome(e: RunEntry, buf: var array[4096, char]): int =
-  ## Reads what the pipe holds without blocking; <= 0 when it holds nothing.
-  when defined(windows):
-    let h = e.p.outputHandle
-    var avail, got: int32
-    if not peekNamedPipe(h, nil, 0, nil, avail.addr) or avail <= 0: return 0
-    if readFile(h, buf[0].addr, min(avail, buf.len.int32), got.addr, nil) == 0: return 0
-    got
-  else:
-    read(e.p.outputHandle.cint, buf[0].addr, buf.len)
+  e.p.nonBlocking()
 
 proc readAvailable(e: RunEntry): bool =
-  var buf: array[4096, char]
-  while true:
-    let n = e.readSome(buf)
-    if n <= 0: break
-    var s = newString(n)
-    copyMem(s[0].addr, buf[0].addr, n)
+  let s = e.p.readPipe()
+  if s.len > 0:
     stdout.write s  # also to our terminal, as before the log existed
     e.add s.stripAnsi
     result = true

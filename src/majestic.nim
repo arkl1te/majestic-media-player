@@ -1,11 +1,11 @@
 ## Majestic Media Player — an mpv-based video player with a Silky UI.
 
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
-  random, tables, streams]
+  random, tables, streams, json]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg
+  rectedit, syncdlg, ytdlp
 from std/uri import encodeUrl, decodeUrl, parseUri
 
 const
@@ -16,6 +16,7 @@ const
   OptionsSize = ivec2(780, 600)
   RenameSize = ivec2(400, 116)
   CommandsSize = ivec2(880, 520)
+  YtdlpSize = ivec2(460, 176)
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
@@ -30,7 +31,11 @@ const
 
 type
   Overlay = enum
-    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync
+    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync,
+    ovYtdlp
+
+  YtMode = enum
+    ymInstall, ymUpdate, ymBusy, ymFailed  ## what the yt-dlp window asks or shows
 
   ContextMenu = enum
     cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog  ## where the right-click menu was opened
@@ -239,6 +244,24 @@ type
     syncWin: Window
     syncSk: Silky
     syncUi: Ui
+    ytJob: YtJob              ## yt-dlp at work: a download, check, update or install
+    ytUrl: string             ## the link it works for
+    ytWatch: bool             ## the link being opened goes to yt-dlp if it fails
+    ytCurrent, ytLatest: string  ## yt-dlp's versions, installed and released
+    ytError: string           ## why yt-dlp couldn't download the link
+    ytFiles: Table[string, tuple[file, chapters: string, parts: seq[string]]]
+                              ## links downloaded: the file, its chapters file
+                              ## and streams to add (unmerged)
+    ytRetry: string           ## a link to open again at ytRetryAt
+    ytRetryAt: float
+    ytHooked: string          ## the yt-dlp mpv opens links with, "" until there is one
+    ytCaps: YtJob             ## the open link's automatic captions being looked up
+    ytCaptions: Table[string, seq[tuple[url, title, lang: string]]]  ## and found, by link
+    ytMode: YtMode
+    ytMsg: string             ## the yt-dlp window's text while busy or failed
+    ytWin: Window             ## the yt-dlp window, created on first use
+    ytSk: Silky
+    ytUi: Ui
     props: seq[InfoSection]   ## File > Properties report
     propScroll: float32
     propPageH: float32        ## height of its scrolling body, for Page Up / Down
@@ -696,6 +719,10 @@ proc autosave(a: App) =
     a.cfg.save()
     a.savedCfg = j
 
+proc isWebLink(path: string): bool =
+  let l = path.toLowerAscii
+  l.startsWith("http://") or l.startsWith("https://")
+
 proc playIndex(a: App, i: int, start = -1.0) =
   ## Plays entry i from `start`, or from where it was left off when negative.
   if i < 0 or i >= a.playlist.len: return
@@ -711,7 +738,26 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.clearLoopMarks()
   a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
   a.reopening = false  # another file instead
-  a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
+  if a.ytJob.running and a.ytJob.task == ytDownload and a.ytJob.url != path:
+    a.ytJob.stop()
+    a.ytJob = nil
+  if a.ytCaps.running and a.ytCaps.url != path:
+    a.ytCaps.stop()
+    a.ytCaps = nil
+  a.ytError = ""
+  a.ytRetry = ""
+  let dl = a.ytFiles.getOrDefault(path)
+  if dl.file.len > 0 and fileExists(dl.file):
+    # Downloaded by yt-dlp: that file, with the link's chapters.
+    a.ytWatch = false
+    var opts: seq[string]
+    let quoted = proc (s: string): string = &"%{s.len}%{s}"  # taken as it is
+    if dl.chapters.len > 0: opts.add "chapters-file=" & quoted(dl.chapters)
+    if dl.parts.len > 0: opts.add "external-files=" & quoted(dl.parts.join($PathSep))
+    a.player.load(dl.file, a.resumedAt, a.cfg.repeatPingPong, opts.join(","))
+  else:
+    a.ytWatch = path.isWebLink
+    a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
   a.applyLoop()
   a.cfg.addRecent(path)
   a.cfg.lastDir = path.parentDir
@@ -777,6 +823,31 @@ proc copyToClipboard(a: App) =
       setClipboardString(path)
   a.osd("Copied " & path.extractFilename)
 
+proc looksLikeAddress(s: string): bool =
+  ## "www.example.com/watch?v=..." or "youtu.be/...": a host, then a path.
+  let host = s.split('/')[0]
+  let dot = host.rfind('.')
+  '/' in s and ' ' notin s and dot > 0 and host.len - dot - 1 >= 2 and
+    host[dot + 1 .. ^1].allCharsInSet(Letters) and
+    host.allCharsInSet(Letters + Digits + {'.', '-'})
+
+proc pathOrLink(line: string): string =
+  ## A pasted or dropped line as a path or link: file:// URIs become paths,
+  ## bare web addresses ("youtu.be/...") links, and a link amid other text
+  ## (a dragged sentence) is picked out; "" for blanks and comments.
+  var e = strutils.strip(line, chars = Whitespace + {'"', '\''})
+  if e.contains("://") and e.contains(' '):
+    for word in strutils.splitWhitespace(e):
+      if word.contains("://"):
+        e = strutils.strip(word, chars = {'"', '\'', '<', '>', '(', ')', ','})
+        break
+  if e.len == 0 or e.startsWith("#"): ""
+  elif e.toLowerAscii.startsWith("file://"): decodeUrl(e.parseUri.path, false)
+  elif e.contains("://"): e
+  elif not fileExists(e.expandTilde) and not dirExists(e.expandTilde) and e.looksLikeAddress:
+    "https://" & e  # for yt-dlp
+  else: e.expandTilde
+
 proc clipboardPaths(a: App): seq[string] =
   ## Files and URLs on the clipboard: a file manager's text/uri-list (on
   ## Windows, Explorer's file list), or plain text holding paths or URLs, one
@@ -794,12 +865,8 @@ proc clipboardPaths(a: App): seq[string] =
       if code2 == 0: text = uris
   if text.len == 0: text = getClipboardString()
   for line in text.splitLines:
-    let e = strutils.strip(line, chars = Whitespace + {'"', '\''})
-    if e.len == 0 or e.startsWith("#"): continue
-    if e.toLowerAscii.startsWith("file://"):
-      result.add decodeUrl(e.parseUri.path, false)
-    elif e.contains("://"): result.add e
-    else: result.add e.expandTilde
+    let p = pathOrLink(line)
+    if p.len > 0: result.add p
 
 proc openFromClipboard(a: App) =
   if a.editLocked: return
@@ -2525,14 +2592,14 @@ proc applyUiScale(a: App) =
   if s == a.sk.uiScale: return
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
     sk.atlasScale = s
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
-                    (a.syncWin, SyncSize)]:
+                    (a.syncWin, SyncSize), (a.ytWin, YtdlpSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
@@ -2715,6 +2782,195 @@ proc pollJobs(a: App) =
         else: &"{e.title} failed (exit code {e.code})")
       if e.code == 0 and not e.stopped:
         for f in e.reveal: a.showInFolder(f)
+
+# --- yt-dlp -------------------------------------------------------------------
+# A link mpv can't open (its yt-dlp hook included) goes on from here: yt-dlp is
+# installed when missing, else updated when a newer one is out, else it
+# downloads the video, which then opens from the file.
+
+proc shortPath(path: string): string =
+  ## path with the home folder as "~".
+  let home = getHomeDir().strip(leading = false, chars = {DirSep})
+  if path.startsWith(home & DirSep): "~" & path[home.len .. ^1] else: path
+
+const HookStart = 0.5  ## seconds for a newly loaded mpv hook script to get going
+
+proc hookYtdlp(a: App) =
+  ## Lets mpv open links through yt-dlp, once there is one. mpv keeps the
+  ## path it first found, so outside Windows it gets a link of ours, moved
+  ## to whichever yt-dlp is found now.
+  let exe = findYtdlp()
+  if exe.len == 0 or exe == a.ytHooked: return
+  var path = exe
+  when not defined(windows):
+    let link = getCacheDir("majestic-media-player") / "yt-dlp-exe"
+    try:
+      createDir(link.parentDir)
+      if symlinkExists(link) or fileExists(link): removeFile(link)
+      createSymlink(exe, link)
+      path = link
+    except OSError: discard
+  # Moving the link is enough for a hook that has it already.
+  if a.ytHooked.len == 0 or path == exe: a.player.useYtdlp(path)
+  a.ytHooked = exe
+
+proc ytStatus(a: App): string =
+  ## What yt-dlp is doing, for the status bar; "" when nothing.
+  let j = a.ytJob
+  if not j.running: return
+  case j.task
+  of ytDownload:
+    result = "Downloading"
+    if j.progress >= 0: result.add &" {int(j.progress)}%"
+  of ytVersion, ytLatest: result = "Checking yt-dlp"
+  of ytUpdate: result = "Updating yt-dlp"
+  of ytInstall:
+    result = "Installing yt-dlp"
+    if j.progress >= 0: result.add &" {int(j.progress)}%"
+  of ytCaptions: discard  # its own slot, quietly
+
+proc ytCurrentLink(a: App): string =
+  if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
+
+proc ytOpen(a: App, url: string, delay = 0.0) =
+  ## Opens url again, now through yt-dlp or its download, unless another
+  ## entry has been opened meanwhile.
+  if delay > 0:
+    (a.ytRetry, a.ytRetryAt) = (url, now() + delay)
+  elif url.len > 0 and a.ytCurrentLink == url: a.playIndex(a.plIndex)
+
+proc ytDownload(a: App, url: string) =
+  if a.ytCurrentLink != url: return
+  a.ytJob = download(findYtdlp(), url)
+
+proc closeDialogs(a: App) =
+  ## Closes whichever dialog or overlay is up (as Cancel would).
+  case a.overlay
+  of ovOptions: a.closeOptions(false)
+  of ovRename: a.closeRename()
+  of ovCommands: a.closeCommands()
+  of ovPick: a.closePick()
+  of ovSync: a.closeSyncProps()
+  of ovYtdlp:
+    a.ytUi.focusId = ""
+    a.ytWin.visible = false
+  else: discard
+  a.overlay = ovNone
+
+proc showYtdlp(a: App, mode: YtMode, msg = "") =
+  a.menus.close()
+  if a.overlay notin {ovNone, ovYtdlp}: a.closeDialogs()
+  if a.ytWin == nil:
+    (a.ytWin, a.ytSk, a.ytUi) = a.newDialogWindow("yt-dlp", YtdlpSize)
+  a.ytMode = mode
+  a.ytMsg = msg
+  if a.overlay != ovYtdlp:
+    a.ytUi.focusId = ""
+    a.showDialog(a.ytWin, YtdlpSize)
+    a.overlay = ovYtdlp
+
+proc closeYtdlp(a: App) =
+  ## Hides the yt-dlp window. Turning down an update still gets the video:
+  ## downloaded with the yt-dlp there is.
+  let declined = a.ytMode == ymUpdate
+  a.ytUi.focusId = ""
+  if a.overlay == ovYtdlp: a.overlay = ovNone
+  if a.ytWin.visible:
+    a.ytWin.visible = false
+    a.window.activate()
+  if declined: a.ytDownload(a.ytUrl)
+
+proc ytFailed(a: App, url: string) =
+  ## A link didn't open: on to yt-dlp.
+  if a.ytJob.running and a.ytJob.task in {ytUpdate, ytInstall}: return
+  if a.ytJob.running: a.ytJob.stop()
+  a.ytUrl = url
+  a.ytError = ""
+  let exe = findYtdlp()
+  if exe.len == 0:
+    a.showYtdlp(ymInstall)
+  elif exe != a.ytHooked:
+    a.hookYtdlp()  # installed meanwhile: mpv tries again with it
+    a.ytOpen(url, HookStart)
+  else:
+    (a.ytCurrent, a.ytLatest) = ("", "")
+    a.ytJob = version(exe)
+
+proc ytInstall(a: App, msg: string) =
+  a.ytJob = install()
+  a.showYtdlp(ymBusy, msg)
+
+proc ytAnswer(a: App, ok: bool) =
+  ## The yt-dlp window's buttons: install or update, else close it.
+  if ok and a.ytMode == ymInstall:
+    a.ytInstall("Installing yt-dlp to " & shortPath(managedPath()) & "...")
+  elif ok and a.ytMode == ymUpdate:
+    a.ytJob = update(findYtdlp())
+    a.showYtdlp(ymBusy, "Updating yt-dlp (yt-dlp -U)...")
+  else: a.closeYtdlp()
+
+proc addCaptions(a: App, url: string) =
+  for c in a.ytCaptions.getOrDefault(url):
+    a.player.h.commandAsync("sub-add", c.url, "auto", c.title, c.lang)
+
+proc pollYtdlp(a: App) =
+  let p = a.player
+  if a.ytRetry.len > 0 and now() >= a.ytRetryAt:
+    let url = a.ytRetry
+    a.ytRetry = ""
+    a.ytOpen(url)
+  if a.ytWatch and not p.opening and (p.loaded or p.loadError.len > 0):
+    a.ytWatch = false
+    if p.loadError.len > 0: a.ytFailed(p.path)
+  # A link opened (streamed or downloaded): its automatic captions join.
+  let link = a.ytCurrentLink
+  if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp().len > 0:
+    if link in a.ytCaptions: a.addCaptions(link)
+    elif not a.ytCaps.running: a.ytCaps = captions(findYtdlp(), link)
+  if a.ytCaps != nil and a.ytCaps.poll() and not a.ytCaps.running:
+    let j = a.ytCaps
+    a.ytCaps = nil
+    if j.code == 0:
+      a.ytCaptions[j.url] = j.originalCaptions
+      if link == j.url and p.loaded: a.addCaptions(link)
+  let j = a.ytJob
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  if j.running: return
+  a.ytJob = nil
+  case j.task
+  of ytCaptions: discard
+  of ytVersion:
+    a.ytCurrent = j.versionText
+    a.ytJob = latest()
+  of ytLatest:
+    a.ytLatest = j.versionText
+    if newer(a.ytLatest, a.ytCurrent): a.showYtdlp(ymUpdate)
+    else: a.ytDownload(a.ytUrl)
+  of ytUpdate:
+    if j.code == 0:
+      a.closeYtdlp()
+      a.ytOpen(a.ytUrl)
+    else:
+      # yt-dlp can't update itself (one from a package manager): the
+      # standalone build instead, which can.
+      a.ytInstall("This yt-dlp can't update itself (" & j.errorText &
+        "). Installing the standalone build, which can, to " & shortPath(managedPath()) & "...")
+  of ytInstall:
+    if j.code == 0:
+      a.hookYtdlp()
+      a.closeYtdlp()
+      a.osd("yt-dlp installed")
+      a.ytOpen(a.ytUrl, HookStart)
+    else:
+      a.showYtdlp(ymFailed, "yt-dlp couldn't be installed: " & j.errorText)
+  of ytDownload:
+    if j.code == 0:
+      a.ytFiles[j.url] = (j.file, j.chaptersFile, j.parts)
+      a.ytOpen(j.url)
+    else:
+      a.ytError = "yt-dlp: " & j.errorText
+      a.osd("Couldn't open the link: " & a.ytError)
 
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
@@ -3499,7 +3755,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovPick, ovSync}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -3987,6 +4243,11 @@ proc seekBar(a: App, r: Rect) =
   let hov = (ui.hover(r) and mouseIn or active) and dur > 0 and p.loaded
   let th = if hov: 6'f32 else: 4'f32
   ui.rect(rect(x0, cy - th / 2, w, th), colTrack)
+  if dur > 0 and p.loaded:
+    # What has been read ahead, beneath the played part.
+    for (bs, be) in p.buffered:
+      let bx = x0 + w * clamp(bs / dur, 0, 1)
+      ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / dur, 0, 1) - bx, th), colBuffered)
   let cur = if active: a.seekDragT else: p.timePos
   let frac = if dur > 0: clamp(cur / dur, 0, 1) else: 0
   ui.rect(rect(x0, cy - th / 2, w * frac, th), colAccent)
@@ -4311,14 +4572,22 @@ proc status(a: App, r: Rect) =
     elif p.hasRealVideo: "film16"
     else: "music16"
   ui.icon(fileIcon, vec2(r.x + 16, r.y + r.h / 2), if p.loaded: colAccent else: colTextDim)
+  let yt = a.ytStatus
   let state =
-    if not p.loaded: "Stopped"
+    if yt.len > 0: yt & "..."
+    elif p.opening: "Opening..."
+    elif not p.loaded: "Stopped"
     elif p.stopped: "Stopped"
     elif p.paused: "Paused"
     else: "Playing"
-  ui.textIn(state, rect(r.x + 30, r.y, 120, r.h), colText, FontSmall)
-  if p.loadError.len > 0:
-    ui.textIn("Error: " & p.loadError, rect(r.x + 100, r.y, r.w / 2, r.h), colMarker, FontSmall)
+  let sw = ui.textSize(state, FontSmall).x
+  ui.textIn(state, rect(r.x + 30, r.y, sw + 4, r.h), colText, FontSmall)
+  let err = if a.ytError.len > 0: a.ytError
+            elif yt.len > 0 or a.overlay == ovYtdlp or p.opening: ""
+            else: p.loadError
+  if err.len > 0:
+    ui.textIn("Error: " & err, rect(r.x + 30 + max(sw + 16, 70), r.y, r.w / 2, r.h),
+      colMarker, FontSmall)
 
   # Right side: audio icon, time.
   let audioIcon =
@@ -4661,9 +4930,11 @@ proc runLogPanel(a: App, r: Rect) =
     ui.textIn(row, rect(textX, y, textW, rowH), rows[i][1], FontSmall)
   ui.sk.popClipRect()
 
-proc dropFiles(a: App, paths: seq[string]) =
+proc dropFiles(a: App, dropped: seq[string]) =
   ## Dropped on the playlist: insert at the row boundary under the pointer and
-  ## keep playing. Anywhere else: replace the playlist and play.
+  ## keep playing. Anywhere else: replace the playlist and play. Files, links
+  ## (from a browser) and text holding them (a dragged selection) alike.
+  let paths = dropped.mapIt(pathOrLink(it)).filterIt(it.len > 0)
   let list = a.plListRect
   if list.w > 0 and a.dropAt.inside(list):
     let at = int((a.dropAt.y - list.y + a.plScroll) / PlaylistRowH + 0.5)
@@ -4865,6 +5136,66 @@ proc renderSyncProps(a: App, shot: string) =
     if sel.len > 0: a.setFollowOf(d.selected, d.newOffset, sel[0].loop)
   of saLoop:
     if sel.len > 0: a.setFollowOf(d.selected, sel[0].offset, d.newLoop)
+
+proc renderYtdlp(a: App, shot: string) =
+  ## Draws the yt-dlp window: an install or update to agree to, or one going on.
+  if a.overlay != ovYtdlp: return
+  let w = a.ytWin
+  let ui = a.ytUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeYtdlp()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+  let esc = w.buttonPressed[KeyEscape]
+  if not a.beginDialogDraw(w, a.ytSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.ytSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = ui.size.x
+  let H = ui.size.y
+  let text = case a.ytMode
+    of ymInstall:
+      "Opening this link needs yt-dlp, which wasn't found on PATH. Install it? " &
+        "Its standalone build goes to " & shortPath(managedPath()) &
+        ", from where it keeps itself up to date (yt-dlp -U)."
+    of ymUpdate:
+      &"This link didn't open. A newer yt-dlp is out: {a.ytLatest} (you have " &
+        &"{a.ytCurrent}). Update it now? Otherwise the video is downloaded " &
+        "with the one you have."
+    of ymBusy, ymFailed: a.ytMsg
+  var y = 14'f32
+  for line in ui.wrapText(text, W - 32, 5):
+    ui.textIn(line, rect(16, y, W - 32, 22), colText)
+    y += 22
+  let j = a.ytJob
+  if a.ytMode == ymBusy and j.running:
+    let r = rect(16, min(y + 10, H - 56), W - 32, 6)
+    ui.rect(r, colTrack)
+    if j.progress >= 0: ui.rect(rect(r.x, r.y, r.w * clamp(j.progress / 100, 0, 1), r.h), colAccent)
+  let bw = 100'f32
+  let br = rect(W - 16 - bw, H - 44, bw, 28)
+  var ok, cancel = false
+  case a.ytMode
+  of ymInstall, ymUpdate:
+    ok = ui.textButton("yt-ok", br, (if a.ytMode == ymInstall: "Install" else: "Update"),
+      primary = true)
+    cancel = ui.textButton("yt-cancel", rect(br.x - bw - 8, br.y, bw, br.h),
+      if a.ytMode == ymInstall: "Cancel" else: "Not now")
+  of ymBusy: cancel = ui.textButton("yt-hide", br, "Hide")
+  of ymFailed: cancel = ui.textButton("yt-close", br, "Close", primary = true)
+  ui.drawTooltip()
+  a.ytSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-ytdlp.png")
+  a.endDialogDraw(w, a.ytSk, size)
+  if (ok or enter) and a.ytMode in {ymInstall, ymUpdate}: a.ytAnswer(true)
+  elif cancel or esc or (enter and a.ytMode == ymFailed): a.ytAnswer(false)
 
 proc renderCommands(a: App, shot: string) =
   ## Draws the Commands window window and carries out its buttons.
@@ -5345,6 +5676,8 @@ proc frame(a: App) =
       if ui.pressed() and a.rectEdit == nil: a.pickWin.activate()
     of ovSync:
       if ui.pressed(): a.syncWin.activate()
+    of ovYtdlp:
+      if ui.pressed(): a.ytWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -5423,6 +5756,7 @@ proc frame(a: App) =
   a.renderCommands(shot)
   a.renderPick(shot)
   a.renderSyncProps(shot)
+  a.renderYtdlp(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -5434,6 +5768,7 @@ proc keyUi(a: App): Ui =
   of ovCommands: a.cmdUi
   of ovPick: a.pickUi
   of ovSync: a.syncUi
+  of ovYtdlp: a.ytUi
   else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
@@ -5554,6 +5889,18 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "quit": a.window.closeRequested = true
   of "uiscale": a.cfg.uiScale = parseFloat(arg)  # percent, as Options sets it
   of "set": a.player.h.setProp(st.args[0], st.args[1 .. ^1].join(" "))
+  of "ytdlp":  # 1 | 0: the yt-dlp window's Install/Update or Cancel; "download": the open link
+    if arg == "download":
+      a.ytUrl = a.ytCurrentLink
+      a.ytDownload(a.ytUrl)
+    else: a.ytAnswer(arg == "1")
+  of "ytdump":
+    stderr.writeLine "ytdlp status=", a.ytStatus, " mode=", a.ytMode, " overlay=", a.overlay,
+      " opening=", a.player.opening, " loaded=", a.player.loaded, " path=", a.player.path,
+      " err=", a.player.loadError, " yterr=", a.ytError, " hooked=", a.ytHooked,
+      " versions=", a.ytCurrent, "/", a.ytLatest, " msg=", a.ytMsg,
+      " buffered=", a.player.buffered, " chapters=", a.player.chapters.len,
+      " subs=", a.player.tracks.countIt(it.kind == "sub")
   of "dump":
     for prop in st.args:
       stderr.writeLine "dump ", prop, " = ", a.player.h.getStr(prop)
@@ -5622,6 +5969,8 @@ proc main() =
   a.quad = newQuadRenderer()
 
   a.player = newPlayer(a.cfg.volume, a.cfg.muted, a.cfg.showOsd)
+  a.hookYtdlp()
+  pruneDownloads()
   a.player.initRender()
   a.applyLoop()
   a.syncSettings()
@@ -5704,6 +6053,7 @@ proc main() =
     if a.cmdWin != nil: a.cmdWin.runeInputEnabled = true
     if a.pickWin != nil: a.pickWin.runeInputEnabled = true
     if a.syncWin != nil: a.syncWin.runeInputEnabled = true
+    if a.ytWin != nil: a.ytWin.runeInputEnabled = true
     pollEvents()
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
@@ -5715,12 +6065,7 @@ proc main() =
         if it.contains("://"): it else: it.absolutePath))
       a.osd("Opening in the synchronization master")
     elif incoming.len > 0:
-      if a.overlay == ovOptions: a.closeOptions(false)
-      if a.overlay == ovRename: a.closeRename()
-      if a.overlay == ovCommands: a.closeCommands()
-      if a.overlay == ovPick: a.closePick()
-      if a.overlay == ovSync: a.closeSyncProps()
-      a.overlay = ovNone
+      a.closeDialogs()
       a.ui.focusId = ""
       a.openPaths(incoming.mapIt(if it.contains("://"): it else: it.absolutePath))
       a.window.activate()
@@ -5741,6 +6086,7 @@ proc main() =
     a.preview.pollEvents()
     a.pollDialog()
     a.pollJobs()
+    a.pollYtdlp()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -5807,6 +6153,8 @@ proc main() =
       sleep(1)
 
   if a.overlay == ovOptions: a.closeOptions(false)
+  if a.ytJob.running and a.ytJob.task == ytDownload: a.ytJob.stop()
+  if a.ytCaps.running: a.ytCaps.stop()
   a.savePosition()
   a.rememberState()
   a.cfg.save()
