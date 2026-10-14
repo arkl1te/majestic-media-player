@@ -369,6 +369,38 @@ proc stepper*(ui: Ui, id: string, pos: Vec2, label: string, value: var float,
       value = clamp(value + dir * step, lo, hi)
       result = true
 
+proc slider*(ui: Ui, id: string, r: Rect, value: var float, lo, hi, step: float): bool =
+  ## Horizontal track with a knob: drag or click it, scroll over it, or
+  ## Left/Right (Home/End) while it has keyboard focus. Returns true when
+  ## value changed.
+  let hov = ui.hover(r)
+  let focused = ui.tabStop(id, r)
+  if hov and ui.pressed():
+    ui.activeId = id
+    ui.navId = id
+    ui.consumeClick()
+  var v = value
+  if ui.activeId == id and ui.down():
+    v = lo + clamp((ui.mouse.x - r.x) / r.w, 0, 1) * (hi - lo)
+  if hov and ui.scroll() != 0:
+    v += (if ui.scroll() < 0: step else: -step)
+    ui.scrollConsumed = true
+  if ui.navKey(id, KeyRight) or ui.navKey(id, KeyUp): v += step
+  if ui.navKey(id, KeyLeft) or ui.navKey(id, KeyDown): v -= step
+  if ui.navKey(id, KeyHome): v = lo
+  if ui.navKey(id, KeyEnd): v = hi
+  v = clamp(round((v - lo) / step) * step + lo, lo, hi)
+  if v != value:
+    value = v
+    result = true
+  let cy = r.y + r.h / 2
+  let frac = clamp((value - lo) / (hi - lo), 0, 1).float32
+  ui.rect(rect(r.x, cy - 2, r.w, 4), colTrack)
+  ui.rect(rect(r.x, cy - 2, r.w * frac, 4), colAccent)
+  ui.icon("knob16", vec2(r.x + r.w * frac, cy),
+    if hov or ui.activeId == id: colWhite else: colText)
+  if focused: ui.focusRing(r)
+
 proc radioButton*(ui: Ui, id: string, pos: Vec2, label: string, selected: bool,
                   enabled = true): bool =
   ## Returns true when clicked while not selected.

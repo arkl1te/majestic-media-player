@@ -29,6 +29,7 @@ type
     kaLoadAudio = "load-audio"
     kaOpenClipboard = "open-clipboard"
     kaCopyClipboard = "copy-clipboard"
+    kaCopyTimeLink = "copy-time-link"
     kaClose = "close"
     kaScreenshot = "screenshot"
     kaProperties = "properties"
@@ -110,6 +111,7 @@ const
     (kgFile, "Load audio file", "Load Audio", ""),
     (kgFile, "Open from clipboard", "Open From Clipboard", "Ctrl+V"),
     (kgFile, "Copy to clipboard", "Copy to Clipboard", "Ctrl+C"),
+    (kgFile, "Copy YouTube link at current time", "Copy Link at Time", "Ctrl+Shift+C"),
     (kgFile, "Close", "Close", "Ctrl+X"),
     (kgFile, "Save screenshot", "Screenshot", "Alt+I"),
     (kgFile, "Properties", "Properties", ""),

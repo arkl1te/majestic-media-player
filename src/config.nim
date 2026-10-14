@@ -56,6 +56,8 @@ type
     uiScale*: float = 100          # percent
     openMode*: OpenMode = omSamePlayer
     osdTimestamp*: bool = false
+    osdScale*: float = 1           # OSD text size multiplier
+    osdScaleByWindow*: bool = true # OSD text grows and shrinks with the video frame
     showMillis*: bool = false      # timestamps as HH:MM:SS.mmm
     showRemaining*: bool = false   # status/OSD time as -remaining / duration
     showAllShortcuts*: bool = false  # status bar hints include view toggles and pan/rotate/scale
@@ -104,6 +106,8 @@ type
 const
   MaxRecent = 15
   LoopFramesMaxMB* = 4096          ## hard cap of loopFramesMB (4 GB)
+  OsdScaleMin* = 0.25             ## range of osdScale
+  OsdScaleMax* = 8.0
 
 proc expandPath*(p: string): string =
   ## A folder typed in Options: trimmed, with ~ expanded.

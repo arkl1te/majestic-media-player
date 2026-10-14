@@ -9,6 +9,7 @@ import ui, theme, config, assoc, keymap
 type
   OptionsPage* = enum
     opPlayer = "Player"
+    opInterface = "Interface"
     opFormats = "Formats"
     opPaths = "Paths"
     opKeys = "Keys"
@@ -26,7 +27,7 @@ type
 
   OptionsDialog* = ref object
     page*: OptionsPage
-    playerOpen: bool            ## Player node expanded (shows Formats, Paths)
+    playerOpen: bool            ## Player node expanded (shows Interface, Formats, Paths, Keys)
     scroll: float32             ## page content scroll
     assoc: seq[AssocItem]
     assocLoaded: bool
@@ -50,9 +51,9 @@ type
     started: bool               ## a group header was placed already
 
 const
-  Tree = [(opPlayer, 0), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
+  Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
           (opSubtitles, 0), (opMisc, 0), (opSystem, 0)]
-  PlayerChildren = {opFormats, opPaths, opKeys}
+  PlayerChildren = {opInterface, opFormats, opPaths, opKeys}
   TreeWidth = 180'f32
   TreeRow = 22'f32
   TreeIndent = 16'f32
@@ -227,9 +228,6 @@ proc folderNote(ui: Ui, p: var Pane, value: string) =
 # --- pages ----------------------------------------------------------------------
 
 proc playerPage(ui: Ui, c: var Config, p: var Pane) =
-  ui.group(p, "Interface")
-  ui.numberRow(p, "o-scale", "UI scaling (percent)", c.uiScale, 25, 50, 300)
-  ui.hint(p, "Size of text, menus and controls in every window.")
   ui.group(p, "Open options")
   ui.radioRow(p, "o-same", "Same player for each media file", c.openMode, omSamePlayer)
   ui.radioRow(p, "o-new", "New player for each media file", c.openMode, omNewPlayer)
@@ -240,6 +238,22 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
   ui.checkRow(p, "o-rxf", "Remember last pan, rotation and zoom", c.rememberTransform)
   ui.checkRow(p, "o-rpl", "Remember playlist", c.rememberPlaylist)
+
+proc interfacePage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Interface")
+  ui.numberRow(p, "o-scale", "UI scaling (percent)", c.uiScale, 25, 50, 300)
+  ui.hint(p, "Size of text, menus and controls in every window.")
+  ui.group(p, "OSD")
+  ui.textIn("OSD scaling", rect(p.x + 8, p.y, LabelW, 26), colText)
+  let sw = clamp(p.w - LabelW - 8 - 70, 120'f32, 300'f32)
+  discard ui.slider("o-osdscale", rect(p.x + 8 + LabelW, p.y, sw, 26), c.osdScale,
+    OsdScaleMin, OsdScaleMax, 0.05)
+  ui.textIn("x" & formatFloat(c.osdScale, ffDecimal, 2),
+    rect(p.x + 8 + LabelW + sw + 14, p.y, 60, 26), colText)
+  p.y += Row + 4
+  ui.checkRow(p, "o-osdwin", "Scale with window size", c.osdScaleByWindow)
+  ui.hint(p, if c.osdScaleByWindow: "OSD text grows and shrinks with the video frame."
+             else: "OSD text keeps the same size whatever the window's size.")
   ui.group(p, "Timestamps")
   ui.checkRow(p, "o-osdtime", "Show timestamp in OSD", c.osdTimestamp)
   ui.checkRow(p, "o-millis", "Show milliseconds", c.showMillis)
@@ -649,6 +663,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   let pageStops = ui.tabStops.len
   case d.page
   of opPlayer: playerPage(ui, c, p)
+  of opInterface: interfacePage(ui, c, p)
   of opFormats: d.formatsPage(ui, p, pageR.y + pageR.h)
   of opPaths: d.pathsPage(ui, c, p)
   of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)

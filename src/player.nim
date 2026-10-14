@@ -22,7 +22,8 @@ type
 
   Prop = enum
     pPause, pTimePos, pDuration, pEof, pTracks, pChapters, pVolume, pMute,
-    pSpeed, pVideoParams, pAudioChannels, pIdle, pSeeking, pCacheState
+    pSpeed, pVideoParams, pAudioChannels, pIdle, pSeeking, pCacheState,
+    pPausedForCache
 
   Player* = ref object
     h*: MpvHandle
@@ -49,6 +50,8 @@ type
     tracks*: seq[Track]
     chapters*: seq[Chapter]
     buffered*: seq[(float, float)]  ## spans read ahead into the cache, seconds
+    cacheAhead*: float = -1   ## seconds read ahead of the position (-1: unknown)
+    buffering*: bool          ## playback held until the cache fills
     videoW*, videoH*: int     ## display size (aspect-corrected)
     pixelW*, pixelH*: int     ## stored size, as upright as shown (what ffmpeg
                               ## filters see, autorotation included)
@@ -118,7 +121,8 @@ proc observe(h: MpvHandle) =
       (pSpeed, "speed", fmtDouble), (pVideoParams, "video-params", fmtNode),
       (pAudioChannels, "audio-params/channel-count", fmtInt64),
       (pIdle, "idle-active", fmtFlag), (pSeeking, "seeking", fmtFlag),
-      (pCacheState, "demuxer-cache-state", fmtNode)]:
+      (pCacheState, "demuxer-cache-state", fmtNode),
+      (pPausedForCache, "paused-for-cache", fmtFlag)]:
     discard mpv_observe_property(h, p.uint64, name.cstring, fmt)
   for i, name in MirroredProps:
     discard mpv_observe_property(h, uint64(MirrorBase + i), name.cstring, fmtString)
@@ -280,9 +284,13 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pIdle: discard
   of pCacheState:
     p.buffered.setLen 0
+    p.cacheAhead = -1
     if d != nil and ev.format == fmtNode:
-      for r in cast[ptr MpvNode](d)[].toJson{"seekable-ranges"}.getElems:
+      let j = cast[ptr MpvNode](d)[].toJson
+      for r in j{"seekable-ranges"}.getElems:
         p.buffered.add (r{"start"}.getFloat, r{"end"}.getFloat)
+      if j{"cache-duration"} != nil: p.cacheAhead = j{"cache-duration"}.getFloat
+  of pPausedForCache: p.buffering = b
   of pTracks, pChapters, pVideoParams:
     let j = if d == nil or ev.format != fmtNode: newJNull()
             else: cast[ptr MpvNode](d)[].toJson
@@ -385,6 +393,8 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "") 
   p.loadError = ""
   p.opening = true
   p.buffered.setLen 0
+  p.cacheAhead = -1
+  p.buffering = false
   p.setBackward(false)
   var o = opts
   if start > 0:
@@ -417,6 +427,8 @@ proc close*(p: Player) =
   p.opening = false
   p.stopped = false
   p.buffered.setLen 0
+  p.cacheAhead = -1
+  p.buffering = false
   p.sphere = SphereInfo()
   p.tracks.setLen 0
   p.chapters.setLen 0

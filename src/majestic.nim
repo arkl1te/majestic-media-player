@@ -6,13 +6,14 @@ import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
   rectedit, syncdlg, ytdlp
-from std/uri import encodeUrl, decodeUrl, parseUri
+from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
   AppName = "Majestic Media Player"
   AppVersion = staticRead("../VERSION").strip  # single source of truth: /VERSION
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
+  MinCompactWindow = ivec2(16, 16)  ## pixels, not UI units: compact mode shrinks all the way
   OptionsSize = ivec2(780, 600)
   RenameSize = ivec2(400, 116)
   CommandsSize = ivec2(880, 520)
@@ -171,7 +172,7 @@ type
     xf: VideoTransform
     subs: SubLayout
     subsKey: string           ## mpv subtitle placement last pushed
-    osdFit: tuple[key: string, target, x, y: (int, int), subMarginX: int, props: string]
+    osdFit: tuple[key: string, target, x, y: (int, int), subMarginX: int, unit: float, props: string]
     afterPlayback: AfterPlayback
     overlay: Overlay
     optionsDlg: OptionsDialog
@@ -264,6 +265,8 @@ type
     ytUi: Ui
     props: seq[InfoSection]   ## File > Properties report
     propScroll: float32
+    hintScroll: float32         ## status bar key hints' horizontal scroll
+    hintScrollKey: string       ## the hints hintScroll belongs to
     propPageH: float32        ## height of its scrolling body, for Page Up / Down
     propThumbFrom: (float32, float32)    ## pointer y and scroll when the thumb drag began
     dialog: Dialog
@@ -293,6 +296,7 @@ type
     osdLayer: OsdLayer        ## draws the OSD while the video is transformed
     osdFlag: bool             ## the OSD layer asked for a redraw
     osdApart: bool            ## the OSD is drawn by osdLayer now
+    osdLayerSizes: string     ## osdSizes last pushed to osdLayer
     osdStatus: string         ## the layer's status line as last sent
     rotMoved: bool            ## past the click threshold; a click resets rotation
     lastMouse: Vec2
@@ -392,7 +396,8 @@ proc px(a: App, r: Rect): Rect =
   let s = a.sk.uiScale
   rect(r.x * s, r.y * s, r.w * s, r.h * s)
 
-proc minWindow(a: App): IVec2 = a.px(MinWindow)
+proc minWindow(a: App): IVec2 =
+  if a.cfg.compactMode: MinCompactWindow else: a.px(MinWindow)
 
 proc menuBarHeight(a: App): float32 =
   ## Height of the menu bar as laid out: none in full screen or compact mode.
@@ -513,7 +518,10 @@ proc setCompact(a: App, on: bool) =
   if a.window.maximized: return
   let menu = a.px(ivec2(0, int32(MenuBarHeight))).y
   let d = if on: menu else: -menu
-  a.window.size = a.window.size - ivec2(0, d)
+  var size = a.window.size - ivec2(0, d)
+  size.x = max(size.x, a.minWindow.x)
+  size.y = max(size.y, a.minWindow.y)
+  a.window.size = size
   let moved = content + ivec2(0, d)
   a.window.moveFrame(if on: moved else: moved - a.frameInset)
 
@@ -849,6 +857,35 @@ proc copyToClipboard(a: App) =
     except OSError:
       setClipboardString(path)
   a.osd("Copied " & path.extractFilename)
+
+proc youtubeId(url: string): string =
+  ## The video id of a YouTube link (watch?v=, youtu.be/, shorts/, live/,
+  ## embed/), "" for anything else.
+  let u = try: url.parseUri except UriParseError: return ""
+  var host = u.hostname.toLowerAscii
+  for pre in ["www.", "m.", "music."]:
+    if host.startsWith(pre): host = host[pre.len .. ^1]
+  let parts = u.path.split('/').filterIt(it.len > 0)
+  if host == "youtu.be":
+    if parts.len > 0: result = parts[0]
+  elif host in ["youtube.com", "youtube-nocookie.com"]:
+    if parts.len == 1 and parts[0] == "watch":
+      for (k, v) in u.query.decodeQuery:
+        if k == "v": result = v
+    elif parts.len >= 2 and parts[0] in ["shorts", "live", "embed", "v"]:
+      result = parts[1]
+  if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
+
+proc copyTimeLink(a: App) =
+  ## The YouTube link with the current position, so it opens right here.
+  if not a.player.loaded or a.plIndex notin 0 ..< a.playlist.len: return
+  let id = a.playlist[a.plIndex].youtubeId
+  if id.len == 0:
+    a.osd("Not a YouTube video")
+    return
+  let t = max(0, a.player.timePos.int)
+  setClipboardString("https://www.youtube.com/watch?v=" & id & "&t=" & $t & "s")
+  a.osd("Copied link at " & fmtTime(t.float))
 
 proc looksLikeAddress(s: string): bool =
   ## "www.example.com/watch?v=..." or "youtu.be/...": a host, then a path.
@@ -3084,6 +3121,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     action = proc () = a.openFromClipboard())
   file.item("Copy to Clipboard", k(kaCopyClipboard), enabled = loaded,
     action = proc () = a.copyToClipboard())
+  file.item("Copy YouTube Link at Current Time", k(kaCopyTimeLink),
+    enabled = loaded and a.plIndex in 0 ..< a.playlist.len and
+      a.playlist[a.plIndex].youtubeId.len > 0, action = proc () = a.copyTimeLink())
   file.item("Close", k(kaClose), enabled = loaded and not locked, action = proc () = a.closeFile())
   file.sep()
   file.item("Save Screenshot...", k(kaScreenshot), enabled = loaded and p.hasVideo,
@@ -3564,7 +3604,7 @@ proc unitsOpt(units: int): int =
   int(ceil(float(units) * 720 / OsdPlayResY + 0.1))
 
 proc osdLayout(alignX, marginX: int, target: (int, int), mx, my: (int, int)):
-    tuple[target, x, y: (int, int), subMarginX: int, props: string] =
+    tuple[target, x, y: (int, int), subMarginX: int, unit: float, props: string] =
   ## The OSD is laid out on the whole (padded) target: counter-scale and
   ## re-place it so it keeps the look and spot it has on the unpadded video.
   ## Its canvas is 288 units high (PlayResX = 288 * aspect, truncated) and
@@ -3572,9 +3612,11 @@ proc osdLayout(alignX, marginX: int, target: (int, int), mx, my: (int, int)):
   ## target gets extra pixels on both sides of each axis, chosen so whole
   ## units land on the spot. They leave centered subtitles in place; anchored
   ## ones get their sub-margin-x redone to stay put. Returns the grown target
-  ## and margins, the subtitles' margin option and the OSD property settings.
+  ## and margins, the subtitles' margin option, the factor that undoes the
+  ## padding's growth of OSD sizes and the OSD property settings (but for
+  ## osd-scale and osd-outline-size, see osdSizes).
   let (cw, ch) = (target[0] - mx[0] - mx[1], target[1] - my[0] - my[1])
-  result = (target, mx, my, marginX, "")
+  result = (target, mx, my, marginX, 1.0, "")
   if cw <= 0 or ch <= 0: return
   let (vw, vh) = (float(cw), float(ch))
   proc playResX(w, h: float): float = float(int(OsdPlayResY * (w / h)))
@@ -3644,12 +3686,21 @@ proc osdLayout(alignX, marginX: int, target: (int, int), mx, my: (int, int)):
                    resX * barW / 100, barOutline)
   let barY = align(OsdBarAlign.y, OsdPlayResY, vh / OsdPlayResY, float(result.y[0]), OsdPlayResY,
                    h / OsdPlayResY, OsdPlayResY * barH / 100, barOutline)
-  let (scale, outline, markerMin) = (f, OsdOutline * f, OsdBarMarkerMin * f)
-  result.props = &"osd-scale={scale:.6f}|osd-margin-x={unitsOpt(best.ml)}|" &
-    &"osd-margin-y={unitsOpt(best.mv)}|osd-outline-size={outline:.6f}|" &
+  let markerMin = OsdBarMarkerMin * f
+  result.unit = f
+  result.props = &"osd-margin-x={unitsOpt(best.ml)}|osd-margin-y={unitsOpt(best.mv)}|" &
     &"osd-bar-w={barW:.6f}|osd-bar-h={barH:.6f}|osd-bar-align-x={barX:.6f}|" &
     &"osd-bar-align-y={barY:.6f}|osd-bar-outline-size={barOutline:.6f}|" &
     &"osd-bar-marker-min-size={markerMin:.6f}"
+
+proc osdSizes(a: App, frameH: float, unit = 1.0): string =
+  ## osd-scale and osd-outline-size for an OSD over a frame frameH pixels
+  ## high (unit: see osdLayout). Options > Interface > OSD scaling sizes the
+  ## text; unless it scales with the window, text and outline keep the size
+  ## they have on a 720 pixel high frame.
+  let fixed = if a.cfg.osdScaleByWindow: 1.0 else: 720 / max(1.0, frameH)
+  let text = clamp(a.cfg.osdScale, OsdScaleMin, OsdScaleMax) * fixed * unit
+  &"osd-scale={text:.6f}|osd-outline-size={OsdOutline * fixed * unit:.6f}"
 
 proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32],
                     target: (int, int)): tuple[x, y: (int, int), target: (int, int)] =
@@ -3675,9 +3726,10 @@ proc applySubLayout(a: App, video: Vec2, pad: tuple[l, r, t, b: float32],
   let my0 = (int(round(pad.t / full.y * target[1].float32)), int(round(pad.b / full.y * target[1].float32)))
   let fitKey = &"{s.alignX}|{s.alignY}|{marginX0}|{target}|{mx0}|{my0}"
   if a.osdFit.key != fitKey:
-    let (t, x, y, m, props) = osdLayout(s.alignX, marginX0, target, mx0, my0)
-    a.osdFit = (fitKey, t, x, y, m, props)
-  let (target, mx, my, osd) = (a.osdFit.target, a.osdFit.x, a.osdFit.y, a.osdFit.props)
+    let (t, x, y, m, u, props) = osdLayout(s.alignX, marginX0, target, mx0, my0)
+    a.osdFit = (fitKey, t, x, y, m, u, props)
+  let (target, mx, my) = (a.osdFit.target, a.osdFit.x, a.osdFit.y)
+  let osd = a.osdFit.props & "|" & a.osdSizes(video.y, a.osdFit.unit)
   let marginX = a.osdFit.subMarginX
   # Subtitles scale with the target height; keep padding from growing them.
   let scale = s.scale * float32(target[1] - my[0] - my[1]) / target[1].float32
@@ -3733,6 +3785,7 @@ proc runAction(a: App, act: KeyAction) =
         filterName = "Audio files")
   of kaOpenClipboard: a.openFromClipboard()
   of kaCopyClipboard: a.copyToClipboard()
+  of kaCopyTimeLink: a.copyTimeLink()
   of kaClose: a.closeFile()
   of kaScreenshot: a.screenshot()
   of kaProperties: a.showOverlay(ovProperties)
@@ -3911,6 +3964,12 @@ proc renderOsdLayer(a: App, area: Rect) =
     discard mpv_render_context_update(l.render)
   if not a.osdApart: return
   let r = a.osdLayerRect(area)
+  let sizes = a.osdSizes(r.h)
+  if sizes != a.osdLayerSizes:
+    a.osdLayerSizes = sizes
+    for kv in sizes.split('|'):
+      let p = kv.split('=')
+      l.h.setProp(p[0], p[1])
   let resized = int(r.w) != l.target.w or int(r.h) != l.target.h
   l.target.ensureSize(int(r.w), int(r.h))
   if redraw or resized: l.render.render(l.target)
@@ -4431,43 +4490,79 @@ proc volumeSlider(a: App, r: Rect) =
     a.player.setVolume(round(clamp((ui.mouse.x - r.x) / r.w, 0, 1) * 100))
   ui.tip(r, &"Volume {int(round(v))}%")
 
+const
+  CtlButtonW = 36'f32
+  CtlStep = CtlButtonW + 2       ## a button and the gap after it
+  CtlSepW = 10'f32               ## a divider between button groups
+  CtlVolumeW = 100'f32           ## the volume slider
+  CtlHintsMargin = 60'f32        ## room past the full controls the key hints want
+
+proc controlsVolumeW(a: App): float32 =
+  ## Width of the volume group at the right of the controls bar: the
+  ## percentage, the mute button and the slider.
+  let pct = &"{int(round(a.player.volume))}%"
+  a.ui.textSize(pct, FontSmall).x + 6 + CtlButtonW + 6 + CtlVolumeW + 16
+
+proc controlsTier(a: App, w: float32): int =
+  ## How much a controls bar w wide drops as the window narrows: 0 keeps
+  ## everything, 1 hides the status bar's key hints, 2 the Repeat button,
+  ## 3 the rate buttons, 4 previous/next.
+  let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep, CtlSepW + CtlStep]
+  var full = a.controlsVolumeW + 10
+  for n in need: full += n
+  if w >= full + CtlHintsMargin: return 0
+  result = 1
+  # Drop the groups from the right of the list until the rest fits.
+  for i in countdown(need.high, 1):
+    if w >= full: return
+    full -= need[i]
+    inc result
+
 proc controls(a: App, r: Rect) =
+  ## The playback buttons and the volume. A narrow bar drops buttons in
+  ## the order controlsTier gives; past that, the volume clips at the right.
   let ui = a.ui
   let p = a.player
   ui.rect(r, colPanel)
-  let bw = 36'f32
+  ui.sk.pushClipRect(r)
+  let tier = a.controlsTier(r.w)
+  let bw = CtlButtonW
   let bh = r.h - 8
   var x = r.x + 6
   let y = r.y + 4
   template btn(id, iconName, tipText: string, enabled: bool, toggled: bool, body: untyped) =
     if ui.iconButton(id, rect(x, y, bw, bh), iconName & "20", tipText, enabled, toggled):
       body
-    x += bw + 2
+    x += CtlStep
+  template divider() =
+    ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
+    x += CtlSepW
   btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing): a.play()
   btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped): a.pause()
   btn("stop", "stop", "Stop", p.loaded, p.stopped): a.stop()
-  ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
-  x += 10
-  let navOk = p.loaded and not a.playlistLocked
-  btn("prev", "prev", "Previous", navOk, false): a.navigate(-1)
-  btn("slower", "slower", "Slower playback", p.loaded, false): a.changeRate(-1)
-  btn("faster", "faster", "Faster playback", p.loaded, false): a.changeRate(1)
-  btn("next", "next", "Next", navOk, false): a.navigate(1)
-  ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
-  x += 10
-  # Click toggles Repeat > Forever; right-click opens the Repeat menu.
-  let loopR = rect(x, y, bw, bh)
-  btn("loop", "loop", "Repeat (right-click for options)", true,
-      a.cfg.repeatForever or (a.abLoop and a.loopReady)):
-    a.cfg.repeatForever = not a.cfg.repeatForever
-    a.applyLoop()
-  if ui.hover(loopR) and ui.released(MouseRight):
-    a.ctxMenu = cmRepeat
-    a.menus.openContext(ui.mouse)
+  if tier < 4:
+    divider()
+    let navOk = p.loaded and not a.playlistLocked
+    btn("prev", "prev", "Previous", navOk, false): a.navigate(-1)
+    if tier < 3:
+      btn("slower", "slower", "Slower playback", p.loaded, false): a.changeRate(-1)
+      btn("faster", "faster", "Faster playback", p.loaded, false): a.changeRate(1)
+    btn("next", "next", "Next", navOk, false): a.navigate(1)
+  if tier < 2:
+    divider()
+    # Click toggles Repeat > Forever; right-click opens the Repeat menu.
+    let loopR = rect(x, y, bw, bh)
+    btn("loop", "loop", "Repeat (right-click for options)", true,
+        a.cfg.repeatForever or (a.abLoop and a.loopReady)):
+      a.cfg.repeatForever = not a.cfg.repeatForever
+      a.applyLoop()
+    if ui.hover(loopR) and ui.released(MouseRight):
+      a.ctxMenu = cmRepeat
+      a.menus.openContext(ui.mouse)
 
-  # Volume on the right.
-  let sw = 100'f32
-  let sr = rect(r.x + r.w - sw - 16, r.y, sw, r.h)
+  # Volume on the right, never over the buttons.
+  let vx = max(r.x + r.w - a.controlsVolumeW, x + 4)
+  let sr = rect(vx + a.controlsVolumeW - CtlVolumeW - 16, r.y, CtlVolumeW, r.h)
   a.volumeSlider(sr)
   let vb = rect(sr.x - bw - 6, y, bw, bh)
   let volIcon = if p.muted: "nosound20" else: "volume20"
@@ -4476,6 +4571,7 @@ proc controls(a: App, r: Rect) =
   let pct = &"{int(round(p.volume))}%"
   let pw = ui.textSize(pct, FontSmall).x
   ui.textIn(pct, rect(vb.x - pw - 6, r.y, pw + 2, r.h), colTextDim, FontSmall)
+  ui.sk.popClipRect()
 
 type KeyHint = tuple[key, label: string]
 
@@ -4545,8 +4641,8 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
-  ## Groups that don't fit wrap onto more rows, which grow the bar upward
-  ## over the controls so the layout beneath doesn't move.
+  ## Hints that don't fit scroll sideways with the mouse wheel, with an
+  ## arrow at each end that has more hidden past it.
   let ui = a.ui
   let capH = r.h - 8
   proc mouseIcon(key: string): string =
@@ -4560,39 +4656,48 @@ proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   proc pairW(h: KeyHint): float32 = capW(h.key) + 5 + ui.textSize(h.label, FontSmall).x
   const PairGap = 14'f32
   const GroupGap = 25'f32
-  let left = r.x + 10
-  let right = r.x + r.w - 10
-  # Lay out first: (row, x) per pair, plus where the group dividers go.
-  var pos: seq[seq[(int, float32)]]
-  var dividers: seq[(int, float32)]
-  var (row, x) = (0, left)
+  const Pad = 10'f32
+  const ArrowW = 18'f32
+  const WheelStep = 60'f32
+  # Lay out first: x per pair from the start of the row, plus the dividers.
+  var pos: seq[seq[float32]]
+  var dividers: seq[float32]
+  var x = 0'f32
   for gi, g in groups:
-    var gw = 0'f32
-    for i, h in g: gw += pairW(h) + (if i > 0: PairGap else: 0)
     if gi > 0:
-      if x + GroupGap + gw > right and x > left: (row, x) = (row + 1, left)
-      else:
-        dividers.add (row, x + GroupGap / 2)
-        x += GroupGap
+      dividers.add x + GroupGap / 2
+      x += GroupGap
     pos.add @[]
     for i, h in g:
-      if i > 0:
-        if x + PairGap + pairW(h) > right and x > left: (row, x) = (row + 1, left)
-        else: x += PairGap
-      pos[^1].add (row, x)
+      if i > 0: x += PairGap
+      pos[^1].add x
       x += pairW(h)
-  let rows = row + 1
-  let top = r.y - (rows - 1).float32 * r.h
-  let bar = rect(r.x, top, r.w, r.y + r.h - top)
-  ui.rect(bar, colPanel)
-  ui.rect(rect(bar.x, bar.y, bar.w, 1), colBorder)
-  for (ri, dx) in dividers:
-    ui.rect(rect(dx, top + ri.float32 * r.h + 6, 1, r.h - 12), colBorder)
+  let view = rect(r.x + Pad, r.y, r.w - 2 * Pad, r.h)
+  # Scrolled to the end, the left arrow takes room from the hints.
+  let maxScroll = if x > view.w: x - view.w + ArrowW else: 0'f32
+  # Other modifiers show other hints, which start from the left again.
+  let key = $groups
+  if key != a.hintScrollKey:
+    a.hintScrollKey = key
+    a.hintScroll = 0
+  if ui.hover(r) and ui.scroll() != 0:
+    a.hintScroll += ui.wheelNotches * WheelStep
+    ui.scrollConsumed = true
+  a.hintScroll = clamp(a.hintScroll, 0, maxScroll)
+  let (moreLeft, moreRight) = (a.hintScroll > 0, a.hintScroll < maxScroll)
+  let left = view.x - a.hintScroll + (if moreLeft: ArrowW else: 0)
+  ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
+  var clip = view
+  if moreLeft: clip.x += ArrowW; clip.w -= ArrowW
+  if moreRight: clip.w -= ArrowW
+  ui.sk.pushClipRect(clip)
+  for dx in dividers:
+    ui.rect(rect(left + dx, r.y + 6, 1, r.h - 12), colBorder)
   for gi, g in groups:
     for i, h in g:
-      let (ri, hx) = pos[gi][i]
-      let ry = top + ri.float32 * r.h
-      let cap = rect(hx, ry + (r.h - capH) / 2, capW(h.key), capH)
+      let cap = rect(left + pos[gi][i], r.y + (r.h - capH) / 2, capW(h.key), capH)
+      if cap.x > clip.x + clip.w or cap.x + pairW(h) < clip.x: continue
       let icon = mouseIcon(h.key)
       if icon.len > 0:
         ui.icon(icon, cap.xy + cap.wh / 2, colText)
@@ -4601,12 +4706,22 @@ proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
         ui.border(cap, colBorder)
         ui.textIn(h.key, cap, colText, FontSmall, h = CenterAlign)
       let lw = ui.textSize(h.label, FontSmall).x
-      ui.textIn(h.label, rect(cap.x + cap.w + 5, ry, lw + 2, r.h), colTextDim, FontSmall)
+      ui.textIn(h.label, rect(cap.x + cap.w + 5, r.y, lw + 2, r.h), colTextDim, FontSmall)
+  ui.sk.popClipRect()
+  # More hints past an end: an arrow there pointing that way.
+  if moreLeft:
+    ui.rect(rect(clip.x - 1, r.y + 6, 1, r.h - 12), colBorder)
+    ui.icon("arrowleft16", vec2(r.x + (Pad + ArrowW) / 2, r.y + r.h / 2), colAccent)
+  if moreRight:
+    ui.rect(rect(clip.x + clip.w, r.y + 6, 1, r.h - 12), colBorder)
+    ui.icon("arrow16", vec2(r.x + r.w - (Pad + ArrowW) / 2, r.y + r.h / 2), colAccent)
 
 proc status(a: App, r: Rect) =
   let ui = a.ui
   let p = a.player
-  if (a.window.focused or a.fakeMods.len > 0) and a.overlay == ovNone and not a.menus.isOpen:
+  # A window too narrow for all the controls drops the key hints first.
+  if (a.window.focused or a.fakeMods.len > 0) and a.overlay == ovNone and not a.menus.isOpen and
+     a.controlsTier(r.w) == 0:
     let hints = a.modifierHints()
     if hints.len > 0:
       a.keyHintBar(r, hints)
@@ -4628,9 +4743,17 @@ proc status(a: App, r: Rect) =
     elif not p.loaded: "Stopped"
     elif p.stopped: "Stopped"
     elif p.paused: "Paused"
+    elif p.buffering: "Buffering"
     else: "Playing"
-  let sw = ui.textSize(state, FontSmall).x
+  var sw = ui.textSize(state, FontSmall).x
   ui.textIn(state, rect(r.x + 30, r.y, sw + 4, r.h), colText, FontSmall)
+  if yt.len == 0 and not p.opening and p.loaded and not p.stopped and p.cacheAhead >= 0:
+    # Seconds read ahead of the position, dim beside the state.
+    let ahead = &"{p.cacheAhead:.1f}s"
+    let ar = rect(r.x + 30 + sw + 8, r.y, ui.textSize(ahead, FontSmall).x + 4, r.h)
+    ui.textIn(ahead, ar, colTextDim, FontSmall)
+    ui.tip(ar, "Buffered ahead")
+    sw += ar.w + 4
   let err = if a.ytError.len > 0: a.ytError
             elif yt.len > 0 or a.overlay == ovYtdlp or p.opening: ""
             else: p.loadError
@@ -5011,13 +5134,19 @@ proc sphereOsd(a: App, area: Rect) =
   ui.rect(r, rgbx(0, 0, 0, 170))
   ui.text(a.osdMsg, r.xy + vec2(10, 5), colText, FontTitle)
 
+proc compactOutline(a: App, r: Rect) =
+  ## Compact mode has no window frame: a faint 1 pixel line marks the
+  ## window's edge, drawn over its content so it takes no room.
+  if not a.cfg.compactMode or a.fullscreen or a.window.maximized: return
+  a.ui.border(r, colOutline, 1 / a.sk.uiScale)
+
 proc syncOutline(a: App, r: Rect) =
   ## Synchronized players are framed in their group's color: solid around the
   ## master, dashed around the others.
   if not a.synced: return
   let ui = a.ui
   let col = groupColor(a.syncMaster)
-  const t = 1'f32
+  let t = 1 / a.sk.uiScale  # one pixel at any UI scale
   if a.isSyncMaster:
     ui.border(r, col, t)
     return
@@ -5449,7 +5578,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Open file", @[kaOpenFile], ""), ("Load subtitle file", @[kaLoadSubtitle], ""),
       ("Load audio file", @[kaLoadAudio], ""),
       ("Open from clipboard", @[kaOpenClipboard], ""),
-      ("Copy to clipboard", @[kaCopyClipboard], ""), ("Close", @[kaClose], ""),
+      ("Copy to clipboard", @[kaCopyClipboard], ""),
+      ("Copy YouTube link at current time", @[kaCopyTimeLink], ""), ("Close", @[kaClose], ""),
       ("Save screenshot", @[kaScreenshot], ""), ("Properties", @[kaProperties], ""),
       ("Exit", @[kaExit], "")]),
     a.keyRows("Playback", [
@@ -5749,6 +5879,7 @@ proc frame(a: App) =
     a.menus.updatePopups(ui, root, ctxRoot)
     ui.drawTooltip()
   ui.sk.pushLayer(PopupsLayer)
+  a.compactOutline(rect(0, 0, W, H))
   a.syncOutline(rect(0, 0, W, H))
   ui.sk.popLayer()
 
@@ -5858,6 +5989,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
                      else: vec2(parseFloat(st.args[0]), parseFloat(st.args[1]))
   of "mods": a.fakeMods = if arg == "off": "" else: arg
+  of "hintscroll": a.hintScroll = parseFloat(arg)  # status bar key hints, clamped when drawn
   of "optpage":
     a.ensureOptionsWindow()
     for p in OptionsPage:
@@ -6002,8 +6134,9 @@ proc main() =
   # freezing UI and video. The compositor presents our buffers tear-free, mpv
   # paces video frames, and UI-only redraws are rate-capped in the main loop.
   let c = a.cfg
+  let minSize = if c.compactMode: MinCompactWindow else: MinWindow
   let startSize =
-    if c.rememberWindowSize and c.windowW >= MinWindow.x and c.windowH >= MinWindow.y:
+    if c.rememberWindowSize and c.windowW >= minSize.x and c.windowH >= minSize.y:
       ivec2(c.windowW.int32, c.windowH.int32)
     else: ivec2(1024, 640)
   a.window = newWindow(AppName, startSize, vsync = false)

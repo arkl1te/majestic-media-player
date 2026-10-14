@@ -33,6 +33,7 @@ let
   colCardRect* = c("#2ec4b6", 0.30)
   colCardPath* = c("#4ea8de", 0.30)
   colRect* = c("#2ec4b6")       ## rectangle drawn over the video
+  colOutline* = c("#9aa0ab", 0.5)  ## compact mode's window edge
   colShadow* = c("#000000", 0.45)
   colScrim* = c("#000000", 0.55)
   colOverlayBg* = c("#121317", 0.92)
