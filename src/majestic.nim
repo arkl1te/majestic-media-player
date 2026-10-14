@@ -698,7 +698,7 @@ proc setLoopMark(a: App, isB: bool, t: float) =
   if a.hasLoopA and a.hasLoopB and a.loopA > a.loopB: swap(a.loopA, a.loopB)
   if a.loopReady and not had: a.abLoop = true
   a.applyAbLoop()
-  a.osd((if isB: "Loop B: " else: "Loop A: ") & fmtTime(t, a.cfg.showMillis))
+  a.osd((if isB: "Loop B: " else: "Loop A: ") & fmtTime(t, a.cfg.showMillis, a.player.duration))
 
 proc unsetLoopMark(a: App, isB: bool) =
   ## Removes mark A or B, which also ends the loop.
@@ -885,7 +885,7 @@ proc copyTimeLink(a: App) =
     return
   let t = max(0, a.player.timePos.int)
   setClipboardString("https://www.youtube.com/watch?v=" & id & "&t=" & $t & "s")
-  a.osd("Copied link at " & fmtTime(t.float))
+  a.osd("Copied link at " & fmtTime(t.float, dur = a.player.duration))
 
 proc looksLikeAddress(s: string): bool =
   ## "www.example.com/watch?v=..." or "youtu.be/...": a host, then a path.
@@ -1408,7 +1408,7 @@ proc addBookmark(a: App, t: float) =
     var i = 0
     while i < marks.len and marks[i].time < t: inc i
     marks.insert(Bookmark(time: t), i))
-  a.osd("Bookmark added at " & fmtTime(t, a.cfg.showMillis))
+  a.osd("Bookmark added at " & fmtTime(t, a.cfg.showMillis, a.player.duration))
 
 proc removeBookmark(a: App, t: float) =
   ## Removes the current file's bookmark at time t.
@@ -1417,7 +1417,7 @@ proc removeBookmark(a: App, t: float) =
       if b.time == t:
         marks.delete(i)
         break)
-  a.osd("Bookmark removed at " & fmtTime(t, a.cfg.showMillis))
+  a.osd("Bookmark removed at " & fmtTime(t, a.cfg.showMillis, a.player.duration))
 
 proc renameBookmark(a: App, path: string, t: float, name: string) =
   a.editBookmarks(path, proc (marks: var seq[Bookmark]) =
@@ -3302,7 +3302,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   if marks.len > 0:
     bm.sep()
     for i, b in marks:
-      bm.item(fmtTime(b.time) & "  " & b.label(i), action = bindAct(proc (t: float) = a.seekTo(t), b.time))
+      bm.item(fmtTime(b.time, dur = p.duration) & "  " & b.label(i), action = bindAct(proc (t: float) = a.seekTo(t), b.time))
   nav.sep()
   nav.item(&"Jump Forward {a.cfg.seekStep:g}s", k(kaJumpForward), enabled = loaded,
     action = proc () = a.seekRelative(a.cfg.seekStep))
@@ -3314,7 +3314,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let canStep = hasCh or (a.cfg.bookmarksAsChapters and a.fileBookmarks.len > 0)
   let chm = nav.sub("Chapters", enabled = hasCh)
   for i, c in p.chapters:
-    let label = fmtTime(c.time) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
+    let label = fmtTime(c.time, dur = p.duration) & "  " & (if c.title.len > 0: c.title else: &"Chapter {i + 1}")
     chm.item(label, action = bindAct(proc (t: float) = a.seekTo(t), c.time))
   nav.item("Next Chapter", k(kaNextChapter), enabled = canStep, action = proc () = a.chapterStep(1))
   nav.item("Previous Chapter", k(kaPrevChapter), enabled = canStep, action = proc () = a.chapterStep(-1))
@@ -3907,6 +3907,11 @@ proc videoGeometry(a: App, area: Rect, xf: VideoTransform): tuple[center, size: 
 proc videoGeometry(a: App, area: Rect): tuple[center, size: Vec2] =
   a.videoGeometry(area, a.xf)
 
+proc clockDur(p: Player): float =
+  ## The duration fmtTime sizes the clock by: with nothing loaded it counts
+  ## as short media (MM:SS), a stream of unknown length as long (HH:MM:SS).
+  if p.loaded: p.duration else: 1
+
 proc osdStatusText(a: App): string =
   ## The status line mpv's OSD level 3 shows (see applyOsd), as the OSD
   ## layer's literal text: its own player has no file to take it from.
@@ -3914,9 +3919,9 @@ proc osdStatusText(a: App): string =
   let ms = a.cfg.showMillis
   # osd-sym-cc: mpv's escape for a glyph of its OSD symbol font
   result = "\xC2\x91" & (if p.paused or p.stopped: '\x02' else: '\x01') & " "
-  if a.cfg.showRemaining: result.add "-" & fmtTime(max(0, p.duration - p.timePos), ms)
-  else: result.add fmtTime(p.timePos, ms)
-  result.add " / " & fmtTime(p.duration, ms)
+  if a.cfg.showRemaining: result.add "-" & fmtTime(max(0, p.duration - p.timePos), ms, p.clockDur)
+  else: result.add fmtTime(p.timePos, ms, p.clockDur)
+  result.add " / " & fmtTime(p.duration, ms, p.clockDur)
   if p.duration > 0: result.add &" ({int(clamp(p.timePos / p.duration, 0, 1) * 100)}%)"
 
 proc updateOsdApart(a: App) =
@@ -4432,7 +4437,7 @@ proc seekBar(a: App, r: Rect) =
   # Hover label and thumbnail
   a.showPreview = false
   if hov or pinned:
-    var label = fmtTime(t, a.cfg.showMillis)
+    var label = fmtTime(t, a.cfg.showMillis, a.player.duration)
     if snapped >= 0: label.add "  " & markers[snapped][1]
     else:
       for i in countdown(markers.high, 0):
@@ -4778,8 +4783,9 @@ proc status(a: App, r: Rect) =
   let ms = a.cfg.showMillis
   let pos = if a.seekDragging: a.seekDragT else: p.timePos
   var timeText =
-    (if a.cfg.showRemaining: "-" & fmtTime(max(0.0, p.duration - pos), ms) else: fmtTime(pos, ms)) &
-    " / " & fmtTime(p.duration, ms)
+    (if a.cfg.showRemaining: "-" & fmtTime(max(0.0, p.duration - pos), ms, p.clockDur)
+     else: fmtTime(pos, ms, p.clockDur)) &
+    " / " & fmtTime(p.duration, ms, p.clockDur)
   if p.loaded and abs(a.baseSpeed - 1) > 0.001:
     timeText = &"{a.baseSpeed:g}x   " & timeText
   let tw = ui.textSize(timeText, FontSmall).x
@@ -4819,7 +4825,7 @@ proc cellText(a: App, path: string, by: PlaylistSort): string =
   of psName: path.extractFilename
   of psDuration:
     let d = a.mediaInfo.getOrDefault(path).duration
-    if d > 0: fmtTime(d) else: ""
+    if d > 0: fmtTime(d, dur = d) else: ""
   of psSize:
     let b = a.fileSize(path)
     if b >= 0: fmtSize(b) else: ""
@@ -6307,7 +6313,7 @@ proc main() =
         a.syncSend("seek", $a.resumedAt, "true")
         a.syncSend("play")
       if a.resumedAt > 0:
-        a.osd("Resumed at " & fmtTime(a.resumedAt))
+        a.osd("Resumed at " & fmtTime(a.resumedAt, dur = a.player.duration))
         a.resumedAt = 0
       a.hintsKey = ""
       if a.cfg.autoFitWindow: a.fitPending = true

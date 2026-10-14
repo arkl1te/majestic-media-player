@@ -696,9 +696,12 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
       ui.caret = ui.editText.len
     elif ui.focusId == fid: ui.focusId = ""
 
-proc fmtTime*(t: float, millis = false): string =
-  ## HH:MM:SS, or HH:MM:SS.mmm with millis.
+proc fmtTime*(t: float, millis = false, dur = -1.0): string =
+  ## HH:MM:SS, or HH:MM:SS.mmm with millis. MM:SS instead when the media's
+  ## duration dur is known and under an hour.
   let ms = max(0, int(t * 1000))
   let s = ms div 1000
-  result = &"{s div 3600:02}:{(s mod 3600) div 60:02}:{s mod 60:02}"
+  result =
+    if dur > 0 and dur < 3600 and s < 3600: &"{s div 60:02}:{s mod 60:02}"
+    else: &"{s div 3600:02}:{(s mod 3600) div 60:02}:{s mod 60:02}"
   if millis: result.add &".{ms mod 1000:03}"
