@@ -70,6 +70,7 @@ type
     kaSubMoveRight = "sub-move-right"
     kaSubBigger = "sub-bigger"
     kaSubSmaller = "sub-smaller"
+    kaCompact = "compact-mode"
     kaSeekBar = "seek-bar"
     kaControls = "controls"
     kaStatus = "status"
@@ -161,11 +162,12 @@ const
     (kgSubtitles, "Move right", "Move Subtitles Right", "Shift+Right"),
     (kgSubtitles, "Bigger", "Bigger Subtitles", "Shift+Numpad +"),
     (kgSubtitles, "Smaller", "Smaller Subtitles", "Shift+Numpad -"),
-    (kgView, "Seek bar", "Seek Bar", "Ctrl+1"),
-    (kgView, "Controls", "Controls", "Ctrl+2"),
-    (kgView, "Status", "Status", "Ctrl+3"),
-    (kgView, "Playlist", "Playlist", "Ctrl+4"),
-    (kgView, "Run log", "Run Log", "Ctrl+5"),
+    (kgView, "Compact mode", "Compact Mode", "Ctrl+1"),
+    (kgView, "Seek bar", "Seek Bar", "Ctrl+2"),
+    (kgView, "Controls", "Controls", "Ctrl+3"),
+    (kgView, "Status", "Status", "Ctrl+4"),
+    (kgView, "Playlist", "Playlist", "Ctrl+5"),
+    (kgView, "Run log", "Run Log", "Ctrl+6"),
     (kgView, "Show OSD", "Show OSD", ""),
     (kgView, "Full screen", "Fullscreen", "Alt+Enter"),
     (kgView, "Options", "Options", "O"),

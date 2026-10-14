@@ -33,6 +33,7 @@ type
     lastDir*: string
     volume*: float = 100
     muted*: bool
+    compactMode*: bool = false     # no window frame and no menu bar
     showSeekBar*: bool = true
     showControls*: bool = true
     showStatus*: bool = true

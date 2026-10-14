@@ -318,6 +318,34 @@ proc startWindowDrag*(window: Window) =
   k.dragging = true
   discard SetCapture(window.hwnd)
 
+type WindowEdge* = enum
+  weTopLeft, weTop, weTopRight, weRight, weBottomRight, weBottom, weBottomLeft, weLeft
+
+proc startWindowResize*(window: Window, edge: WindowEdge) =
+  ## Resizes the window from edge with the system's sizing loop, as if its
+  ## border had been grabbed (for undecorated windows, which have none).
+  const WmNcLButtonDown = 0x00A1'u32
+  const HitTest: array[WindowEdge, int] = [13, 12, 14, 11, 17, 15, 16, 10]
+  var p: POINT
+  discard GetCursorPos(p.addr)
+  discard ReleaseCapture()
+  discard SendMessageW(window.hwnd, WmNcLButtonDown, WPARAM(HitTest[edge]),
+    LPARAM((p.y and 0xFFFF) shl 16 or (p.x and 0xFFFF)))
+  # The loop ate the release.
+  privateAccess(Window)
+  window.state.buttonDown.excl MouseLeft
+
+proc setDecorated*(window: Window, on: bool) =
+  ## Shows or hides the title bar and borders, keeping the content size.
+  let h = window.hwnd
+  let size = window.size
+  const Frame = WS_CAPTION or WS_THICKFRAME
+  let style = GetWindowLongW(h, GWL_STYLE)
+  discard SetWindowLongW(h, GWL_STYLE, if on: style or Frame else: style and not Frame)
+  discard SetWindowPos(h, 0, 0, 0, 0, 0, SWP_FRAMECHANGED or SWP_NOMOVE or
+    SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE)
+  window.size = size
+
 proc activate*(window: Window) =
   ## Raises and focuses the window. Windows only lets the foreground process
   ## do that, so borrow its input state when we aren't it.

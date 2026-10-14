@@ -269,6 +269,7 @@ type
     dialog: Dialog
     children: seq[Process]
     fullscreen: bool
+    frameInset: IVec2         ## content minus frame top-left while decorated (for compact mode)
     ctxMenu: ContextMenu
     # mouse interaction with the video frame
     videoPress: bool
@@ -393,10 +394,15 @@ proc px(a: App, r: Rect): Rect =
 
 proc minWindow(a: App): IVec2 = a.px(MinWindow)
 
+proc menuBarHeight(a: App): float32 =
+  ## Height of the menu bar as laid out: none in full screen or compact mode.
+  if a.fullscreen or a.cfg.compactMode: 0 else: MenuBarHeight
+
 proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode), in pixels.
+  let menuH = if a.cfg.compactMode: 0'f32 else: MenuBarHeight
   a.px(ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
-        int32(MenuBarHeight + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))))
+        int32(menuH + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))))
 
 proc naturalSize(a: App): Vec2 =
   var w = a.player.videoW.float32
@@ -489,6 +495,27 @@ proc setFullscreen(a: App, on: bool) =
   a.hintsKey = ""
   if on:
     a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
+  elif a.cfg.compactMode:
+    a.window.setDecorated(false)  # leaving full screen may restore the frame
+
+proc setCompact(a: App, on: bool) =
+  ## Compact mode hides the window frame and the menu bar (the right-click
+  ## menu still has every command). The video keeps its size and its place on
+  ## screen.
+  if on == a.cfg.compactMode: return
+  a.menus.close()
+  a.cfg.compactMode = on
+  a.hintsKey = ""
+  if a.fullscreen: return  # applied when leaving full screen
+  let content = a.window.pos
+  if on: a.frameInset = content - a.window.framePos
+  a.window.setDecorated(not on)
+  if a.window.maximized: return
+  let menu = a.px(ivec2(0, int32(MenuBarHeight))).y
+  let d = if on: menu else: -menu
+  a.window.size = a.window.size - ivec2(0, d)
+  let moved = content + ivec2(0, d)
+  a.window.moveFrame(if on: moved else: moved - a.frameInset)
 
 proc applyOnTop(a: App) =
   let want = case a.cfg.onTop
@@ -2679,6 +2706,25 @@ proc editCommandLines(a: App, edit: proc (cmds: var seq[CommandLine])) =
   edit(a.commands)
   a.commands.save()
 
+proc frameEdgeAt(a: App, p: Vec2): set[WindowEdge] =
+  ## The window edge under p (UI units) that resizes the window in compact
+  ## mode, which has no frame to grab: its outermost pixels act as the border.
+  ## Empty elsewhere, and when the window can't be resized.
+  if not a.cfg.compactMode or a.fullscreen or a.window.maximized: return
+  const Grip = 5'f32  # pixels
+  let g = Grip / a.sk.uiScale
+  let s = a.ui.size
+  let (l, r, t, b) = (p.x < g, p.x >= s.x - g, p.y < g, p.y >= s.y - g)
+  if t and l: {weTopLeft} elif t and r: {weTopRight}
+  elif b and l: {weBottomLeft} elif b and r: {weBottomRight}
+  elif t: {weTop} elif b: {weBottom} elif l: {weLeft} elif r: {weRight}
+  else: {}
+
+proc closeTip(a: App, act: KeyAction): string =
+  ## Tooltip of a panel's close button, with the key that toggles the panel.
+  let key = a.cfg.keyText(act)
+  if key.len > 0: &"Close ({key})" else: "Close"
+
 proc setPlaylistShown(a: App, shown: bool) =
   ## Shows or hides the playlist, growing or shrinking the window by its width.
   if a.cfg.showPlaylist == shown: return
@@ -3058,6 +3104,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # View
   let view = root.sub("View")
+  view.check("Compact Mode", k(kaCompact), cfg.compactMode, action = proc () =
+    a.setCompact(not a.cfg.compactMode))
   view.check("Seek Bar", k(kaSeekBar), cfg.showSeekBar, action = proc () =
     a.cfg.showSeekBar = not a.cfg.showSeekBar
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showSeekBar: SeekBarHeight else: -SeekBarHeight))))
@@ -3732,6 +3780,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaSubMoveRight: a.moveSubs(vec2(SubMoveStep, 0))
   of kaSubBigger: a.scaleSubs(1)
   of kaSubSmaller: a.scaleSubs(-1)
+  of kaCompact: a.setCompact(not a.cfg.compactMode)
   of kaSeekBar: a.runMenuPath(@["View", "Seek Bar"])
   of kaControls: a.runMenuPath(@["View", "Controls"])
   of kaStatus: a.runMenuPath(@["View", "Status"])
@@ -4446,7 +4495,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   let rot = &"{a.cfg.rotateStep:g}°"
   # View toggles and pan/rotate/scale only show with "Show all shortcuts".
   let all = a.cfg.showAllShortcuts
-  let viewToggles = {kaSeekBar, kaControls, kaStatus, kaPlaylist, kaRunLog, kaShowOsd}
+  let viewToggles = {kaCompact, kaSeekBar, kaControls, kaStatus, kaPlaylist, kaRunLog, kaShowOsd}
   # Ctrl+C copies the run log's selected text while there is some (handleKeys).
   let logSel = a.cfg.showRunLog and a.rlSelection.len > 0
   for g in KeyGroup:
@@ -4672,7 +4721,7 @@ proc playlistPanel(a: App, r: Rect) =
   let header = rect(r.x, r.y, r.w, 30)
   ui.icon("playlist16", vec2(r.x + 18, header.y + 15), colAccent)
   ui.textIn(&"Playlist ({a.playlist.len})", rect(r.x + 32, header.y, r.w - 70, 30), colText)
-  if ui.iconButton("pl-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", "Close (Ctrl+4)"):
+  if ui.iconButton("pl-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", a.closeTip(kaPlaylist)):
     a.setPlaylistShown(false)
   ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
   if a.playlistLocked:
@@ -4770,7 +4819,7 @@ proc runLogPanel(a: App, r: Rect) =
     ui.consumeClick()
   if ui.activeId == "rlresize":
     let (y0, h0) = a.rlResizeFrom
-    let below = (if a.fullscreen: 0'f32 else: MenuBarHeight + a.bottomHeight) +
+    let below = (if a.fullscreen: 0'f32 else: a.menuBarHeight + a.bottomHeight) +
       MinWindow.y.float32 / 2
     a.cfg.runLogHeight = clamp(h0 + ui.mouse.y - y0, RunLogMinHeight,
       max(RunLogMinHeight, ui.size.y - below))
@@ -4791,7 +4840,7 @@ proc runLogPanel(a: App, r: Rect) =
   let header = rect(r.x, r.y, r.w, RunLogHeaderH)
   let running = a.runLog.countIt(it.running)
   # Header buttons, right to left: Close, Copy all, Clear (finished runs), Stop (running ones).
-  if ui.iconButton("rl-close", rect(r.x + r.w - 30, header.y + 2, 24, 24), "close16", "Close (Ctrl+5)"):
+  if ui.iconButton("rl-close", rect(r.x + r.w - 30, header.y + 2, 24, 24), "close16", a.closeTip(kaRunLog)):
     a.setRunLogShown(false)
   var bx = r.x + r.w - 38
   let headerButton = proc (label, tip: string): bool =
@@ -5434,6 +5483,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move by one pixel", "Arrows")]),
     ("Run log", @[("Copy selected text", "Ctrl+C")])]
   var view = a.keyRows("View", [
+    ("Compact mode", @[kaCompact], ""),
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
     ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
     ("Run log", @[kaRunLog], ""), ("Show OSD", @[kaShowOsd], ""),
@@ -5456,6 +5506,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
       ("Move window", "Drag video"), ("Context menu", "Right-click"),
+      ("Resize window (compact mode)", "Drag window edge"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
       ("Restore zoom / panning", "Middle-click video"),
       ("Pan zoomed video", "Ctrl+Drag video"),
@@ -5527,7 +5578,7 @@ proc frame(a: App) =
   # Layout
   let fs = a.fullscreen
   let bottomH = a.bottomHeight
-  let menuH = if fs: 0'f32 else: MenuBarHeight
+  let menuH = a.menuBarHeight
   let W = ui.size.x
   let H = ui.size.y
   let plW = if a.cfg.showPlaylist: min(a.playlistWidth, W) else: 0
@@ -5564,6 +5615,15 @@ proc frame(a: App) =
   a.drawVideo(a.px(videoArea), fb)
   a.idleScreen(videoArea)
   a.sphereOsd(videoArea)
+
+  # Compact mode: dragging the window's outer pixels resizes it.
+  let edge = if a.overlay == ovNone and not a.menus.isOpen and a.rectEdit == nil and
+                ui.activeId == "" and w.mouseInside: a.frameEdgeAt(ui.mouse)
+             else: {}
+  for e in edge:
+    if ui.pressed():
+      ui.consumeClick()
+      w.startWindowResize(e)
 
   # A Run window rectangle being drawn over the video.
   let overVideo = ui.mouse.inside(videoArea) and
@@ -5658,7 +5718,7 @@ proc frame(a: App) =
   else:
     a.showPreview = false
     a.seekDragging = false
-  if not fs:
+  if menuH > 0:
     a.menus.drawBar(ui, root, rect(0, 0, W, MenuBarHeight))
 
   # Overlays draw on the popup layer with the mouse released to them.
@@ -5709,7 +5769,11 @@ proc frame(a: App) =
   let overLog = ui.activeId == "rlselect" or a.cfg.showRunLog and a.runLog.len > 0 and
     ui.hover(rect(rlRect.x, rlRect.y + RunLogHeaderH, rlRect.w - RunLogBarW - 4,
       rlRect.h - RunLogHeaderH - RunLogGripH)) and a.overlay == ovNone and not a.menus.isOpen
-  var shape = if hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV
+  var shape = if edge * {weLeft, weRight} != {}: ptResize
+              elif edge * {weTop, weBottom} != {}: ptResizeV
+              elif edge * {weTopLeft, weBottomRight} != {}: ptResizeNWSE
+              elif edge != {}: ptResizeNESW
+              elif hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV
               elif overLog: ptText else: ptArrow
   if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
     shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
@@ -5945,6 +6009,7 @@ proc main() =
   a.window = newWindow(AppName, startSize, vsync = false)
   a.window.icon = appIcon()
   a.window.initMainWindow()
+  if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
   makeContextCurrent(a.window)
   loadExtensions()

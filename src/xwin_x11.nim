@@ -218,6 +218,35 @@ proc startWindowDrag*(window: Window) =
   privateAccess(Window)
   window.state.buttonDown.excl MouseLeft
 
+type WindowEdge* = enum
+  ## Ordered as _NET_WM_MOVERESIZE's size directions.
+  weTopLeft, weTop, weTopRight, weRight, weBottomRight, weBottom, weBottomLeft, weLeft
+
+proc startWindowResize*(window: Window, edge: WindowEdge) =
+  ## Hands the pointer to the window manager to resize the window from edge
+  ## (for undecorated windows, which have no frame to grab).
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  var root, child: XID
+  var rx, ry, wx, wy: cint
+  var mask: cuint
+  discard XQueryPointer(d, window.xid, root.addr, child.addr, rx.addr, ry.addr,
+    wx.addr, wy.addr, mask.addr)
+  discard XUngrabPointer(d, 0)
+  window.sendWmMessage("_NET_WM_MOVERESIZE", [rx.clong, ry.clong, edge.ord.clong, 1, 1])
+  privateAccess(Window)
+  window.state.buttonDown.excl MouseLeft
+
+proc setDecorated*(window: Window, on: bool) =
+  ## Shows or hides the WM's title bar and borders (_MOTIF_WM_HINTS
+  ## decorations), keeping the window mapped and its content size.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  let hints = XInternAtom(d, "_MOTIF_WM_HINTS", 0)
+  var v = [clong 2, 0, clong(on), 0, 0]  # flags = decorations
+  discard XChangeProperty(d, window.xid, hints, hints, 32, 0, v[0].addr, 5)
+  discard XFlush(d)
+
 proc activate*(window: Window) =
   ## Raises and focuses the window. Source 2 ("pager") asks the WM to honour
   ## it despite focus-stealing prevention.
