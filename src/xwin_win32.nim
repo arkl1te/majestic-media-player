@@ -55,9 +55,12 @@ type Hook = ref object
   chrome, minSize: IVec2     ## client-area sizes
   dragging: bool
   dragOffset: IVec2          ## pointer minus outer top-left, in screen pixels
+  frameless: bool            ## undecorated by setDecorated: the hook finds its edges
   cursor: HCURSOR            ## shown instead of Windy's cursor; 0: Windy's
 
 var hooks: seq[Hook]
+
+var modalTick: proc ()  ## see whileModal
 
 proc hookFor(h: HWND): Hook =
   for k in hooks:
@@ -81,6 +84,42 @@ proc constrainSizing(k: Hook, edge: WPARAM, r: var RECT) =
   case edge.int
   of WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT: r.top = r.bottom - ch - f.y
   else: r.bottom = r.top + ch + f.y
+
+const
+  HtLeft = 10
+  HtRight = 11
+  HtTop = 12
+  HtTopLeft = 13
+  HtTopRight = 14
+  HtBottom = 15
+  HtBottomLeft = 16
+  HtBottomRight = 17
+  ScSize = 0xF000
+  WmNcHitTest = 0x0084'u32
+  WmNcLButtonDown = 0x00A1'u32
+  SmCxSizeFrame = 32'i32
+  SmCySizeFrame = 33'i32
+
+proc edgeAt(k: Hook, x, y: int32): int =
+  ## The hit-test code of the edge at screen point (x, y) of a frameless
+  ## window, whose outer pixels stand in for the border it lacks (as MPC-HC's
+  ## borderless mode does); 0 elsewhere, and when it can't be resized.
+  let h = k.window.hwnd
+  if not k.frameless or k.window.fullscreen or IsZoomed(h) != 0: return 0
+  let o = outerRect(h)
+  let (gx, gy) = (GetSystemMetrics(SmCxSizeFrame), GetSystemMetrics(SmCySizeFrame))
+  let (l, r) = (x < o.left + gx, x >= o.right - gx)
+  let (t, b) = (y < o.top + gy, y >= o.bottom - gy)
+  if t and l: HtTopLeft elif t and r: HtTopRight
+  elif b and l: HtBottomLeft elif b and r: HtBottomRight
+  elif t: HtTop elif b: HtBottom elif l: HtLeft elif r: HtRight
+  else: 0
+
+proc sysSize(h: HWND, hit: int, lParam: LPARAM) =
+  ## Runs the system's sizing loop from the edge hit names. SC_SIZE starts it
+  ## on windows without a sizing border too, where DefWindowProc ignores a
+  ## press on such an edge.
+  discard SendMessageW(h, WM_SYSCOMMAND, WPARAM(ScSize or (hit - HtLeft + WMSZ_LEFT)), lParam)
 
 proc dropFiles(k: Hook, drop: HANDLE) =
   privateAccess(Window)
@@ -264,6 +303,19 @@ proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.std
     if k.aspect > 0:
       k.constrainSizing(wParam, cast[ptr RECT](lParam)[])
       return 1
+  of WM_SIZE:
+    # Each step of a border drag, so the content follows the frame at once.
+    result = CallWindowProcW(k.prev, h, msg, wParam, lParam)
+    if modalTick != nil: modalTick()
+    return
+  of WmNcHitTest:
+    let hit = k.edgeAt(int32(cast[int16](lParam and 0xFFFF)),
+                       int32(cast[int16]((lParam shr 16) and 0xFFFF)))
+    if hit != 0: return hit
+  of WmNcLButtonDown:
+    if k.frameless and wParam.int in HtLeft .. HtBottomRight:
+      sysSize(h, wParam.int, lParam)
+      return 0
   of WM_DROPFILES:
     k.dropFiles(cast[HANDLE](wParam))
     return 0
@@ -305,6 +357,28 @@ proc initMainWindow*(window: Window) =
   discard SetWindowLongPtrW(window.hwnd, GWLP_WNDPROC, cast[LONG_PTR](hookProc))
   if not registerDrops(window.hwnd): DragAcceptFiles(window.hwnd, 1)
 
+# --- Windows' modal loops -----------------------------------------------------
+# Dragging a title bar or a border, or opening a title bar's menu, runs a
+# message loop inside DefWindowProc until it's over. The app's main loop, which
+# called it through pollEvents, stalls meanwhile, and video and drawing with it.
+# Those loops dispatch thread timers too, which call back into the app.
+
+proc modalTimer(h: HWND, msg: UINT, id: UINT_PTR, time: DWORD) {.stdcall.} =
+  if modalTick != nil: modalTick()
+
+proc whileModal*(tick: proc ()) =
+  ## Calls tick about every 10 ms from whichever message loop runs on this
+  ## thread, pollEvents' or one of Windows' modal ones, and on each resize of
+  ## the main window; tick tells a stalled main loop from a running one.
+  modalTick = tick
+  discard SetTimer(0, 0, 10, modalTimer)
+
+proc clearFrameInput*(window: Window) =
+  ## Forgets the presses, releases and deltas gathered since pollEvents began,
+  ## once something has handled them in the middle of it.
+  privateAccess(Window)
+  window.state.perFrame = default(typeof(window.state.perFrame))
+
 proc startWindowDrag*(window: Window) =
   ## Moves the window with the pointer until the left button comes up. Done
   ## here rather than by the system's modal move loop, which would stall
@@ -323,14 +397,14 @@ type WindowEdge* = enum
 
 proc startWindowResize*(window: Window, edge: WindowEdge) =
   ## Resizes the window from edge with the system's sizing loop, as if its
-  ## border had been grabbed (for undecorated windows, which have none).
-  const WmNcLButtonDown = 0x00A1'u32
-  const HitTest: array[WindowEdge, int] = [13, 12, 14, 11, 17, 15, 16, 10]
+  ## border had been grabbed. Frameless windows don't need this: the hook
+  ## answers WM_NCHITTEST for their edges, so Windows resizes them itself.
+  const Hit: array[WindowEdge, int] = [HtTopLeft, HtTop, HtTopRight, HtRight,
+    HtBottomRight, HtBottom, HtBottomLeft, HtLeft]
   var p: POINT
   discard GetCursorPos(p.addr)
   discard ReleaseCapture()
-  discard SendMessageW(window.hwnd, WmNcLButtonDown, WPARAM(HitTest[edge]),
-    LPARAM((p.y and 0xFFFF) shl 16 or (p.x and 0xFFFF)))
+  sysSize(window.hwnd, Hit[edge], LPARAM((p.y and 0xFFFF) shl 16 or (p.x and 0xFFFF)))
   # The loop ate the release.
   privateAccess(Window)
   window.state.buttonDown.excl MouseLeft
@@ -341,6 +415,8 @@ proc setDecorated*(window: Window, on: bool) =
   let size = window.size
   const Frame = WS_CAPTION or WS_THICKFRAME
   let style = GetWindowLongW(h, GWL_STYLE)
+  let k = hookFor(h)
+  if k != nil: k.frameless = not on
   discard SetWindowLongW(h, GWL_STYLE, if on: style or Frame else: style and not Frame)
   discard SetWindowPos(h, 0, 0, 0, 0, 0, SWP_FRAMECHANGED or SWP_NOMOVE or
     SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE)

@@ -7,6 +7,7 @@ export windefs
 type
   MINMAXINFO* {.pure.} = object
     ptReserved*, ptMaxSize*, ptMaxPosition*, ptMinTrackSize*, ptMaxTrackSize*: POINT
+  TIMERPROC* = proc (hWnd: HWND, msg: UINT, id: UINT_PTR, time: DWORD) {.stdcall.}
 
 const
   GWLP_WNDPROC* = -4'i32
@@ -39,6 +40,7 @@ const
 proc GetWindowLongPtrW*(hWnd: HWND, nIndex: int32): LONG_PTR {.stdcall, dynlib: "user32", importc.}
 proc SetWindowLongPtrW*(hWnd: HWND, nIndex: int32, dwNewLong: LONG_PTR): LONG_PTR {.stdcall, dynlib: "user32", importc.}
 proc CallWindowProcW*(prev: WNDPROC, hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.stdcall, dynlib: "user32", importc.}
+proc SetTimer*(hWnd: HWND, id: UINT_PTR, elapse: UINT, fn: TIMERPROC): UINT_PTR {.stdcall, dynlib: "user32", importc.}
 proc GetAsyncKeyState*(vKey: int32): int16 {.stdcall, dynlib: "user32", importc.}
 proc GetSystemMetrics*(nIndex: int32): int32 {.stdcall, dynlib: "user32", importc.}
 proc SetForegroundWindow*(hWnd: HWND): BOOL {.stdcall, dynlib: "user32", importc.}

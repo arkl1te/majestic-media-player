@@ -2998,7 +2998,9 @@ proc editCommandLines(a: App, edit: proc (cmds: var seq[CommandLine])) =
 proc frameEdgeAt(a: App, p: Vec2): set[WindowEdge] =
   ## The window edge under p (UI units) that resizes the window in compact
   ## mode, which has no frame to grab: its outermost pixels act as the border.
-  ## Empty elsewhere, and when the window can't be resized.
+  ## Empty elsewhere, and when the window can't be resized. Always empty on
+  ## Windows, where the window procedure reports those edges to the system.
+  when defined(windows): return
   if not a.cfg.compactMode or a.fullscreen or a.window.maximized: return
   const Grip = 5'f32  # pixels
   let g = Grip / a.sk.uiScale
@@ -6837,7 +6839,7 @@ proc main() =
         else: 0
 
   var lastFrame = 0.0
-  while not a.window.closeRequested:
+  proc enableRunes() =
     # Silky's own text-input layer (unused here) switches rune input off at
     # the end of every UI frame and on focus changes; without it Windy drops
     # typed characters, so turn it back on before reading events.
@@ -6848,7 +6850,10 @@ proc main() =
     if a.pickWin != nil: a.pickWin.runeInputEnabled = true
     if a.syncWin != nil: a.syncWin.runeInputEnabled = true
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
-    pollEvents()
+
+  proc step(): bool =
+    ## One pass of the main loop after reading events; false when there was
+    ## nothing to draw.
     if a.dropped.len > 0:
       a.dropFiles(a.dropped)
       a.dropped.setLen 0
@@ -6948,8 +6953,30 @@ proc main() =
       a.frame()
       a.syncSettings()
       lastFrame = t
-    else:
-      sleep(1)
+    needDraw
+
+  var polling, stepping = false
+  var pollAt = 0.0
+  when defined(windows):
+    # Dragging a title bar or a border holds the thread in Windows' own loop,
+    # inside pollEvents: step from there, so video and drawing carry on.
+    whileModal(proc () =
+      if not polling or stepping or now() - pollAt < 0.008: return
+      stepping = true
+      discard step()
+      # Handled: the main loop mustn't handle it again once pollEvents returns.
+      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin]:
+        if w != nil: w.clearFrameInput()
+      enableRunes()
+      stepping = false)
+
+  while not a.window.closeRequested:
+    enableRunes()
+    polling = true
+    pollAt = now()
+    pollEvents()
+    polling = false
+    if not step(): sleep(1)
 
   if a.overlay == ovOptions: a.closeOptions(false)
   if a.ytCaps.running: a.ytCaps.stop()
