@@ -6733,6 +6733,9 @@ proc main() =
     if c.rememberWindowSize and c.windowW >= minSize.x and c.windowH >= minSize.y:
       ivec2(c.windowW.int32, c.windowH.int32)
     else: ivec2(1024, 640)
+  # Ties the window to majestic-media-player.desktop (taskbar icon, audio
+  # stream matching), whatever the binary is called.
+  when defined(linux): x11ClassName = "majestic-media-player"
   a.window = newWindow(AppName, startSize, vsync = false)
   a.window.icon = appIcon()
   a.window.initMainWindow()

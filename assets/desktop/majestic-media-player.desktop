@@ -5,6 +5,7 @@ GenericName=Media Player
 Comment=Play video and audio files
 Exec=majestic-media-player %F
 Icon=majestic-media-player
+StartupWMClass=majestic-media-player
 Terminal=false
 Categories=AudioVideo;Video;Player;
 Keywords=video;movie;audio;music;mpv;player;

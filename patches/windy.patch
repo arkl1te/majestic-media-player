@@ -1,8 +1,17 @@
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..67a7e66 100644
+index 5b29e3c..70ee52a 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
-@@ -94,6 +94,8 @@ var
+@@ -66,6 +66,8 @@ var
+   onQuitRequest*: Callback
+   multiClickInterval*: Duration = initDuration(milliseconds = 200)
+   multiClickRadius*: float = 4
++  x11ClassName*: string = getAppFilename().splitFile.name
++    ## WM_CLASS name and class of new windows; match the .desktop file name
+ 
+   initialized: bool
+   windows: seq[Window]
+@@ -94,6 +96,8 @@ var
    xaXdndActionPrivate: Atom
    xaTextUriList: Atom
    xaTextPlain: Atom
@@ -11,7 +20,7 @@ index 5b29e3c..67a7e66 100644
    xaXdndAware: Atom
  
  proc initConstants(display: Display) =
-@@ -133,6 +135,8 @@ proc initConstants(display: Display) =
+@@ -133,6 +137,8 @@ proc initConstants(display: Display) =
    xaXdndActionPrivate = display.XInternAtom("XdndActionPrivate", 0)
    xaTextUriList = display.XInternAtom("text/uri-list", 0)
    xaTextPlain = display.XInternAtom("text/plain", 0)
@@ -20,7 +29,7 @@ index 5b29e3c..67a7e66 100644
    xaXdndAware = display.XInternAtom("XdndAware", 0)
  
  proc atomIfExist(name: string): Atom =
-@@ -192,7 +196,8 @@ proc property(
+@@ -192,7 +198,8 @@ proc property(
  
    result.kind = kind
  
@@ -30,7 +39,27 @@ index 5b29e3c..67a7e66 100644
    result.data = newString(len)
    if len != 0:
      copyMem(result.data[0].addr, data, len)
-@@ -814,8 +819,11 @@ proc newWindow*(
+@@ -788,6 +795,19 @@ proc newWindow*(
+     result.handle, wmProtocols[0].addr, cint wmProtocols.len
+   )
+ 
++  # Without WM_CLASS the window manager can't tie the window to its .desktop
++  # file; Plasma's task manager then matches it with an empty app id, which
++  # also matches every unsandboxed audio stream (muting the task mutes them).
++  let wmClass = x11ClassName & '\0' & x11ClassName & '\0'
++  display.XChangeProperty(result.handle, display.XInternAtom("WM_CLASS", 0),
++    xaString, 8, pmReplace, wmClass.cstring, wmClass.len.cint)
++  display.XChangeProperty(result.handle,
++    display.XInternAtom("_KDE_NET_WM_DESKTOP_FILE", 0), xaUTF8String, 8,
++    pmReplace, x11ClassName.cstring, x11ClassName.len.cint)
++  let pid = getCurrentProcessId().clong
++  display.XChangeProperty(result.handle, display.XInternAtom("_NET_WM_PID", 0),
++    xaCardinal, 32, pmReplace, pid.addr, 1)
++
+   result.im = display.XOpenIM
+   result.ic = result.im.XCreateIC(
+     "clientWindow",
+@@ -814,8 +834,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -44,7 +73,7 @@ index 5b29e3c..67a7e66 100644
  
    makeContextCurrent result
  
-@@ -865,8 +873,8 @@ proc pollEvents(window: Window) =
+@@ -865,8 +888,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -55,7 +84,7 @@ index 5b29e3c..67a7e66 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -925,9 +933,12 @@ proc pollEvents(window: Window) =
+@@ -925,9 +948,12 @@ proc pollEvents(window: Window) =
              if ev.client.data.l[i] != 0:
                formats.add(cast[Atom](ev.client.data.l[i]))
  
@@ -71,7 +100,7 @@ index 5b29e3c..67a7e66 100644
              window.xdndFormat = fmt
              break
  
-@@ -941,6 +952,13 @@ proc pollEvents(window: Window) =
+@@ -941,6 +967,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -85,7 +114,7 @@ index 5b29e3c..67a7e66 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -1055,10 +1073,13 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1088,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -102,7 +131,7 @@ index 5b29e3c..67a7e66 100644
  
        let
          now = getTime()
-@@ -1122,18 +1143,30 @@ proc pollEvents(window: Window) =
+@@ -1122,18 +1158,30 @@ proc pollEvents(window: Window) =
  
      of xeSelection:
        # Handle XDnD selection data.
@@ -141,7 +170,7 @@ index 5b29e3c..67a7e66 100644
  
          # Clean up the property.
          window.handle.delProperty(xaWindyXdndTargetProperty)
-@@ -1224,8 +1257,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1272,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -152,7 +181,7 @@ index 5b29e3c..67a7e66 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1348,8 +1381,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1396,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -167,7 +196,7 @@ index 5b29e3c..67a7e66 100644
  
    display.XChangeProperty(
      window.handle,
-@@ -1455,3 +1492,4 @@ proc saveFileDialog*(
+@@ -1455,3 +1507,4 @@ proc saveFileDialog*(
      args.add("--file-filter=" & filter.name & " | " &
        filter.extensions.replace(";", " ").replace(",", " "))
    result = runZenity(args)
