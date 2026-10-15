@@ -19,14 +19,16 @@
         11. (separator)
         12. Exit (Alt+X)
     * View
-        * Seek Bar (Ctrl+1)
-        * Controls (Ctrl+2)
-        * Status (Ctrl+3)
-        * Playlist (Ctrl+4)
+        * Compact mode (hides the window frames and navigation bar) (Ctrl+1)
+        * Seek Bar (Ctrl+2)
+        * Controls (Ctrl+3)
+        * Status (Ctrl+4)
+        * Playlist (Ctrl+5)
+        * Run Log (Ctrl+6)
         * (separator)
         * Show OSD
         * Full Screen
-        * Grab, Rotate & Scale
+        * Pan, Rotate & Zoom
             * Center (Numpad 5)
             * Move up (10 pixels default) (Numpad 8)
             * Move down (Numpad 2)

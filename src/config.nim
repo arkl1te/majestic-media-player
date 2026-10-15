@@ -30,6 +30,7 @@ type
 
   Config* = object
     recentFiles*: seq[string]
+    recentTitles*: Table[string, string]  # its links' titles
     lastDir*: string
     volume*: float = 100
     muted*: bool
@@ -113,6 +114,7 @@ type
     transform*: SavedTransform
     playlist*: seq[string]         # kept when "Remember playlist" is on
     playlistIndex*: int = -1
+    playlistTitles*: Table[string, string]  # its links' titles
 
 const
   MaxRecent = 15

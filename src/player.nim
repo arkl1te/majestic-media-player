@@ -14,7 +14,10 @@ type
     title*, lang*, codec*: string
     selected*, external*, albumArt*: bool
     file*: string           ## an external track's file
-    channels*: int
+    channels*, sampleRate*: int
+    width*, height*: int
+    fps*: float
+    default*, forced*: bool
 
   Chapter* = object
     time*: float
@@ -171,8 +174,10 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("audio-display", "embedded-first")
   # Links go through yt-dlp (useYtdlp), which also fetches their subtitles.
   h.setOpt("ytdl", "no")
+  # A playlist's videos are the app's playlist entries (listYoutube): a
+  # video's link streams that video alone.
   h.setOpt("ytdl-raw-options", "sub-langs=%" & $YtdlSubLangs.len & "%" &
-    YtdlSubLangs)  # %n%: n bytes taken as they are
+    YtdlSubLangs & ",no-playlist=")  # %n%: n bytes taken as they are
   check mpv_initialize(h), "mpv_initialize"
   # mpv's log goes to stderr only when MMP_DEBUG is set; load failures surface
   # in the status bar regardless. Errors come in anyway, for yt-dlp's
@@ -252,7 +257,11 @@ proc parseTracks(p: Player, j: JsonNode) =
       codec: t{"codec"}.getStr, selected: t{"selected"}.getBool,
       external: t{"external"}.getBool, albumArt: t{"albumart"}.getBool,
       file: t{"external-filename"}.getStr,
-      channels: t{"demux-channel-count"}.getInt)
+      channels: t{"demux-channel-count"}.getInt,
+      sampleRate: t{"demux-samplerate"}.getInt,
+      width: t{"demux-w"}.getInt, height: t{"demux-h"}.getInt,
+      fps: t{"demux-fps"}.getFloat,
+      default: t{"default"}.getBool, forced: t{"forced"}.getBool)
 
 proc parseChapters(p: Player, j: JsonNode) =
   p.chapters.setLen 0
@@ -588,12 +597,37 @@ proc selectedTrack*(p: Player, kind: string): int =
     if t.kind == kind and t.selected: return t.id
   0
 
+proc urlLang(url: string): string =
+  ## A caption link's lang= parameter (YouTube's timedtext), else "".
+  let q = url.find('?')
+  if q < 0: return
+  for kv in url[q + 1 .. ^1].split('&'):
+    if kv.startsWith("lang="): return kv[5 .. ^1]
+
 proc trackLabel*(t: Track): string =
+  ## As mpv's OSD shows a track: #1: Title (eng opus 2ch 48000 Hz) [default].
+  ## A track added without a title gets its file's name from mpv: a link's
+  ## (a whole query string) is dropped, and the language read from it.
+  var (title, lang) = (t.title, t.lang)
+  let link = t.external and t.file.contains("://")
+  if link and title == t.file.rsplit('/', 1)[^1]: title = ""
+  if link and lang.len == 0: lang = urlLang(t.file)
   result = "#" & $t.id
-  if t.title.len > 0: result.add ": " & t.title
-  if t.lang.len > 0: result.add " [" & t.lang & "]"
-  if t.codec.len > 0: result.add " (" & t.codec & ")"
-  if t.external: result.add " · external"
+  if title.len > 0: result.add ": " & title
+  var info: seq[string]
+  if lang.len > 0: info.add lang
+  if t.codec.len > 0 and t.codec != "null": info.add t.codec
+  if t.width > 0 and t.height > 0: info.add $t.width & "x" & $t.height
+  if t.fps > 0:
+    var fps = formatFloat(t.fps, ffDecimal, 3)
+    fps.trimZeros()
+    info.add fps & " fps"
+  if t.channels > 0: info.add $t.channels & "ch"
+  if t.sampleRate > 0: info.add $t.sampleRate & " Hz"
+  if info.len > 0: result.add " (" & info.join(" ") & ")"
+  if t.default: result.add " [default]"
+  if t.forced: result.add " [forced]"
+  if t.external: result.add " [external]"
 
 # --- detached OSD -----------------------------------------------------------
 

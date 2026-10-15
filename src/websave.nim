@@ -92,6 +92,12 @@ proc complete*(s: Saved): bool =
   ## The whole link is saved.
   s.duration > 0 and s.covered >= s.duration - 1
 
+proc wholeFile*(s: Saved): string =
+  ## The one file holding all of the link, from its start; "" when none does.
+  for g in s.segs:
+    if s.duration > 0 and g.start <= 0.05 and g.stop >= s.duration - 1 and fileExists(g.file):
+      return g.file
+
 proc timeline*(s: Saved, start, stop: float): string =
   ## The stretch saved from `start` to `stop` (chainAt), one file after
   ## another, as an mpv EDL keeping the link's times: before `start` it holds

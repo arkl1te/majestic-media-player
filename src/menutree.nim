@@ -184,10 +184,9 @@ iterator rows(node: MenuNode, r: Rect): (int, Rect) =
     yield (i, rect(r.x + 4, y, r.w - 8, h))
     y += h
 
-proc layoutPopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
-                 depth: int, below: bool, released: bool) =
-  ## Places one popup level, tracks hover/open submenus and clicks, and
-  ## recurses into the open child, if any.
+proc placePopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
+                depth: int, below: bool) =
+  ## Places one popup level and recurses into its open submenu, if any.
   let size = popupSize(ui, node)
   let b = m.bounds
   var pos =
@@ -200,38 +199,53 @@ proc layoutPopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
     pos.y = max(b.y, b.y + b.h - size.y)
   let r = rect(round(pos.x), round(pos.y), size.x, size.y)
   m.levels.add PopupLevel(node: node, rect: r)
+  if m.path.len > depth:
+    let i = m.path[depth]
+    if i in 0 ..< node.children.len and node.children[i].kind == mkSub:
+      for (j, row) in rows(node, r):
+        if j == i:
+          m.placePopup(ui, node.children[i], row, depth + 1, false)
+          break
 
-  var openChild = -1
-  var openRow: Rect
-  let mouseInPopup = m.mouse.inside(r)
-  for (i, row) in rows(node, r):
-    let c = node.children[i]
-    if c.kind == mkSeparator: continue
-    let hov = c.enabled and m.mouse.inside(row)
-    if hov:
-      if c.kind == mkSub:
-        if not (m.path.len > depth and m.path[depth] == i):
-          m.path.setLen depth
-          m.path.add i
-      elif mouseInPopup:
-        m.path.setLen depth
+proc topLevelAt(m: MenuSystem, p: Vec2): int =
+  ## The deepest popup under p (a flipped submenu can cover an ancestor), or -1.
+  result = -1
+  for d in countdown(m.levels.high, 0):
+    if p.inside(m.levels[d].rect): return d
+
+proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
+                  below: bool, released: bool) =
+  ## Places the open popups, then tracks hover/open submenus and clicks in the
+  ## topmost popup under the pointer only.
+  m.levels.setLen 0
+  m.placePopup(ui, node, anchor, 0, below)
+  let d = m.topLevelAt(m.mouse)
+  if d < 0: return
+  let lv = m.levels[d]
+  for (i, row) in rows(lv.node, lv.rect):
+    let c = lv.node.children[i]
+    if c.kind == mkSeparator or not c.enabled or not m.mouse.inside(row): continue
     if c.kind == mkSub:
-      if m.path.len > depth and m.path[depth] == i:
-        openChild = i
-        openRow = row
-    elif hov and released:
-      if c.remove != nil and m.mouse.inside(removeRect(row)):
-        m.pendingRemove = c.remove
-      elif c.action != nil:
-        m.pendingAction = c.action
-
-  if openChild >= 0:
-    m.layoutPopup(ui, node.children[openChild], openRow, depth + 1, false, released)
+      if not (m.path.len > d and m.path[d] == i):
+        m.path.setLen d
+        m.path.add i
+        m.levels.setLen 0
+        m.placePopup(ui, node, anchor, 0, below)
+    else:
+      if m.path.len > d:
+        m.path.setLen d
+        m.levels.setLen d + 1
+      if released:
+        if c.remove != nil and m.mouse.inside(removeRect(row)):
+          m.pendingRemove = c.remove
+        elif c.action != nil:
+          m.pendingAction = c.action
 
 proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
   ## Draws one popup level into its own window, i.e. at the origin.
   let r = rect(vec2(0, 0), lv.rect.wh)
   let mouse = m.mouse - lv.rect.xy
+  let top = m.topLevelAt(m.mouse) == depth
   ui.rect(r, colPopup)
   ui.border(r, colBorder)
   for (i, row) in rows(lv.node, r):
@@ -239,7 +253,7 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
     if c.kind == mkSeparator:
       ui.rect(rect(row.x + 4, row.y + row.h / 2, row.w - 8, 1), colBorder)
       continue
-    let hov = c.enabled and mouse.inside(row)
+    let hov = c.enabled and top and mouse.inside(row)
     let isOpenSub = c.kind == mkSub and m.path.len > depth and m.path[depth] == i
     if hov or isOpenSub:
       ui.rect(row, colHover)
@@ -254,7 +268,7 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
         if c.enabled: colTextDim else: colTextDisabled, h = RightAlign)
     if c.remove != nil and c.enabled:
       let xr = removeRect(row)
-      let xHov = mouse.inside(xr)
+      let xHov = top and mouse.inside(xr)
       if xHov: ui.rect(xr, colPressed)
       ui.icon("close16", xr.xy + xr.wh / 2, if xHov: colText else: colTextDim)
     if c.kind == mkSub:
@@ -298,9 +312,9 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   case m.mode
   of mmBar:
     if m.barIndex < m.barRects.len:
-      m.layoutPopup(ui, root.children[m.barIndex], m.barRects[m.barIndex], 0, true, released)
+      m.layoutPopups(ui, root.children[m.barIndex], m.barRects[m.barIndex], true, released)
   of mmContext:
-    m.layoutPopup(ui, contextRoot, rect(m.contextPos, vec2(0, 0)), 0, true, released)
+    m.layoutPopups(ui, contextRoot, rect(m.contextPos, vec2(0, 0)), true, released)
   of mmClosed: discard
   if m.pendingRemove != nil:
     # Removing keeps the menu open, so several entries can go in a row.

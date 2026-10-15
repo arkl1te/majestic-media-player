@@ -31,6 +31,7 @@ type
     kaCopyClipboard = "copy-clipboard"
     kaCopyTimeLink = "copy-time-link"
     kaClose = "close"
+    kaSave = "save"
     kaScreenshot = "screenshot"
     kaProperties = "properties"
     kaExit = "exit"
@@ -113,6 +114,7 @@ const
     (kgFile, "Copy to clipboard", "Copy to Clipboard", "Ctrl+C"),
     (kgFile, "Copy YouTube link at current time", "Copy Link at Time", "Ctrl+Shift+C"),
     (kgFile, "Close", "Close", "Ctrl+X"),
+    (kgFile, "Save", "Save", "Ctrl+S"),
     (kgFile, "Save screenshot", "Screenshot", "Alt+I"),
     (kgFile, "Properties", "Properties", ""),
     (kgFile, "Exit", "Exit", "Alt+X"),

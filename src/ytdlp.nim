@@ -3,7 +3,7 @@
 ## for a newer release, updating itself (yt-dlp -U) and installing its standalone
 ## build, which can then keep itself up to date with -U too.
 
-import std/[os, osproc, json, strutils, algorithm]
+import std/[os, osproc, json, strutils, algorithm, sequtils]
 import runlog
 
 const
@@ -22,6 +22,8 @@ type
     ytInstall   ## the standalone build, to managedPath
     ytCaptions  ## a link's automatic captions
     ytSubs      ## a link's subtitles, as files
+    ytPlaylist  ## a playlist's videos, as they're found
+    ytDownload  ## a link's video, whole, to a file (File > Save)
 
   YtJob* = ref object
     task*: YtTask
@@ -31,10 +33,17 @@ type
     lines*: seq[string]       ## output lines, stdout and stderr together
     code*: int = -1           ## exit code once finished; -1 while running
     progress*: float = -1     ## percent done, as last printed
+    bytes*, total*: int64     ## ytDownload: bytes downloaded, of how many (0: unknown)
+    streamBase: int64         ## ytDownload: the streams downloaded before this one
+    streamDone, streamTotal: int64  ## and this one's bytes, as last printed
+    inStream: bool            ## ytDownload: a stream downloading (not a subtitle)
+    step*, steps*: int        ## ytDownload: of video, audio and merging them,
+                              ## which it's on (steps 0: one stream, no merging)
     data: string              ## ytCaptions: what it printed
     dest: string              ## ytInstall: where it goes; ytSubs: the start
                               ## of its files' paths
     subs*: seq[string]        ## ytSubs: the files it made
+    items*: seq[tuple[id, title: string]]  ## ytPlaylist: the videos found so far
 
 proc managedPath*(): string =
   ## Where the player installs yt-dlp: on PATH for most Linux setups.
@@ -74,6 +83,12 @@ proc captions*(exe, url: string, cookies = ""): YtJob =
   start(ytCaptions, exe, @["--no-warnings", "--no-playlist"] & cookieArgs(cookies) &
     @["-O", "MMPCAPS %(automatic_captions)j", "--", url], url)
 
+proc playlistItems*(exe, url: string, cookies = ""): YtJob =
+  ## Lists a playlist's videos (url: the playlist's link, or a video's in it),
+  ## each printed as soon as its page of the list comes in.
+  start(ytPlaylist, exe, @["--no-warnings", "--flat-playlist", "--lazy-playlist",
+    "--yes-playlist"] & cookieArgs(cookies) & @["-O", "MMPITEM %(id)s %(title)s", "--", url], url)
+
 proc subtitles*(exe, url, dest: string, cookies = ""): YtJob =
   ## Downloads url's subtitles (not its video) as dest.<lang>.<ext>.
   try: createDir(dest.parentDir)
@@ -82,6 +97,27 @@ proc subtitles*(exe, url, dest: string, cookies = ""): YtJob =
     cookieArgs(cookies) & @["--write-subs", "--sub-langs", YtdlSubLangs, "--sub-format",
     "ass/srt/best", "-P", dest.parentDir, "-o", dest.extractFilename & ".%(ext)s", "--", url], url)
   result.dest = dest
+
+proc download*(exe, url, dir, name, ext: string, cookies = ""): YtJob =
+  ## Downloads url whole (as the yt-dlp hook streams it: best video and
+  ## audio) into dir as `name` (an output template), an `ext` (mkv, mp4) with
+  ## its subtitles and chapters.
+  start(ytDownload, exe, @["--no-playlist", "--newline", "--force-overwrites",
+    "-f", "bv*+ba/b", "--merge-output-format", ext, "--remux-video", ext,
+    "--embed-subs", "--sub-langs", YtdlSubLangs, "--embed-chapters", "--progress-template",
+    "download:MMPPROG %(progress.downloaded_bytes)s %(progress.total_bytes)s " &
+    "%(progress.total_bytes_estimate)s"] & cookieArgs(cookies) &
+    @["-P", dir, "-o", name, "--", url], url)
+
+proc downloadScript*(exe, url, dest: string, cookies = ""): string =
+  ## Bash lines downloading url whole (as the yt-dlp hook streams it: best
+  ## video and audio) to dest, an .mkv with its subtitles and chapters, for
+  ## a command line to run on; the script exits when it fails.
+  let args = @[exe, "--no-playlist", "--newline", "-f", "bv*+ba/b",
+    "--merge-output-format", "mkv", "--remux-video", "mkv", "--embed-subs",
+    "--sub-langs", YtdlSubLangs, "--embed-chapters", "--no-part"] & cookieArgs(cookies) &
+    @["-o", dest, "--", url]
+  args.mapIt(quoteShellPosix(it)).join(" ") & " || exit\n"
 
 proc cookieBrowsers*(setting: string): seq[string] =
   ## The browsers whose cookies yt-dlp signs in with, in turn, for a link that
@@ -188,7 +224,42 @@ proc addLine(j: YtJob, line: string) =
   let pc = percentIn(l)
   if j.task == ytInstall and l.startsWith("#"):
     if pc >= 0: j.progress = pc
+  elif j.task == ytDownload and l.startsWith("MMPPROG "):
+    if not j.inStream: return  # a subtitle file
+    proc num(s: string): int64 =
+      try: int64(parseFloat(s)) except ValueError: 0
+    let f = l.split(' ')
+    if f.len < 4: return
+    let done = num(f[1])
+    let total = if num(f[2]) > 0: num(f[2]) else: num(f[3])
+    (j.streamDone, j.streamTotal) = (done, total)
+    j.bytes = j.streamBase + done
+    j.total = if total > 0: j.streamBase + total else: 0
+    if j.total > 0: j.progress = min(j.bytes.float * 100 / j.total.float, 100)
+  elif j.task == ytDownload and l.startsWith("[info]") and " format(s): " in l:
+    # "Downloading 1 format(s): 395+251": video and audio apart, merged after.
+    let n = l.split(" format(s): ", 1)[1].count('+') + 1
+    j.steps = if n > 1: n + 1 else: 0
+    j.lines.add l
+  elif j.task == ytDownload and l.startsWith("[download] Destination: "):
+    # Each stream downloads in turn, counting from 0: the bytes add up.
+    let ext = l.splitFile.ext.toLowerAscii
+    j.inStream = ext notin [".vtt", ".srt", ".ass", ".ssa", ".ttml", ".srv1", ".srv2",
+                            ".srv3", ".json3", ".lrc"]
+    if j.inStream:
+      j.streamBase += max(j.streamTotal, j.streamDone)
+      (j.streamDone, j.streamTotal) = (0'i64, 0'i64)
+      inc j.step
+    j.lines.add l
+  elif j.task == ytDownload and l.startsWith("[Merger]"):
+    j.step = j.steps
+    j.lines.add l
   elif l.startsWith("MMPCAPS "): j.data = l[8 .. ^1]
+  elif l.startsWith("MMPITEM "):
+    let item = l[8 .. ^1].split(' ', 1)
+    let title = if item.len > 1: item[1] else: ""
+    # Private and deleted videos stay listed, unplayable.
+    if title notin ["[Private video]", "[Deleted video]"]: j.items.add (item[0], title)
   else: j.lines.add l
 
 proc read(j: YtJob) =
@@ -223,7 +294,7 @@ proc finish(j: YtJob) =
 proc poll*(j: YtJob): bool =
   ## Reads what it printed and notes when it exits. True when anything changed.
   if not j.running: return
-  let before = (j.lines.len, j.progress)
+  let before = (j.lines.len, j.progress, j.items.len)
   j.read()
   let code = j.p.peekExitCode
   if code != -1:
@@ -234,7 +305,7 @@ proc poll*(j: YtJob): bool =
     j.code = code
     j.finish()
     return true
-  (j.lines.len, j.progress) != before
+  (j.lines.len, j.progress, j.items.len) != before
 
 proc stop*(j: YtJob) =
   if not j.running: return

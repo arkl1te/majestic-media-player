@@ -420,6 +420,10 @@ proc pointerButtonsDown*(): bool =
   for vk in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]:
     if (GetAsyncKeyState(vk).int and 0x8000) != 0: return true
 
+proc ctrlHeld*(): bool =
+  ## Whether Ctrl is held, even while another window has the keyboard.
+  (GetAsyncKeyState(VK_CONTROL).int and 0x8000) != 0
+
 var grabbedBy: HWND
 
 proc grabPointer*(window: Window): bool =

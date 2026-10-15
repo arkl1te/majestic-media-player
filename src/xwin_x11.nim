@@ -109,6 +109,7 @@ const
   GrabModeAsync = 1.cint
   GrabSuccess = 0.cint
   Button1to3Mask = 0x700.cuint
+  ControlMask = 0x4.cuint
 
 proc glXGetCurrentDisplay(): XDisplay {.importc, dynlib: "libGL.so.1".}
 proc XInternAtom(d: XDisplay, name: cstring, onlyIfExists: cint): Atom {.importc, cdecl.}
@@ -385,6 +386,19 @@ proc pointerButtonsDown*(): bool =
   discard XQueryPointer(d, XDefaultRootWindow(d), root.addr, child.addr, rx.addr,
     ry.addr, wx.addr, wy.addr, mask.addr)
   (mask and Button1to3Mask) != 0
+
+proc ctrlHeld*(): bool =
+  ## Whether Ctrl is held, even while another window has the keyboard (the
+  ## server's modifier state; on Xwayland that needs KWin's "Legacy X11 App
+  ## Support" to pass modifiers on, which it does by default).
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  var root, child: XID
+  var rx, ry, wx, wy: cint
+  var mask: cuint
+  discard XQueryPointer(d, XDefaultRootWindow(d), root.addr, child.addr, rx.addr,
+    ry.addr, wx.addr, wy.addr, mask.addr)
+  (mask and ControlMask) != 0
 
 var grabCursor: XID
 

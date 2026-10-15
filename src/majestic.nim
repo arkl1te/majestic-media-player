@@ -1,11 +1,11 @@
 ## Majestic Media Player — an mpv-based video player with a Silky UI.
 
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
-  random, tables, streams, json]
+  random, tables, sets, streams, json]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp, websave
+  rectedit, syncdlg, ytdlp, websave, mediasave
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -268,11 +268,19 @@ type
     recRanges: int            ## mpv's cache ranges as it started
     recWritten: float         ## rec.stop as last written to the index
     ytSubs: YtJob             ## a saved link's subtitles being downloaded
+    saveJob: SaveJob          ## File > Save, while saving
+    saveSrc: string           ## the file or link File > Save asked where to save
     ytRetry: string           ## a link to open again at ytRetryAt
     ytRetryAt: float
     ytHooked: string          ## the yt-dlp mpv opens links with, "" until there is one
     ytCaps: YtJob             ## the open link's automatic captions being looked up
     ytCaptions: Table[string, seq[tuple[url, title, lang: string]]]  ## and found, by link
+    ytList: YtJob             ## a YouTube playlist's videos being listed (listYoutube)
+    ytListUsed: int           ## the ones in the playlist so far
+    ytListLast: string        ## the entry the next ones go after; "" while they go
+                              ## before the link's own video (or none plays yet)
+    ytListed: HashSet[string] ## links whose playlists were listed
+    linkTitles: Table[string, string]  ## links' titles, for the playlist's rows
     ytMode: YtMode
     ytMsg: string             ## the yt-dlp window's text while busy or failed
     ytWin: Window             ## the yt-dlp window, created on first use
@@ -750,8 +758,17 @@ proc rememberState(a: App) =
   if a.cfg.rememberPlaylist:
     a.cfg.playlist = a.playlist
     a.cfg.playlistIndex = if a.plIndex >= 0: a.plIndex else: a.plSelected
+    a.cfg.playlistTitles.clear()
+    for f in a.playlist:
+      if f in a.linkTitles: a.cfg.playlistTitles[f] = a.linkTitles[f]
   else:
     (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
+    a.cfg.playlistTitles.clear()
+  var titles: Table[string, string]
+  for r in a.cfg.recentFiles:
+    let t = a.linkTitles.getOrDefault(r, a.cfg.recentTitles.getOrDefault(r))
+    if t.len > 0: titles[r] = t
+  a.cfg.recentTitles = titles
 
 proc autosave(a: App) =
   ## Saves the remembered state as it changes rather than only on exit, so
@@ -809,7 +826,7 @@ proc ytdlRaw(a: App, url: string): string =
   let subsDone = a.saved.getOrDefault(url).subsDone
   let cookies = a.ytCookies.getOrDefault(url)
   if not subsDone and cookies.len == 0: return
-  var raw = @["sub-langs=" & quoted(if subsDone: "none" else: YtdlSubLangs)]
+  var raw = @["sub-langs=" & quoted(if subsDone: "none" else: YtdlSubLangs), "no-playlist="]
   if cookies.len > 0: raw.add "cookies-from-browser=" & quoted(cookies)
   "ytdl-raw-options=" & quoted(raw.join(","))
 
@@ -839,9 +856,69 @@ proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float
 
 proc handoffOff(a: App)
 
+proc youtubeId(url: string): string =
+  ## The video id of a YouTube link (watch?v=, youtu.be/, shorts/, live/,
+  ## embed/), "" for anything else.
+  let u = try: url.parseUri except UriParseError: return ""
+  var host = u.hostname.toLowerAscii
+  for pre in ["www.", "m.", "music."]:
+    if host.startsWith(pre): host = host[pre.len .. ^1]
+  let parts = u.path.split('/').filterIt(it.len > 0)
+  if host == "youtu.be":
+    if parts.len > 0: result = parts[0]
+  elif host in ["youtube.com", "youtube-nocookie.com"]:
+    if parts.len == 1 and parts[0] == "watch":
+      for (k, v) in u.query.decodeQuery:
+        if k == "v": result = v
+    elif parts.len >= 2 and parts[0] in ["shorts", "live", "embed", "v"]:
+      result = parts[1]
+  if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
+
+proc youtubeList(url: string): string =
+  ## The playlist id of a YouTube link (playlist?list=, or a video's with
+  ## &list=), "" for anything else.
+  let u = try: url.parseUri except UriParseError: return ""
+  var host = u.hostname.toLowerAscii
+  for pre in ["www.", "m.", "music."]:
+    if host.startsWith(pre): host = host[pre.len .. ^1]
+  if host notin ["youtube.com", "youtu.be"]: return
+  for (k, v) in u.query.decodeQuery:
+    if k == "list": result = v
+  if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
+
+proc showYtdlp(a: App, mode: YtMode, msg = "")
+
+proc listYoutube(a: App, i: int): bool =
+  ## Entry i is a YouTube playlist's link, or a video's with its list= id, not
+  ## listed yet: the playlist's videos are looked up, joining around it as
+  ## yt-dlp finds them (pollYtList); the video plays meanwhile. True for a
+  ## playlist alone, whose first video plays in its place once found.
+  let link = a.playlist[i]
+  if link.youtubeList.len == 0 or link in a.ytListed: return
+  result = link.youtubeId.len == 0
+  if result:
+    a.plIndex = i
+    a.plSelected = i
+  let exe = findYtdlp()
+  if exe.len == 0:
+    # A video streams (and asks for yt-dlp on its own); a playlist asks here.
+    if result:
+      a.ytUrl = link
+      a.showYtdlp(ymInstall)
+    return
+  a.ytListed.incl link
+  if a.ytList.running: a.ytList.stop()
+  a.ytList = playlistItems(exe, link, a.ytCookies.getOrDefault(link))
+  a.ytListUsed = 0
+  a.ytListLast = ""
+  if result:
+    a.cfg.addRecent(link)
+    a.osd("Loading playlist...")
+
 proc playIndex(a: App, i: int, start = -1.0) =
   ## Plays entry i from `start`, or from where it was left off when negative.
   if i < 0 or i >= a.playlist.len: return
+  if a.listYoutube(i): return
   a.savePosition()
   a.plIndex = i
   a.plSelected = i
@@ -940,24 +1017,6 @@ proc copyToClipboard(a: App) =
     except OSError:
       setClipboardString(path)
   a.osd("Copied " & path.extractFilename)
-
-proc youtubeId(url: string): string =
-  ## The video id of a YouTube link (watch?v=, youtu.be/, shorts/, live/,
-  ## embed/), "" for anything else.
-  let u = try: url.parseUri except UriParseError: return ""
-  var host = u.hostname.toLowerAscii
-  for pre in ["www.", "m.", "music."]:
-    if host.startsWith(pre): host = host[pre.len .. ^1]
-  let parts = u.path.split('/').filterIt(it.len > 0)
-  if host == "youtu.be":
-    if parts.len > 0: result = parts[0]
-  elif host in ["youtube.com", "youtube-nocookie.com"]:
-    if parts.len == 1 and parts[0] == "watch":
-      for (k, v) in u.query.decodeQuery:
-        if k == "v": result = v
-    elif parts.len >= 2 and parts[0] in ["shorts", "live", "embed", "v"]:
-      result = parts[1]
-  if not result.allCharsInSet(Letters + Digits + {'-', '_'}): result = ""
 
 proc copyTimeLink(a: App) =
   ## The YouTube link with the current position, so it opens right here.
@@ -1347,6 +1406,22 @@ proc changeRate(a: App, dir: float) =
 
 proc cycleTrack(a: App, kind: string, up: bool) =
   if a.player.loaded:
+    if kind == "aid":
+      # audio cycles through its tracks only, never landing on "no"
+      var ids: seq[int]
+      for t in a.player.tracks:
+        if t.kind == "audio": ids.add t.id
+      if ids.len == 0: return
+      let cur = ids.find(a.player.selectedTrack("audio"))
+      let next =
+        if cur < 0: (if up: ids[0] else: ids[^1])
+        else: ids[(cur + (if up: 1 else: -1) + ids.len) mod ids.len]
+      if a.osdApart:
+        a.player.h.setProp("aid", $next)
+        a.player.expandText("aid: ${aid}")
+      else:
+        a.player.h.commandStr("osd-msg set aid " & $next)
+      return
     if a.osdApart:
       a.player.h.commandStr("cycle " & kind & (if up: " up" else: " down"))
       # mpv's own message for it, shown by the OSD layer
@@ -1846,7 +1921,7 @@ proc mirrorStandby(a: App) =
   let have = sb.tracks.filterIt(it.external).mapIt(it.file)
   for t in p.tracks:  # in the same order, so track ids match
     if t.external and t.file notin have and t.kind in ["sub", "audio"]:
-      sb.h.commandAsync(t.kind & "-add", t.file, "auto")
+      sb.h.commandAsync(t.kind & "-add", t.file, "auto", t.title, t.lang)
   for name in MirroredProps:
     if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
       sb.h.setProp(name, p.props[name])
@@ -2505,6 +2580,61 @@ proc screenshot(a: App) =
   a.ask(dkSaveFile, "screenshot", "Save Screenshot",
     dir / &"{base}_{stamp}.png", @["png", "jpg", "webp"], "Images")
 
+proc saveMedia(a: App) =
+  ## File > Save: asks where to save the media playing, whole.
+  let p = a.player
+  if not p.loaded: return
+  if a.saveJob.running:
+    let pc = a.saveJob.progress
+    a.osd("Already saving " & a.saveJob.dest.extractFilename &
+      (if pc >= 0: &" ({pc:.0f}%)" else: ""))
+    return
+  a.saveSrc = p.path
+  if p.path.isWebLink:
+    var title = a.linkTitles.getOrDefault(p.path, a.saved.getOrDefault(p.path).title)
+    if title.len == 0: title = p.h.getStr("media-title")
+    if title.len == 0 or title == p.path: title = p.path.youtubeId
+    a.ask(dkSaveFile, "savemedia", "Save", a.startDir / safeName(title) & ".mkv",
+      @["mkv", "mp4"], "Videos")
+  else:
+    let ext = p.path.splitFile.ext
+    a.ask(dkSaveFile, "savemedia", "Save", a.startDir / p.path.extractFilename,
+      (if ext.len > 1: @[ext[1 .. ^1]] else: @[]), "Media files")
+
+proc startSave(a: App, dest: string) =
+  let src = a.saveSrc
+  var d = dest
+  if src.isWebLink:
+    let whole = a.saved.getOrDefault(src).wholeFile
+    if whole.len > 0:  # the media cache holds all of it
+      if d.splitFile.ext.len == 0: d.add whole.splitFile.ext
+      a.saveJob = copying(whole, d)
+    elif findYtdlp().len == 0:
+      a.osd("Saving links needs yt-dlp")
+      return
+    else:
+      a.saveJob = downloading(findYtdlp(), src, d, a.ytCookies.getOrDefault(src))
+  else:
+    if d.splitFile.ext.len == 0: d.add src.splitFile.ext
+    a.saveJob = copying(src, d)
+  if a.saveJob.done: a.osd("Cannot save: " & a.saveJob.error)
+  else: a.osd("Saving...")
+
+proc pollSave(a: App) =
+  let j = a.saveJob
+  if not j.running or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)  # the status bar's progress
+  if j.done:
+    a.saveJob = nil
+    if j.error.len == 0: a.osd("Saved: " & j.dest.extractFilename)
+    else: a.osd("Save failed: " & j.error)
+
+proc cancelSave(a: App) =
+  if not a.saveJob.running: return
+  a.saveJob.cancel()
+  a.saveJob = nil
+  a.osd("Saving cancelled")
+
 const PlaylistFilters = @[("M3U playlist", @["m3u", "m3u8"]), ("PLS playlist", @["pls"])]
 
 proc loadPlaylistDialog(a: App) =
@@ -2586,7 +2716,7 @@ proc savePlaylist(a: App, path: string) =
     # durations only as already probed: probing every file here would stall
     let d = if f in a.mediaInfo and a.mediaInfo[f].duration > 0: a.mediaInfo[f].duration
             else: -1.0
-    let title = if f.contains("://"): f else: f.splitFile.name
+    let title = if f.contains("://"): a.linkTitles.getOrDefault(f, f) else: f.splitFile.name
     entries.add PlaylistEntry(path: (if f.contains("://"): f else: f.absolutePath),
                               title: title, duration: d)
   try:
@@ -2605,6 +2735,7 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "pladd": a.addToPlaylist(paths)
   of "plload": a.loadPlaylist(paths[0])
   of "plsave": a.savePlaylist(paths[0])
+  of "savemedia": a.startSave(paths[0])
   of "bmexport": a.exportBookmarks(paths[0])
   of "bmimport": a.importBookmarks(paths[0])
   of "pickpath":  # Run window, a path row's folder button
@@ -2907,8 +3038,25 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   ## Runs c with bash in the media file's folder, its cards resolved against
   ## the current file and picks (what the Run window gave each card). Output
   ## goes to the run log (and our stdout).
-  let path = if a.player.loaded: a.player.path else: ""
-  let (script, err) = c.parts.compose(path, picks)
+  var path = if a.player.loaded: a.player.path else: ""
+  # A link: tools like ffmpeg can't open its page, so its file cards get a
+  # file on disk, the saved one when all of it is, else one downloaded first.
+  var fetch, fetchErr = ""
+  if path.isWebLink and c.parts.anyIt(it.card and it.kind == ckReference and it.content == "file"):
+    let local = a.saved.getOrDefault(path).wholeFile
+    if local.len > 0: path = local
+    elif findYtdlp().len == 0: fetchErr = "Opening links needs yt-dlp"
+    else:
+      let tmp = getTempDir() / &"majestic-{getCurrentProcessId()}-{int64(epochTime() * 1000)}"
+      let file = tmp / "media.mkv"
+      fetch = "trap " & quoteShellPosix("rm -rf " & quoteShellPosix(tmp)) & " EXIT\n" &
+        "mkdir -p " & quoteShellPosix(tmp) & " || exit\n" &
+        "echo " & quoteShellPosix("Downloading " & path) & "\n" &
+        downloadScript(findYtdlp(), path, file, a.ytCookies.getOrDefault(path))
+      path = file
+  var (script, err) = c.parts.compose(path, picks)
+  if fetchErr.len > 0: err = fetchErr
+  script = fetch & script
   let dir = a.runDir
   let e = newRunEntry(c.title, dir)
   for p in c.parts:
@@ -3032,7 +3180,7 @@ proc ytStatus(a: App): string =
   of ytInstall:
     result = "Installing yt-dlp"
     if j.progress >= 0: result.add &" {int(j.progress)}%"
-  of ytCaptions, ytSubs: discard  # their own slots, quietly
+  of ytCaptions, ytSubs, ytPlaylist, ytDownload: discard  # their own slots, quietly
 
 proc ytCurrentLink(a: App): string =
   if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
@@ -3159,8 +3307,50 @@ proc addCaptions(a: App, url: string) =
   for c in a.ytCaptions.getOrDefault(url):
     a.player.h.commandAsync("sub-add", c.url, "auto", c.title, c.lang)
 
+proc pollYtList(a: App) =
+  ## A YouTube playlist's videos, as yt-dlp finds them: those before the
+  ## link's own video go before it, the rest after (a playlist alone: the
+  ## first in its place, playing).
+  let j = a.ytList
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  let link = j.url
+  let id = link.youtubeId
+  while a.ytListUsed < j.items.len:
+    let (vid, title) = j.items[a.ytListUsed]
+    inc a.ytListUsed
+    let url = "https://www.youtube.com/watch?v=" & vid
+    let at = a.playlist.find(if a.ytListLast.len > 0: a.ytListLast else: link)
+    if at < 0 or a.playlistLocked:  # gone from the playlist meanwhile
+      j.stop()
+      a.ytList = nil
+      return
+    if vid == id and a.ytListLast.len == 0:
+      a.ytListLast = link
+      if link notin a.linkTitles: a.linkTitles[link] = title
+      continue
+    a.linkTitles[url] = title
+    if id.len == 0 and a.ytListLast.len == 0:
+      a.playlist[at] = url
+      a.ytListLast = url
+      a.playIndex(at)
+      continue
+    let pos = if a.ytListLast.len > 0: at + 1 else: at
+    a.playlist.insert(url, pos)
+    if a.plIndex >= pos: inc a.plIndex
+    if a.plSelected >= pos: inc a.plSelected
+    if a.ytListLast.len > 0: a.ytListLast = url
+  if j.running: return
+  a.ytList = nil
+  if j.code != 0 and a.ytListUsed == 0:
+    a.ytListed.excl link  # to try again
+    a.osd("Couldn't load the playlist: " & errorReason(j.errorText))
+  elif a.ytListUsed > 1 or id.len == 0:
+    a.osd(&"Playlist: {a.ytListUsed} videos")
+
 proc pollYtdlp(a: App) =
   let p = a.player
+  a.pollYtList()
   if a.ytRetry.len > 0 and now() >= a.ytRetryAt:
     let url = a.ytRetry
     a.ytRetry = ""
@@ -3170,6 +3360,9 @@ proc pollYtdlp(a: App) =
     if p.loadError.len > 0: a.ytFailed(p.path)
   # A link opened (streamed or from disk): its automatic captions join.
   let link = a.ytCurrentLink
+  if p.justLoaded and link.isWebLink:
+    let mt = p.h.getStr("media-title")
+    if mt.len > 0 and mt != link: a.linkTitles[link] = mt
   if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp().len > 0:
     if link in a.ytCaptions: a.addCaptions(link)
     elif not a.ytCaps.running:
@@ -3186,7 +3379,7 @@ proc pollYtdlp(a: App) =
   if j.running: return
   a.ytJob = nil
   case j.task
-  of ytCaptions, ytSubs: discard
+  of ytCaptions, ytSubs, ytPlaylist, ytDownload: discard
   of ytVersion:
     a.ytCurrent = j.versionText
     a.ytJob = latest()
@@ -3427,6 +3620,16 @@ proc rlSelection(a: App): string =
     if r > s[0]: result.add '\n'
     if c1 > c0: result.add row[c0 ..< c1]
 
+proc recentName(a: App, path: string): string =
+  ## An Open Recent entry's name: "title [id]" for a link.
+  if not path.isWebLink: return path.extractFilename
+  var title = a.linkTitles.getOrDefault(path, a.cfg.recentTitles.getOrDefault(path))
+  if title.len == 0: title = a.saved.getOrDefault(path).title
+  var id = path.youtubeId
+  if id.len == 0: id = path.youtubeList
+  if title.len == 0: return path
+  if id.len == 0: title else: &"{title} [{id}]"
+
 proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let root = newMenuRoot()
   let p = a.player
@@ -3445,7 +3648,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     if i >= 0: a.cfg.recentFiles.delete(i)
     if a.cfg.recentFiles.len == 0: a.menus.close()
   for r in a.cfg.recentFiles:
-    recent.item(r.extractFilename, action = bindAct(openOne, r),
+    recent.item(a.recentName(r), action = bindAct(openOne, r),
       remove = bindAct(removeOne, r))
   if a.cfg.recentFiles.len > 0:
     recent.sep()
@@ -3459,6 +3662,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   file.item("Copy YouTube Link at Current Time", k(kaCopyTimeLink),
     enabled = loaded and a.plIndex in 0 ..< a.playlist.len and
       a.playlist[a.plIndex].youtubeId.len > 0, action = proc () = a.copyTimeLink())
+  if a.saveJob.running:
+    file.item("Cancel Saving", action = proc () = a.cancelSave())
+  else:
+    file.item("Save...", k(kaSave), enabled = loaded, action = proc () = a.saveMedia())
   file.item("Close", k(kaClose), enabled = loaded and not locked, action = proc () = a.closeFile())
   file.sep()
   file.item("Save Screenshot...", k(kaScreenshot), enabled = loaded and p.hasVideo,
@@ -4122,6 +4329,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaCopyClipboard: a.copyToClipboard()
   of kaCopyTimeLink: a.copyTimeLink()
   of kaClose: a.closeFile()
+  of kaSave: a.saveMedia()
   of kaScreenshot: a.screenshot()
   of kaProperties: a.showOverlay(ovProperties)
   of kaExit: a.window.closeRequested = true
@@ -4977,7 +5185,8 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif mods == {kmShift}:
     mouse = @[("Drag", if a.cfg.snapWithShift: "Seek Snapping To Markers" else: "Seek Without Snapping")]
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
-  if mouse.len > 0: result.add mouse
+  # Mouse shortcuts lead the bar, before any key group.
+  if mouse.len > 0: result.insert(mouse, 0)
 
 proc keyHintBar(a: App, r: Rect, groups: seq[seq[KeyHint]]) =
   ## Blender-style row of [key] label pairs; groups split by a divider.
@@ -5094,6 +5303,18 @@ proc status(a: App, r: Rect) =
     ui.textIn(ahead, ar, colTextDim, FontSmall)
     ui.tip(ar, "Buffered ahead")
     sw += ar.w + 4
+  if a.saveJob.running:
+    let pc = a.saveJob.progress
+    let (done, total) = a.saveJob.bytes
+    let (unit, scale) = if total >= 1 shl 30: ("GB", float(1 shl 30)) else: ("MB", float(1 shl 20))
+    let (step, steps) = a.saveJob.stage
+    var saving = if steps > 0: &"Saving ({step}/{steps})" else: "Saving"
+    saving.add(if pc >= 0: &" {pc:.2f}%" else: "...")
+    if total > 0: saving.add &" ({done.float / scale:.1f} of {total.float / scale:.1f} {unit})"
+    let sr = rect(r.x + 30 + sw + 8, r.y, ui.textSize(saving, FontSmall).x + 4, r.h)
+    ui.textIn(saving, sr, colTextDim, FontSmall)
+    ui.tip(sr, "Saving to " & a.saveJob.dest)
+    sw += sr.w + 4
   let err = if a.ytError.len > 0: a.ytError
             elif yt.len > 0 or a.overlay == ovYtdlp or p.opening: ""
             else: p.loadError
@@ -5167,6 +5388,14 @@ proc cellText(a: App, path: string, by: PlaylistSort): string =
   of psDimensions:
     let m = a.mediaInfo.getOrDefault(path)
     if m.width > 0: &"{m.width}×{m.height}" else: ""
+
+proc rowName(a: App, path: string): string =
+  ## A playlist row's name: a link's title when known.
+  if a.ytList.running and a.ytList.url == path and path.youtubeId.len == 0:
+    "Loading playlist..."
+  elif path in a.linkTitles: a.linkTitles[path]
+  elif path.isWebLink and a.saved.getOrDefault(path).title.len > 0: a.saved[path].title
+  else: path.extractFilename
 
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
@@ -5257,7 +5486,7 @@ proc playlistPanel(a: App, r: Rect) =
     if current: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
     let path = a.playlist[i]
     let nameW = cells[0][0].w - 32
-    ui.textIn(ui.ellipsize(path.extractFilename, nameW), rect(row.x + 28, row.y, nameW, rowH),
+    ui.textIn(ui.ellipsize(a.rowName(path), nameW), rect(row.x + 28, row.y, nameW, rowH),
       if current: colAccent else: colText)
     for (cr, c) in cells[1 .. ^1]:
       ui.textIn(a.cellText(path, c.sort), rect(cr.x, row.y, cr.w - 9, rowH),
@@ -5934,7 +6163,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Open from clipboard", @[kaOpenClipboard], ""),
       ("Copy to clipboard", @[kaCopyClipboard], ""),
       ("Copy YouTube link at current time", @[kaCopyTimeLink], ""), ("Close", @[kaClose], ""),
-      ("Save screenshot", @[kaScreenshot], ""), ("Properties", @[kaProperties], ""),
+      ("Save", @[kaSave], ""), ("Save screenshot", @[kaScreenshot], ""), ("Properties", @[kaProperties], ""),
       ("Exit", @[kaExit], "")]),
     a.keyRows("Playback", [
       ("Play / Pause", @[kaPlayPause], ""), ("Stop", @[kaStop], ""),
@@ -6147,8 +6376,10 @@ proc frame(a: App) =
       a.ctxMenu = cmVideo
       a.menus.openContext(ui.mouse)
     if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
-      if w.ctrl and a.player.isSpherical: a.changeFov(ui.wheelNotches)
-      elif w.ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
+      # Unfocused, the keyboard (and Ctrl) goes elsewhere: ask the system.
+      let ctrl = w.ctrl or (not w.focused and ctrlHeld())
+      if ctrl and a.player.isSpherical: a.changeFov(ui.wheelNotches)
+      elif ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
       else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
     if ui.pressed(MouseMiddle) and a.player.isSpherical:
@@ -6597,6 +6828,7 @@ proc main() =
   elif c.rememberPlaylist:
     # Restored without playing; Play starts the entry that was current.
     a.playlist = c.playlist.filterIt(fileExists(it) or it.contains("://"))
+    a.linkTitles = c.playlistTitles
     if a.playlist.len > 0:
       let cur = c.playlistIndex
       a.plSelected =
@@ -6650,6 +6882,7 @@ proc main() =
     a.pollJobs()
     a.pollYtdlp()
     a.pollWebSave()
+    a.pollSave()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -6721,6 +6954,8 @@ proc main() =
   if a.overlay == ovOptions: a.closeOptions(false)
   if a.ytCaps.running: a.ytCaps.stop()
   if a.ytSubs.running: a.ytSubs.stop()
+  if a.ytList.running: a.ytList.stop()
+  a.cancelSave()
   a.recordEnd()  # mpv closes the file as it shuts down
   a.saved.save()
   a.savePosition()
