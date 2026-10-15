@@ -5,7 +5,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp
+  rectedit, syncdlg, ytdlp, websave
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -116,6 +116,10 @@ type
     sbPending: bool           ## the standby has a frame to draw
     sbLastPos: float          ## the playing player's last position while rolling
     sbPlayingB: float = NaN   ## ab-loop-b as set on the playing player here
+    sbHandoff: bool           ## it serves a link's saved part: opens the
+                              ## stream to take over where the part ends
+    sbOpts: string            ## mpv's per-file options it opens the file with
+    handoffFailed: bool       ## it couldn't, for the part playing
     lsound: Player            ## a loop's sound, seamless (loopSound)
     lsState: LoopSoundState
     lsKey: string             ## the file, track and loop it serves
@@ -245,14 +249,25 @@ type
     syncWin: Window
     syncSk: Silky
     syncUi: Ui
-    ytJob: YtJob              ## yt-dlp at work: a download, check, update or install
+    ytJob: YtJob              ## yt-dlp at work: a check, update or install
     ytUrl: string             ## the link it works for
     ytWatch: bool             ## the link being opened goes to yt-dlp if it fails
     ytCurrent, ytLatest: string  ## yt-dlp's versions, installed and released
-    ytError: string           ## why yt-dlp couldn't download the link
-    ytFiles: Table[string, tuple[file, chapters: string, parts: seq[string]]]
-                              ## links downloaded: the file, its chapters file
-                              ## and streams to add (unmerged)
+    ytError: string           ## why the link couldn't be opened
+    ytTries: int              ## the link's stream tried again this many times
+    ytCookies: Table[string, string]  ## links that asked to sign in: the browser
+                              ## whose cookies yt-dlp signs in with (cookieBrowsers)
+    ytCookieTried: seq[string]  ## the browsers tried on the link being opened
+    streamArgs: tuple[url: string, start: float, opts: string]
+                              ## the link last streamed, to try again with
+    stopOnLoad: bool          ## Stop, once the link loads (going online stopped)
+    saved: SaveIndex          ## links kept on disk as they streamed (websave)
+    webInfoAt: float          ## when Options > Playback > Media Cache's list was last read
+    rec: Seg                  ## the stream being saved: its file and what it holds
+    recUrl: string            ## its link; "" while none is
+    recRanges: int            ## mpv's cache ranges as it started
+    recWritten: float         ## rec.stop as last written to the index
+    ytSubs: YtJob             ## a saved link's subtitles being downloaded
     ytRetry: string           ## a link to open again at ytRetryAt
     ytRetryAt: float
     ytHooked: string          ## the yt-dlp mpv opens links with, "" until there is one
@@ -758,6 +773,72 @@ proc isWebLink(path: string): bool =
   let l = path.toLowerAscii
   l.startsWith("http://") or l.startsWith("https://")
 
+proc quoted(s: string): string = &"%{s.len}%{s}"  ## a per-file option's value, taken as it is
+
+const
+  SavedMin = 5.0  ## a link's saved part plays when this much of it is left
+
+proc linkStart(url: string): float =
+  ## Where a link says to start (t=1645s, t=27m25s, start=1645...), else 0.
+  try:
+    let u = parseUri(url)
+    for part in [u.query, u.anchor]:
+      for (k, v) in decodeQuery(part):
+        if k notin ["t", "start"]: continue
+        var (num, total) = ("", 0.0)
+        for c in v:
+          if c in {'0' .. '9', '.'}: num.add c
+          elif c in {'h', 'm', 's'} and num.len > 0:
+            total += parseFloat(num) * (if c == 'h': 3600.0 elif c == 'm': 60.0 else: 1.0)
+            num = ""
+          else: return 0
+        if num.len > 0: total += parseFloat(num)
+        return total
+  except UriParseError, ValueError: discard
+
+proc streamOpts(a: App, url: string): seq[string] =
+  ## A link's stream, once its subtitles are saved: those, not the yt-dlp
+  ## hook's (the same, numbered alike in its saved part and the stream).
+  let s = a.saved.getOrDefault(url)
+  if s.subsDone and s.subs.len > 0: result.add "sub-files=" & quoted(s.subs.join($PathSep))
+
+proc ytdlRaw(a: App, url: string): string =
+  ## The yt-dlp hook's options for a link (all of them: per file, they stand
+  ## in for the player's): no subtitles once they're saved (streamOpts), and
+  ## the browser it signs in with when it asked to.
+  let subsDone = a.saved.getOrDefault(url).subsDone
+  let cookies = a.ytCookies.getOrDefault(url)
+  if not subsDone and cookies.len == 0: return
+  var raw = @["sub-langs=" & quoted(if subsDone: "none" else: YtdlSubLangs)]
+  if cookies.len > 0: raw.add "cookies-from-browser=" & quoted(cookies)
+  "ytdl-raw-options=" & quoted(raw.join(","))
+
+proc withRaw(a: App, url, opts: string): string =
+  let raw = a.ytdlRaw(url)
+  if raw.len == 0: opts elif opts.len == 0: raw else: opts & "," & raw
+
+proc streamLink(a: App, url: string, start: float, opts: string) =
+  ## Streams a link (mpv's yt-dlp hook), noting how, to try again should it fail.
+  a.ytWatch = true
+  a.streamArgs = (url, start, opts)
+  a.player.load(url, start, false, a.withRaw(url, opts))
+
+proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float]) =
+  ## Plays a link's saved `part` from `start`, the stream to go on past it.
+  a.saved[url].used = epochTime()
+  let s = a.saved[url]
+  var opts: seq[string]
+  if s.chapters.len > 0 and fileExists(s.chapters): opts.add "chapters-file=" & quoted(s.chapters)
+  if s.subs.len > 0: opts.add "sub-files=" & quoted(s.subs.join($PathSep))
+  if s.title.len > 0: opts.add "force-media-title=" & quoted(s.title)
+  a.ytWatch = false
+  a.handoffFailed = false
+  let edl = s.timeline(part.start, part.stop)
+  if s.complete: a.player.load(url, start, false, opts.join(","), edl)
+  else: a.player.load(url, start, false, opts.join(","), edl, part.start, part.stop, s.duration)
+
+proc handoffOff(a: App)
+
 proc playIndex(a: App, i: int, start = -1.0) =
   ## Plays entry i from `start`, or from where it was left off when negative.
   if i < 0 or i >= a.playlist.len: return
@@ -773,25 +854,26 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.clearLoopMarks()
   a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
   a.reopening = false  # another file instead
-  if a.ytJob.running and a.ytJob.task == ytDownload and a.ytJob.url != path:
-    a.ytJob.stop()
-    a.ytJob = nil
   if a.ytCaps.running and a.ytCaps.url != path:
     a.ytCaps.stop()
     a.ytCaps = nil
   a.ytError = ""
   a.ytRetry = ""
-  let dl = a.ytFiles.getOrDefault(path)
-  if dl.file.len > 0 and fileExists(dl.file):
-    # Downloaded by yt-dlp: that file, with the link's chapters.
-    a.ytWatch = false
-    var opts: seq[string]
-    let quoted = proc (s: string): string = &"%{s.len}%{s}"  # taken as it is
-    if dl.chapters.len > 0: opts.add "chapters-file=" & quoted(dl.chapters)
-    if dl.parts.len > 0: opts.add "external-files=" & quoted(dl.parts.join($PathSep))
-    a.player.load(dl.file, a.resumedAt, a.cfg.repeatPingPong, opts.join(","))
+  a.ytTries = 0
+  a.ytCookieTried.setLen 0
+  a.stopOnLoad = false
+  a.handoffOff()
+  # A link played before: from disk, when saved where it starts.
+  let s = a.saved.getOrDefault(path)
+  let at = if a.resumedAt > 0 or not path.isWebLink: a.resumedAt else: path.linkStart
+  let part = s.chainAt(at)
+  if path.isWebLink and part.stop > part.start and
+     (s.complete or part.stop - at >= SavedMin):
+    a.playSaved(path, at, part)
+  elif path.isWebLink:
+    a.streamLink(path, a.resumedAt, a.streamOpts(path).join(","))
   else:
-    a.ytWatch = path.isWebLink
+    a.ytWatch = false
     a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
   a.applyLoop()
   a.cfg.addRecent(path)
@@ -817,6 +899,7 @@ proc openPaths(a: App, paths: seq[string]) =
 proc closeFile(a: App) =
   if a.editLocked: return
   a.savePosition()
+  a.handoffOff()
   a.clearLoopMarks()
   a.player.close()
   a.preview.forget()
@@ -1165,6 +1248,13 @@ proc showInFolder(a: App, path: string) =
       return
     a.spawn("xdg-open", path.parentDir)
 
+proc openFolder(a: App, dir: string) =
+  ## Opens the file manager on dir, made first should it not be there.
+  try: createDir(dir)
+  except OSError: discard
+  when defined(windows): a.spawn("explorer.exe", dir)
+  else: a.spawn("xdg-open", dir)
+
 when defined(windows):
   proc runPowerAction(a: App) =
     case a.afterPlayback
@@ -1221,6 +1311,9 @@ proc handleEof(a: App) =
   let p = a.player
   if not (p.loaded and p.eofReached and not p.eofHandled and not p.stopped): return
   p.eofHandled = true
+  if p.partEnd > 0:  # the end of a link's saved part: the stream goes on
+    p.beyond = p.timePos
+    return
   if a.pingPongFile or a.pingPongAb:  # at either end of the file: turn around
     p.setBackward(not p.backward)
     p.h.setProp("pause", false)
@@ -1758,15 +1851,21 @@ proc mirrorStandby(a: App) =
     if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
       sb.h.setProp(name, p.props[name])
 
-proc standbyAt(a: App, path: string, start: float) =
-  ## Sends the standby (paused, muted) to `start` in `path`.
+proc standbyAt(a: App, path: string, start: float, opts = "") =
+  ## Sends the standby (paused, muted) to `start` in `path`, opened with
+  ## mpv's per-file options `opts`.
   let sb = a.standby
   sb.h.setProp("mute", true)
   sb.stopped = false
   a.sbStart = start
-  if path != a.sbPath or not sb.loaded:
+  if path != a.sbPath or opts != a.sbOpts or not sb.loaded:
     a.sbPath = path
+    a.sbOpts = opts
     sb.path = path
+    sb.source = ""
+    sb.partStart = 0
+    sb.partEnd = 0
+    sb.fullDuration = 0
     sb.loaded = false
     sb.loadError = ""
     sb.sphere = a.player.sphere  # its added tracks come with mirroring
@@ -1774,7 +1873,7 @@ proc standbyAt(a: App, path: string, start: float) =
     # Before opening: changed later, it would reopen the sound output.
     sb.h.setProp("audio-device", a.player.h.getStr("audio-device"))
     sb.h.commandAsync("loadfile", path, "replace", "-1",
-      "start=" & formatFloat(start, ffDecimal, 6))
+      "start=" & formatFloat(start, ffDecimal, 6) & (if opts.len > 0: "," & opts else: ""))
     a.sbState = sbLoading
   else:
     # Seeking first: pausing first would have it wait for its sound to stop.
@@ -1788,6 +1887,7 @@ proc standbyOff(a: App) =
   a.sbState = sbOff
   if not math.isNaN(a.sbPlayingB): a.applyAbLoop()  # B back where it was
   a.sbPath = ""
+  a.sbOpts = ""
   a.standby.h.setProp("pause", true)
   a.standby.close()
 
@@ -1818,6 +1918,13 @@ proc takeOver(a: App, past = NaN) =
   a.framePending = false
   a.renderNow = true  # the new one's frame, right away
   a.sbPending = false
+  if a.sbHandoff:  # the stream from here on; the saved part is done with
+    a.sbHandoff = false
+    a.sbState = sbOff
+    (a.sbPath, a.sbOpts) = ("", "")
+    old.h.setProp("pause", true)
+    old.close()
+    return
   a.standbyAt(a.sbPath, a.sbStart)
 
 proc standbyStep(a: App, la, lb, start: float) =
@@ -1849,7 +1956,7 @@ proc standbyStep(a: App, la, lb, start: float) =
       let pos = a.soundTarget
       let wrapped = pos < a.sbLastPos - (lb - la) / 2
       if wrapped or pos >= lb - 0.004: a.takeOver(if wrapped: pos - la else: 0.0)
-      elif not p.playing: a.standbyAt(p.path, start)
+      elif not p.playing: a.standbyAt(p.path, start, a.sbOpts)
       else: a.sbLastPos = pos
       return
     let pos = p.posNow
@@ -1858,12 +1965,13 @@ proc standbyStep(a: App, la, lb, start: float) =
     if pos >= lb - 0.004 or p.eofReached or (jumped and a.sbLastPos >= lb - 0.05):
       a.takeOver()  # at B, or mpv's own loop just beat us to it
     elif jumped or not p.playing:  # sought or paused meanwhile: wait again
-      a.standbyAt(p.path, start)
+      a.standbyAt(p.path, start, a.sbOpts)
     else:
       a.sbLastPos = pos
 
 proc seamlessLoop(a: App) =
   ## Keeps a standby ready for the loop playing, and hands over at B.
+  if a.sbHandoff: return  # busy going online (webHandoff)
   let p = a.player
   let (la, lb) = a.loopRegion
   let need = lb > la and lb - la >= StandbyMinLoop and p.loaded and not p.stopped and
@@ -2509,9 +2617,10 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
       a.extPicks[a.extQueue[0]] = paths[0].absolutePath
       a.extQueue.delete(0)
       a.askExternal()
-  of "optshotdir", "optopendir":  # Options > Player > Paths, Browse...
+  of "optshotdir", "optopendir", "optwebdir":  # Options' Browse... buttons
     if a.overlay == ovOptions:
       if purpose == "optshotdir": a.cfg.screenshotDir = paths[0]
+      elif purpose == "optwebdir": a.cfg.webDir = paths[0]
       else: a.cfg.openDir = paths[0]
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
@@ -2593,8 +2702,20 @@ proc syncSettings(a: App) =
   h.setProp("sub-file-paths", subPathList(c.subPaths))
   a.updateTitle()
 
+proc recordEnd(a: App)
+proc pruneSaved(a: App)
+
 proc closeOptions(a: App, ok: bool) =
-  if ok: a.cfg.save()
+  if ok:
+    a.cfg.save()
+    # Another folder for links: its own index, the current one left as is.
+    let dir = a.cfg.webDir.expandPath
+    if (if dir.len > 0: dir else: defaultSaveDir()) != saveDir():
+      a.recordEnd()
+      a.handoffOff()
+      setSaveDir(dir)
+      a.saved = loadSaveIndex()
+    a.pruneSaved()
   else: a.cfg = a.cfgBefore  # undo the live edits
   a.optUi.focusId = ""
   a.overlay = ovNone
@@ -2867,9 +2988,10 @@ proc pollJobs(a: App) =
         for f in e.reveal: a.showInFolder(f)
 
 # --- yt-dlp -------------------------------------------------------------------
-# A link mpv can't open (its yt-dlp hook included) goes on from here: yt-dlp is
-# installed when missing, else updated when a newer one is out, else it
-# downloads the video, which then opens from the file.
+# A link mpv can't open (its yt-dlp hook included) goes on from here: its
+# stream is tried again at once (YouTube turns some down now and then), then
+# yt-dlp is installed when missing, or updated when a newer one is out.
+# Nothing is downloaded whole: a link always streams.
 
 proc shortPath(path: string): string =
   ## path with the home folder as "~".
@@ -2893,8 +3015,11 @@ proc hookYtdlp(a: App) =
       createSymlink(exe, link)
       path = link
     except OSError: discard
-  # Moving the link is enough for a hook that has it already.
-  if a.ytHooked.len == 0 or path == exe: a.player.useYtdlp(path)
+  # Moving the link is enough for a hook that has it already. The standby
+  # opens links too (webHandoff), and takes turns with the player.
+  if a.ytHooked.len == 0 or path == exe:
+    for p in [a.player, a.standby]:
+      if p != nil: p.useYtdlp(path)
   a.ytHooked = exe
 
 proc ytStatus(a: App): string =
@@ -2902,29 +3027,41 @@ proc ytStatus(a: App): string =
   let j = a.ytJob
   if not j.running: return
   case j.task
-  of ytDownload:
-    result = "Downloading"
-    if j.progress >= 0: result.add &" {int(j.progress)}%"
   of ytVersion, ytLatest: result = "Checking yt-dlp"
   of ytUpdate: result = "Updating yt-dlp"
   of ytInstall:
     result = "Installing yt-dlp"
     if j.progress >= 0: result.add &" {int(j.progress)}%"
-  of ytCaptions: discard  # its own slot, quietly
+  of ytCaptions, ytSubs: discard  # their own slots, quietly
 
 proc ytCurrentLink(a: App): string =
   if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
 
 proc ytOpen(a: App, url: string, delay = 0.0) =
-  ## Opens url again, now through yt-dlp or its download, unless another
-  ## entry has been opened meanwhile.
+  ## Streams url again (from where it was tried), unless another entry has
+  ## been opened meanwhile.
   if delay > 0:
     (a.ytRetry, a.ytRetryAt) = (url, now() + delay)
-  elif url.len > 0 and a.ytCurrentLink == url: a.playIndex(a.plIndex)
+  elif url.len > 0 and a.ytCurrentLink == url:
+    if a.streamArgs.url == url: a.streamLink(url, a.streamArgs.start, a.streamArgs.opts)
+    else: a.playIndex(a.plIndex)
 
-proc ytDownload(a: App, url: string) =
-  if a.ytCurrentLink != url: return
-  a.ytJob = download(findYtdlp(), url)
+proc ytGiveUp(a: App) =
+  ## The link's stream failed, yt-dlp as new as it gets. yt-dlp's reason, when
+  ## it gave one: mpv's is then about the web page it tried in its place.
+  let p = a.player
+  if p.hookError.len > 0:
+    a.ytError = errorReason(p.hookError)
+    if a.ytCookieTried.len > 0:
+      a.ytError.add " (not signed in on " & a.ytCookieTried.join(", ") & ")"
+    elif not wantsSignIn(p.hookError): discard
+    elif a.cfg.signInCookies.strip.toLowerAscii == "none":
+      a.ytError.add " (signing in is off: Options > Playback)"
+    else: a.ytError.add " (no browser found to sign in with)"
+  else:
+    a.ytError = "couldn't stream it" &
+      (if p.loadError.len > 0: " (" & p.loadError & ")" else: "")
+  a.osd("Couldn't open the link: " & a.ytError)
 
 proc closeDialogs(a: App) =
   ## Closes whichever dialog or overlay is up (as Cancel would).
@@ -2953,28 +3090,54 @@ proc showYtdlp(a: App, mode: YtMode, msg = "") =
     a.overlay = ovYtdlp
 
 proc closeYtdlp(a: App) =
-  ## Hides the yt-dlp window. Turning down an update still gets the video:
-  ## downloaded with the yt-dlp there is.
+  ## Hides the yt-dlp window. Turning down an update gives up on the link.
   let declined = a.ytMode == ymUpdate
   a.ytUi.focusId = ""
   if a.overlay == ovYtdlp: a.overlay = ovNone
   if a.ytWin.visible:
     a.ytWin.visible = false
     a.window.activate()
-  if declined: a.ytDownload(a.ytUrl)
+  if declined: a.ytGiveUp()
+
+const StreamTries = 2  ## a link's stream is tried again at once this many times
+
+proc ytSignIn(a: App, url: string): bool =
+  ## The link asked to sign in (or the browser yt-dlp signed in with didn't
+  ## do): its stream again with the next browser's cookies, else it gives up.
+  ## False when the failure is about something else.
+  let err = a.player.hookError
+  if a.ytCookieTried.len == 0 and a.ytCookies.getOrDefault(url).len > 0:
+    a.ytCookieTried.add a.ytCookies[url]  # from an earlier opening
+  # Its cookies couldn't be read (no profile, locked keyring...): the next one.
+  let unread = a.ytCookieTried.len > 0 and "cookie" in err.toLowerAscii
+  if not (wantsSignIn(err) or unread): return
+  for b in cookieBrowsers(a.cfg.signInCookies):
+    if b in a.ytCookieTried: continue
+    a.ytCookieTried.add b
+    a.ytCookies[url] = b
+    a.osd("Signing in with " & b & "'s cookies...")
+    a.ytOpen(url)
+    return true
+  a.ytCookies.del url
+  a.ytGiveUp()
+  true
 
 proc ytFailed(a: App, url: string) =
-  ## A link didn't open: on to yt-dlp.
+  ## A link didn't open: its stream again, else on to yt-dlp.
   if a.ytJob.running and a.ytJob.task in {ytUpdate, ytInstall}: return
   if a.ytJob.running: a.ytJob.stop()
   a.ytUrl = url
   a.ytError = ""
+  if a.ytSignIn(url): return
   let exe = findYtdlp()
   if exe.len == 0:
     a.showYtdlp(ymInstall)
   elif exe != a.ytHooked:
     a.hookYtdlp()  # installed meanwhile: mpv tries again with it
     a.ytOpen(url, HookStart)
+  elif a.ytTries < StreamTries:
+    inc a.ytTries
+    a.ytOpen(url)
   else:
     (a.ytCurrent, a.ytLatest) = ("", "")
     a.ytJob = version(exe)
@@ -3005,11 +3168,12 @@ proc pollYtdlp(a: App) =
   if a.ytWatch and not p.opening and (p.loaded or p.loadError.len > 0):
     a.ytWatch = false
     if p.loadError.len > 0: a.ytFailed(p.path)
-  # A link opened (streamed or downloaded): its automatic captions join.
+  # A link opened (streamed or from disk): its automatic captions join.
   let link = a.ytCurrentLink
   if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp().len > 0:
     if link in a.ytCaptions: a.addCaptions(link)
-    elif not a.ytCaps.running: a.ytCaps = captions(findYtdlp(), link)
+    elif not a.ytCaps.running:
+      a.ytCaps = captions(findYtdlp(), link, a.ytCookies.getOrDefault(link))
   if a.ytCaps != nil and a.ytCaps.poll() and not a.ytCaps.running:
     let j = a.ytCaps
     a.ytCaps = nil
@@ -3022,14 +3186,14 @@ proc pollYtdlp(a: App) =
   if j.running: return
   a.ytJob = nil
   case j.task
-  of ytCaptions: discard
+  of ytCaptions, ytSubs: discard
   of ytVersion:
     a.ytCurrent = j.versionText
     a.ytJob = latest()
   of ytLatest:
     a.ytLatest = j.versionText
     if newer(a.ytLatest, a.ytCurrent): a.showYtdlp(ymUpdate)
-    else: a.ytDownload(a.ytUrl)
+    else: a.ytGiveUp()
   of ytUpdate:
     if j.code == 0:
       a.closeYtdlp()
@@ -3047,13 +3211,183 @@ proc pollYtdlp(a: App) =
       a.ytOpen(a.ytUrl, HookStart)
     else:
       a.showYtdlp(ymFailed, "yt-dlp couldn't be installed: " & j.errorText)
-  of ytDownload:
+
+# --- online videos kept on disk ----------------------------------------------
+# A link streaming is saved as it plays, a file for each stretch read without
+# a jump (websave). Opened again where some of it was saved, that part plays
+# from disk (playSaved), and the standby opens the stream shortly before the
+# part ends, taking over there as it would at a seamless loop's B.
+
+const
+  HandoffLead = 30.0    ## the stream opens this long before the saved part ends, media seconds
+  HandoffMargin = 0.5   ## and takes over this long before its end
+  RecordMin = 2.0       ## a stream's new part worth saving, seconds
+
+proc entry(a: App, url: string): var Saved = a.saved.mgetOrPut(url, Saved())
+
+proc webLimits(a: App): Limits =
+  Limits(hours: (if a.cfg.webKeepOn: a.cfg.webKeepHours.float else: 0),
+         count: (if a.cfg.webCountOn: a.cfg.webCount else: 0),
+         bytes: (if a.cfg.webSizeOn: a.cfg.webSizeGB.int64 shl 30 else: 0))
+
+proc pruneSaved(a: App) =
+  ## Applies Options > Playback > Media Cache's limits, sparing the link playing.
+  a.saved.prune(a.webLimits, if a.player.path.isWebLink: a.player.path else: "")
+
+proc handoffOff(a: App) =
+  if not a.sbHandoff: return
+  a.sbHandoff = false
+  a.standbyOff()
+
+proc goOnline(a: App, t: float, stopped = false) =
+  ## From a link's saved part to its stream at t, the same tracks chosen
+  ## (`stopped`: there, stopped).
+  let p = a.player
+  a.handoffOff()
+  let url = p.path
+  var opts = a.streamOpts(url)
+  let aid = p.selectedTrack("audio")
+  opts.add "aid=" & (if aid == 0: "no" else: $aid)
+  if a.saved.getOrDefault(url).subsDone:  # numbered alike only then
+    let sid = p.selectedTrack("sub")
+    opts.add "sid=" & (if sid == 0: "no" else: $sid)
+  if t <= 0: opts.add "start=0"  # not the link's own (t=...)
+  if stopped: opts.add "pause=yes"
+  a.stopOnLoad = stopped
+  a.ytTries = 0
+  a.streamLink(url, t, opts.join(","))
+
+proc webHandoff(a: App) =
+  ## While a link's saved part plays: the standby opens the stream a little
+  ## before the part ends, to take over there (standbyStep, takeOver).
+  let p = a.player
+  let part = p.partEnd
+  if a.standby == nil or part <= 0 or not p.loaded or p.stopped or a.handoffFailed:
+    a.handoffOff()
+    return
+  let h = part - HandoffMargin
+  let start = max(h - StandbyPreroll, 0)
+  if not a.sbHandoff:
+    let pos = p.posNow
+    if p.seeking or pos >= h or pos < h - HandoffLead * max(p.speed, 1): return
+    a.sbHandoff = true
+    (a.sbA, a.sbB) = (h, h)
+    a.standbyAt(p.path, start, a.withRaw(p.path, a.streamOpts(p.path).join(",")))
+    return
+  discard a.standby.pollEvents()
+  if a.standby.loadError.len > 0:  # the part's end goes online the plain way
+    a.handoffFailed = true
+    a.handoffOff()
+    return
+  a.standbyStep(h, h, start)
+
+proc recordEnd(a: App) =
+  ## Done saving the stream: what its file holds goes in the index.
+  if a.recUrl.len == 0: return
+  let url = a.recUrl
+  a.recUrl = ""
+  if a.player.path == url: a.player.stopDump()
+  if a.rec.stop - a.rec.start < 1:
+    try: removeFile(a.rec.file)
+    except OSError: discard
+    return
+  a.entry(url).addSeg(a.rec)
+  a.pruneSaved()
+
+proc recordStep(a: App) =
+  ## Saves the link streaming as it streams, a file for each stretch read
+  ## without a jump that reaches past what's saved there.
+  let p = a.player
+  if a.recUrl.len > 0:
+    if p.path != a.recUrl or not p.loaded or not p.dumping:
+      a.recordEnd()
+      return
+    if p.buffered.len == 0: return
+    # mpv's cache range it's writing: the one reaching on from where it got to.
+    var ours = (-1.0, -1.0)
+    for r in p.buffered:
+      if r[0] <= a.rec.stop + 0.5 and r[1] >= a.rec.stop - 0.05 and r[1] > ours[1]: ours = r
+    # Read elsewhere (sought past the cache): the file would go on from there.
+    let pos = p.timePos
+    if ours[1] < 0 or p.buffered.len > a.recRanges or
+       not p.seeking and (pos < ours[0] - 1 or pos > ours[1] + 15):
+      a.recordEnd()
+      return
+    a.recRanges = p.buffered.len
+    a.rec.stop = max(a.rec.stop, ours[1])
+    if a.rec.stop - a.recWritten >= 10:  # now and then, should the player not get to close
+      a.recWritten = a.rec.stop
+      a.entry(a.recUrl).addSeg(a.rec)
+      a.saved.save()
+    return
+  let link = a.ytCurrentLink
+  if not (p.loaded and link.isWebLink and p.path == link and p.source.len == 0 and
+          p.duration > 0 and not p.seeking): return
+  # mpv's cache range being read; a dump would also take in any range after
+  # it, out of place, so only the last one is saved.
+  var cur = (-1.0, -1.0)
+  for r in p.buffered:
+    if r[0] <= p.timePos + 1 and p.timePos <= r[1] + 15 and r[0] > cur[0]: cur = r
+  if cur[1] < 0: return
+  for r in p.buffered:
+    if r[0] > cur[1]: return
+  # Worth it once it reaches past what's saved there.
+  let c = a.saved.getOrDefault(link).chainAt(cur[0])
+  let have = if c.stop > c.start: c.stop else: cur[0]
+  if cur[1] >= have + RecordMin:
+    let r = cur
+    try: createDir(saveDir())
+    except OSError: return
+    a.rec = Seg(file: newSegFile(link), start: max(r[0], 0), stop: max(r[0], 0))
+    a.recUrl = link
+    a.recRanges = p.buffered.len
+    a.recWritten = a.rec.start
+    p.dumpFrom(r[0], a.rec.file)
+    a.entry(link).duration = p.duration
+    a.entry(link).used = epochTime()
+    let title = p.h.getStr("media-title")
+    if title.len > 0 and title != link: a.entry(link).title = title
+    if a.entry(link).chapters.len == 0 and p.chapters.len > 0:
+      a.entry(link).chapters = writeChapters(link,
+        p.chapters.mapIt((it.time, it.title)), p.duration)
+    if not a.entry(link).subsDone and not a.ytSubs.running and findYtdlp().len > 0:
+      a.ytSubs = subtitles(findYtdlp(), link, saveDir() / keyOf(link) & "-subs",
+        a.ytCookies.getOrDefault(link))
+
+proc pollWebSave(a: App) =
+  let p = a.player
+  # Got before the saved part some other way (a chapter back, say): what
+  # plays there only stands in for the time.
+  if p.partEnd > 0 and p.beyond < 0 and p.settled and not p.seeking and
+     p.timePos < p.partStart - 0.5:
+    p.beyond = max(p.timePos, 0)
+  if p.beyond >= 0:  # sought outside the saved part, or played to its end
+    let t = p.beyond
+    p.beyond = -1
+    if p.partEnd > 0: a.goOnline(t, p.stopped)
+  a.webHandoff()
+  a.recordStep()
+  if a.ytSubs != nil and a.ytSubs.poll() and not a.ytSubs.running:
+    let j = a.ytSubs
+    a.ytSubs = nil
     if j.code == 0:
-      a.ytFiles[j.url] = (j.file, j.chaptersFile, j.parts)
-      a.ytOpen(j.url)
-    else:
-      a.ytError = "yt-dlp: " & j.errorText
-      a.osd("Couldn't open the link: " & a.ytError)
+      a.entry(j.url).subs = j.subs
+      a.entry(j.url).subsDone = true
+      a.saved.save()
+
+proc dropSaved(a: App, urls: seq[string]) =
+  ## Deletes links' saved files (Options > Playback > Media Cache); one playing from
+  ## them goes on streaming.
+  let p = a.player
+  if a.recUrl in urls: a.recordEnd()
+  if p.partEnd > 0 and p.path in urls: a.goOnline(p.posNow, p.stopped)
+  a.saved.drop(urls)
+
+proc refreshWebInfo(a: App) =
+  a.webInfoAt = now()
+  let (free, total) = diskSpace()
+  a.optionsDlg.web = WebInfo(dir: saveDir(), used: usedBytes(), free: free, total: total,
+                             items: a.saved.items)
 
 proc showOverlay(a: App, o: Overlay) =
   a.menus.close()
@@ -3064,6 +3398,7 @@ proc showOverlay(a: App, o: Overlay) =
     a.cfgBefore = a.cfg
     a.ensureOptionsWindow()
     a.optionsDlg.opened(a.optUi)
+    a.refreshWebInfo()
     a.showDialog(a.optWin, OptionsSize)
   a.overlay = o
 
@@ -5219,6 +5554,8 @@ proc renderOptions(a: App, shot: string) =
   glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
+  # The Media Cache page's list follows links being saved.
+  if a.optionsDlg.page == opWeb and now() - a.webInfoAt > 2: a.refreshWebInfo()
   let action = a.optionsDlg.draw(ui, a.cfg, rect(vec2(0, 0), ui.size))
   ui.drawTooltip()
   a.optSk.endUi()
@@ -5240,11 +5577,23 @@ proc renderOptions(a: App, shot: string) =
     let d = a.cfg.openDir.expandPath
     a.ask(dkOpenDir, "optopendir", "Start Folder",
       if d.len > 0 and dirExists(d): d else: a.startDir)
-  of prShowSettings:
-    try: createDir(configDir())
-    except OSError: discard
-    when defined(windows): a.spawn("explorer.exe", configDir())
-    else: a.spawn("xdg-open", configDir())
+  of prShowSettings: a.openFolder(configDir())
+  of prBrowseWeb:
+    let d = a.cfg.webDir.expandPath
+    a.ask(dkOpenDir, "optwebdir", "Media Cache Folder",
+      if d.len > 0 and dirExists(d): d else: saveDir())
+  of prOpenWebDir:  # the folder set in the field, applied or not
+    let d = a.cfg.webDir.expandPath
+    a.openFolder(if d.len > 0: d else: defaultSaveDir())
+  of prClearWeb:
+    a.dropSaved(toSeq(a.saved.keys))
+    a.saved.removeStray(initDuration())
+    a.optionsDlg.webPicked = @[]
+    a.refreshWebInfo()
+  of prDeleteWeb:
+    a.dropSaved(a.optionsDlg.webPicked)
+    a.optionsDlg.webPicked = @[]
+    a.refreshWebInfo()
   if a.optionsDlg.assocApplied:
     a.optionsDlg.assocApplied = false
     # Let KDE's service cache notice the new defaults right away.
@@ -5350,8 +5699,7 @@ proc renderYtdlp(a: App, shot: string) =
         ", from where it keeps itself up to date (yt-dlp -U)."
     of ymUpdate:
       &"This link didn't open. A newer yt-dlp is out: {a.ytLatest} (you have " &
-        &"{a.ytCurrent}). Update it now? Otherwise the video is downloaded " &
-        "with the one you have."
+        &"{a.ytCurrent}). Update it now?"
     of ymBusy, ymFailed: a.ytMsg
   var y = 14'f32
   for line in ui.wrapText(text, W - 32, 5):
@@ -6091,18 +6439,25 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "quit": a.window.closeRequested = true
   of "uiscale": a.cfg.uiScale = parseFloat(arg)  # percent, as Options sets it
   of "set": a.player.h.setProp(st.args[0], st.args[1 .. ^1].join(" "))
-  of "ytdlp":  # 1 | 0: the yt-dlp window's Install/Update or Cancel; "download": the open link
-    if arg == "download":
-      a.ytUrl = a.ytCurrentLink
-      a.ytDownload(a.ytUrl)
-    else: a.ytAnswer(arg == "1")
+  of "ytdlp": a.ytAnswer(arg == "1")  # 1 | 0: the yt-dlp window's Install/Update or Cancel
   of "ytdump":
     stderr.writeLine "ytdlp status=", a.ytStatus, " mode=", a.ytMode, " overlay=", a.overlay,
       " opening=", a.player.opening, " loaded=", a.player.loaded, " path=", a.player.path,
-      " err=", a.player.loadError, " yterr=", a.ytError, " hooked=", a.ytHooked,
+      " err=", a.player.loadError, " yterr=", a.ytError, " tries=", a.ytTries,
+      " hooked=", a.ytHooked,
       " versions=", a.ytCurrent, "/", a.ytLatest, " msg=", a.ytMsg,
       " buffered=", a.player.buffered, " chapters=", a.player.chapters.len,
       " subs=", a.player.tracks.countIt(it.kind == "sub")
+  of "webdump":  # the open link's saved part, its saving and the standby going online
+    let p = a.player
+    let s = a.saved.getOrDefault(a.ytCurrentLink)
+    stderr.writeLine "web t=", p.timePos.formatFloat(ffDecimal, 3), " dur=", p.duration,
+      " source=", p.source.len > 0, " part=", p.partStart, "..", p.partEnd,
+      " stopped=", p.stopped, " paused=", p.paused, " dumping=", p.dumping,
+      " rec=", (if a.recUrl.len > 0: $a.rec.start & ".." & $a.rec.stop else: "-"),
+      " sb=", a.sbState, " handoff=", a.sbHandoff, " saved=", s.covered, "/", s.duration,
+      " segs=", s.segs.len, " subs=", s.subs.len, " subsDone=", s.subsDone,
+      " tracks=", p.tracks.mapIt(it.kind & $it.id & (if it.selected: "*" else: "")).join(",")
   of "dump":
     for prop in st.args:
       stderr.writeLine "dump ", prop, " = ", a.player.h.getStr(prop)
@@ -6173,8 +6528,10 @@ proc main() =
   a.quad = newQuadRenderer()
 
   a.player = newPlayer(a.cfg.volume, a.cfg.muted, a.cfg.showOsd)
-  a.hookYtdlp()
-  pruneDownloads()
+  removeDownloads()
+  setSaveDir(a.cfg.webDir.expandPath)
+  a.saved = loadSaveIndex()
+  a.pruneSaved()
   a.player.initRender()
   a.applyLoop()
   a.syncSettings()
@@ -6185,6 +6542,7 @@ proc main() =
   except MpvError as e:
     stderr.writeLine "seamless loops disabled: ", e.msg
     a.standby = nil
+  a.hookYtdlp()
   try:
     a.lsound = newLoopSound(a.cfg.volume)
   except MpvError as e:
@@ -6291,6 +6649,7 @@ proc main() =
     a.pollDialog()
     a.pollJobs()
     a.pollYtdlp()
+    a.pollWebSave()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -6305,6 +6664,9 @@ proc main() =
         a.player.h.setProp(prop, if id == 0: "no" else: $id)
     if a.player.justLoaded:
       a.player.justLoaded = false
+      if a.stopOnLoad:  # gone online at Stop
+        a.stopOnLoad = false
+        a.player.stop()
       a.resetLook()
       a.lookDragging = false
       a.updateTitle()
@@ -6357,8 +6719,10 @@ proc main() =
       sleep(1)
 
   if a.overlay == ovOptions: a.closeOptions(false)
-  if a.ytJob.running and a.ytJob.task == ytDownload: a.ytJob.stop()
   if a.ytCaps.running: a.ytCaps.stop()
+  if a.ytSubs.running: a.ytSubs.stop()
+  a.recordEnd()  # mpv closes the file as it shuts down
+  a.saved.save()
   a.savePosition()
   a.rememberState()
   a.cfg.save()

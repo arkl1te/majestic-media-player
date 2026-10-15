@@ -632,9 +632,58 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.textIn(placeholder, rect(inner.x, r.y, inner.w + 4000, r.h), colTextDisabled)
   ui.sk.popClipRect()
 
+proc evalMath*(s: string): float =
+  ## Basic arithmetic typed into a number field: + - * / and parentheses,
+  ## as in 24*3+12/2. Raises ValueError on anything else.
+  var i = 0
+  proc skip() =
+    while i < s.len and s[i] in Whitespace: inc i
+  proc expr(): float
+  proc atom(): float =
+    skip()
+    if i < s.len and s[i] in {'+', '-'}:
+      let neg = s[i] == '-'
+      inc i
+      let v = atom()
+      return if neg: -v else: v
+    if i < s.len and s[i] == '(':
+      inc i
+      result = expr()
+      skip()
+      if i >= s.len or s[i] != ')': raise newException(ValueError, "missing )")
+      inc i
+      return
+    let start = i
+    while i < s.len and s[i] in Digits + {'.'}: inc i
+    if i == start: raise newException(ValueError, "number expected")
+    result = parseFloat(s[start ..< i])
+  proc term(): float =
+    result = atom()
+    skip()
+    while i < s.len and s[i] in {'*', '/'}:
+      let op = s[i]
+      inc i
+      let v = atom()
+      result = if op == '*': result * v else: result / v
+      skip()
+  proc expr(): float =
+    result = term()
+    skip()
+    while i < s.len and s[i] in {'+', '-'}:
+      let op = s[i]
+      inc i
+      let v = term()
+      result = if op == '+': result + v else: result - v
+      skip()
+  result = expr()
+  if i < s.len: raise newException(ValueError, "unexpected " & s[i])
+  if result.classify in {fcNan, fcInf, fcNegInf}:
+    raise newException(ValueError, "not a number")
+
 proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
                   step, lo, hi: float, decimals = 0): bool =
-  ## [-] value [+]: type a number, click the buttons or scroll over it.
+  ## [-] value [+]: type a number (or basic math, worked out on Enter or
+  ## unfocus), click the buttons or scroll over it.
   ## Returns true when value changed.
   let fid = id & "#field"
   proc fmt(v: float): string =
@@ -656,7 +705,7 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
     if ui.window.buttonPressed[KeyDown]: keyDelta = -step
     if keyDelta != 0:
       try:
-        let v = clamp(parseFloat(buf.strip), lo, hi)
+        let v = clamp(evalMath(buf), lo, hi)
         if v != value:
           value = v
           result = true
@@ -664,7 +713,7 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
   if ui.focusId == fid: ui.editText = buf
   if eeCommitted in ev:
     try:
-      let v = clamp(parseFloat(buf.strip), lo, hi)
+      let v = clamp(evalMath(buf), lo, hi)
       if v != value:
         value = v
         result = true

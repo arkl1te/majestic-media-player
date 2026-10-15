@@ -30,6 +30,14 @@ type
     render*: MpvRenderContext
     target*: VideoTarget
     path*: string
+    source*: string           ## what mpv opened, when not path (a link's
+                              ## saved part: path is the link)
+    partStart*, partEnd*: float  ## a link's saved part: where it starts
+                              ## and ends, link time (partEnd 0: not one)
+    fullDuration*: float      ## and the link's length, shown as the duration
+    beyond*: float = -1       ## a seek asked for past the saved part
+    dumping*: bool            ## writing what it streams to a file (dumpFrom)
+    dumpId: uint64
     loaded*: bool             ## a file is open
     opening*: bool            ## a file is being opened (links take a while)
     stopped*: bool            ## our Stop state (paused at 0, video hidden)
@@ -57,6 +65,9 @@ type
                               ## filters see, autorotation included)
     audioChannels*: int
     loadError*: string
+    hookError*: string        ## yt-dlp's error opening the link (mpv's hook),
+                              ## "ERROR: ..."; mpv's own (loadError) is then
+                              ## about the web page it tried in its place
     sphere*: SphereInfo       ## 360° metadata of the open file
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
@@ -69,6 +80,7 @@ type
                               ## this module (not a loop's own jumps back)
     soundKey: string          ## a loop sound's filters and track as set
     restarts*: int            ## playback restarts (after loads and seeks)
+    loadRestarts: int         ## restarts as the file was opened
     expanded*: seq[string]    ## expandText results, in order
 
   Preview* = ref object
@@ -88,6 +100,8 @@ var
   previewReady: Atomic[int]
   osdReady: Atomic[int]
 
+let logAll = existsEnv("MMP_DEBUG")  ## mpv's log (warnings and up) to stderr
+
 const
   MirroredProps* = ["aid", "vid", "sid", "secondary-sid", "volume", "speed",
     "sub-delay", "audio-delay", "sub-visibility", "slang", "alang",
@@ -103,6 +117,7 @@ const
     ## player can be made to look and sound the same (seamless loops)
   MirrorBase = 1000           ## observation ids of MirroredProps
   ExpandReply = 77'u64        ## reply id of expandText
+  DumpReply = 1000'u64        ## dumpFrom's, plus its count
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
 proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
@@ -160,9 +175,9 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
     YtdlSubLangs)  # %n%: n bytes taken as they are
   check mpv_initialize(h), "mpv_initialize"
   # mpv's log goes to stderr only when MMP_DEBUG is set; load failures surface
-  # in the status bar regardless.
-  if existsEnv("MMP_DEBUG"):
-    discard mpv_request_log_messages(h, "warn")
+  # in the status bar regardless. Errors come in anyway, for yt-dlp's
+  # (hookError).
+  discard mpv_request_log_messages(h, (if logAll: "warn" else: "error").cstring)
   observe(h)
 
 proc useYtdlp*(p: Player, path: string) =
@@ -271,7 +286,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
     if step > 0.001 and step < 0.1: p.frameDur = step
     p.timePos = f
     p.timeAt = epochTime()
-  of pDuration: p.duration = f
+  of pDuration: p.duration = max(f, p.fullDuration)
   of pEof:
     p.eofReached = b
     if not p.eofReached: p.eofHandled = false
@@ -369,28 +384,41 @@ proc pollEvents*(p: Player): bool =
         p.opening = false
     of evPlaybackRestart: inc p.restarts
     of evCommandReply:
-      if ev.replyUserdata == ExpandReply and ev.error >= 0:
+      if ev.replyUserdata == DumpReply + p.dumpId: p.dumping = false
+      elif ev.replyUserdata == ExpandReply and ev.error >= 0:
         let n = cast[ptr MpvNode](ev.data)
         if n.format == fmtString: p.expanded.add $n.u.str
     of evLogMessage:
       type LogMsg = object
         prefix, level, text: cstring
       let m = cast[ptr LogMsg](ev.data)
-      stderr.write "[mpv/", $m.prefix, "] ", $m.text
+      if $m.prefix == "ytdl_hook":
+        for line in ($m.text).splitLines:
+          if line.startsWith("ERROR:"): p.hookError = line.strip
+      if logAll: stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
-proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "") =
-  ## Opens path, starting at `start` seconds when given, with mpv's per-file
-  ## options `opts` ("name=value,...").
+proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
+           source = "", partStart = 0.0, partEnd = 0.0, fullDuration = 0.0) =
+  ## Opens path (or `source` in its place), starting at `start` seconds when
+  ## given, with mpv's per-file options `opts` ("name=value,..."). A link's
+  ## saved part (source) holds partStart to partEnd of the link's fullDuration.
   p.threadless = threadless
   p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
   p.path = path
+  p.source = source
+  p.loadRestarts = p.restarts
+  p.partStart = partStart
+  p.partEnd = partEnd
+  p.fullDuration = fullDuration
+  p.beyond = -1
   p.stopped = false
   p.eofReached = false
   p.eofHandled = false
   p.timePos = start
-  p.duration = 0
+  p.duration = fullDuration
   p.loadError = ""
+  p.hookError = ""
   p.opening = true
   p.buffered.setLen 0
   p.cacheAhead = -1
@@ -399,8 +427,9 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "") 
   var o = opts
   if start > 0:
     o = "start=" & formatFloat(start, ffDecimal, 3) & (if o.len > 0: "," & o else: "")
-  if o.len > 0: p.h.commandAsync("loadfile", path, "replace", "-1", o)
-  else: p.h.commandAsync("loadfile", path, "replace")
+  let file = if source.len > 0: source else: path
+  if o.len > 0: p.h.commandAsync("loadfile", file, "replace", "-1", o)
+  else: p.h.commandAsync("loadfile", file, "replace")
   p.h.setProp("pause", false)
 
 proc reopen*(p: Player, threadless: bool) =
@@ -411,8 +440,8 @@ proc reopen*(p: Player, threadless: bool) =
   p.eofReached = false
   p.eofHandled = false
   inc p.jumps
-  p.h.commandAsync("loadfile", p.path, "replace", "-1",
-    "start=" & formatFloat(p.timePos, ffDecimal, 6))
+  p.h.commandAsync("loadfile", if p.source.len > 0: p.source else: p.path,
+    "replace", "-1", "start=" & formatFloat(p.timePos, ffDecimal, 6))
 
 proc externalFiles*(p: Player): seq[string] =
   ## The added tracks' files as mpv has them now (p.tracks may lag behind).
@@ -423,6 +452,11 @@ proc externalFiles*(p: Player): seq[string] =
 proc close*(p: Player) =
   p.h.commandAsync("stop")
   p.path = ""
+  p.source = ""
+  p.partStart = 0
+  p.partEnd = 0
+  p.fullDuration = 0
+  p.beyond = -1
   p.loaded = false
   p.opening = false
   p.stopped = false
@@ -438,6 +472,10 @@ proc close*(p: Player) =
   p.pixelH = 0
   p.timePos = 0
   p.duration = 0
+
+proc settled*(p: Player): bool =
+  ## Playing from where it was opened at (its time is to be trusted).
+  p.loaded and p.restarts > p.loadRestarts
 
 proc hasVideo*(p: Player): bool =
   p.loaded and p.videoW > 0 and p.videoH > 0
@@ -479,25 +517,54 @@ proc pause*(p: Player) =
 
 proc stop*(p: Player) =
   if not p.loaded: return
+  if p.partEnd > 0 and p.partStart > 0.05:
+    # 0 is before a link's saved part: the app goes online, stopped.
+    p.beyond = 0
+    p.h.setProp("pause", true)
+    p.stopped = true
+    return
   inc p.jumps
   p.setBackward(false)
   p.h.setProp("pause", true)
   p.h.commandAsync("seek", "0", "absolute", "exact")
   p.stopped = true
 
+proc pastPart(p: Player, t: float): bool =
+  ## A seek to t leaves the saved part: noted for the app to go online.
+  result = p.partEnd > 0 and (t > p.partEnd - 0.5 or t < p.partStart - 0.05)
+  if result: p.beyond = clamp(t, 0, max(p.duration - 1, 0))
+
 proc seek*(p: Player, t: float, exact = true) =
-  if not p.loaded: return
+  if not p.loaded or p.pastPart(t): return
   inc p.jumps
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
 
 proc seekRelative*(p: Player, d: float) =
+  if p.pastPart(p.timePos + d): return
   inc p.jumps
   p.h.commandAsync("seek", $d, "relative")
 
 proc seekPercent*(p: Player, percent: float) =
+  if p.pastPart(p.duration * percent / 100): return
   inc p.jumps
   p.h.commandAsync("seek", $percent, "absolute-percent")
+
+proc dumpFrom*(p: Player, start: float, file: string) =
+  ## Writes the stream from `start` (a time in mpv's cache) to file, then
+  ## all it reads after, until stopDump, an error or another file.
+  inc p.dumpId
+  p.dumping = true
+  let args = ["dump-cache", formatFloat(start, ffDecimal, 6), "no", file]
+  var cargs: array[5, cstring]
+  for i, a in args: cargs[i] = a.cstring
+  discard mpv_command_async(p.h, DumpReply + p.dumpId, cargs[0].addr)
+
+proc stopDump*(p: Player) =
+  if not p.dumping: return
+  p.dumping = false
+  inc p.dumpId  # its reply, still to come, is no longer ours
+  p.h.commandAsync("dump-cache", "0", "0", "")
 
 proc frameStep*(p: Player, forward: bool) =
   inc p.jumps

@@ -90,6 +90,20 @@ proc digitsOnly*(s: string): string =
   for c in s:
     if c in Digits: result.add c
 
+const MathChars = Digits + {'+', '-', '*', '/', '(', ')', '.', ' '}
+
+proc mathOnly*(s: string): string =
+  ## What a pixel field keeps while typed in: digits and basic math.
+  for c in s:
+    if c in MathChars: result.add c
+
+proc mathDigits*(s: string): string =
+  ## A pixel field's text once done typing: its math worked out to a whole,
+  ## non-negative number.
+  if s.allCharsInSet(Digits): return s
+  try: $int(round(clamp(evalMath(s), 0.0, 1e9)))
+  except ValueError: s.digitsOnly
+
 proc externalCards*(parts: seq[CmdPart]): seq[string] =
   ## Names of the external-file cards, asked for with a file dialog on run,
   ## each once, in order.
@@ -179,7 +193,10 @@ proc load*(d: CmdDialog, c: CommandLine) =
   d.error = ""
 
 proc commandLine*(d: CmdDialog): CommandLine =
-  CommandLine(title: d.title.strip, parts: d.toks.toParts)
+  var toks = d.toks
+  for t in toks.mitems:
+    if t.isRect: t.content = t.content.mathDigits
+  CommandLine(title: d.title.strip, parts: toks.toParts)
 
 proc validate(d: CmdDialog): string =
   let title = d.title.strip
@@ -252,7 +269,7 @@ proc makeRect(d: CmdDialog, s: int) =
     if t.isRect: id = max(id, t.rect + 1)
   d.toks[s].rect = id
   d.toks[s].dim = rdWidth
-  d.toks[s].content = d.toks[s].content.digitsOnly
+  d.toks[s].content = d.toks[s].content.mathDigits
   let name = d.toks[s].name
   if name.startsWith("var") and name.len > 3 and name[3 .. ^1].allCharsInSet(Digits):
     d.toks[s].name = ""
@@ -683,7 +700,9 @@ proc properties(d: CmdDialog, ui: Ui, r: Rect, path: string) =
       rect(r.x + labelW, y + 46, fw, 18), colTextDim, FontSmall)
     return
   discard ui.textField("cl-content", rect(r.x + labelW, y, fw, 26), d.toks[s].content, "number")
-  d.toks[s].content = d.toks[s].content.digitsOnly
+  d.toks[s].content =
+    if ui.focusId == "cl-content": d.toks[s].content.mathOnly
+    else: d.toks[s].content.mathDigits
   let t = d.toks[s]
   let dimLabel = case t.dim
     of rdHeight: "Height"
@@ -1025,7 +1044,7 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
     let id = "pk-" & $i
     if row.isRect:
       discard ui.textField(id, rect(dr.x, dr.y, dr.w - 32, dr.h), d.texts[i], "number")
-      d.texts[i] = d.texts[i].digitsOnly
+      d.texts[i] = if ui.focusId == id: d.texts[i].mathOnly else: d.texts[i].mathDigits
       let ir = iconRect(dr)
       let hov = ui.hover(ir)
       if hov and ui.pressed():

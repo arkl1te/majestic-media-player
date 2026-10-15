@@ -2,9 +2,9 @@
 ## tree view) and the selected page on the right. Edits apply to the config
 ## live; the caller snapshots it beforehand so Cancel can undo them.
 
-import std/[os, strutils, strformat, math, tables]
+import std/[os, strutils, strformat, math, tables, times]
 import silky, vmath, bumpy, chroma, pixie
-import ui, theme, config, assoc, keymap
+import ui, theme, config, assoc, keymap, websave, mediainfo
 
 type
   OptionsPage* = enum
@@ -14,6 +14,7 @@ type
     opPaths = "Paths"
     opKeys = "Keys"
     opPlayback = "Playback"
+    opWeb = "Media Cache"
     opSubtitles = "Subtitles"
     opMisc = "Miscellaneous"
     opSystem = "System"
@@ -23,11 +24,18 @@ type
 
   PathRequest* = enum
     ## Paths page buttons the caller carries out (file dialogs, file manager).
-    prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings
+    prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
+    prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb
+
+  WebInfo* = object
+    ## Playback > Media Cache: the cached links, filled in by the caller.
+    dir*: string
+    used*, free*, total*: int64  ## bytes the folder takes, left on its disk, the disk's size (-1: unknown)
+    items*: seq[WebItem]
 
   OptionsDialog* = ref object
     page*: OptionsPage
-    playerOpen: bool            ## Player node expanded (shows Interface, Formats, Paths, Keys)
+    expanded: set[OptionsPage]  ## tree nodes showing their children
     scroll: float32             ## page content scroll
     assoc: seq[AssocItem]
     assocLoaded: bool
@@ -44,6 +52,10 @@ type
     keyTaken: bool              ## a key went to the capture this frame
     keyNote: string             ## Keys page: outcome of the last change
     keyReveal: bool             ## scroll the selected command into view
+    web*: WebInfo               ## Media Cache page; the caller refreshes it
+    webPicked*: seq[string]     ## Media Cache page: links checked in the list
+    webScroll: float32
+    confirmClear: bool          ## Media Cache page: Clear pressed once, asking again
 
   Pane = object
     ## Layout cursor for a page.
@@ -52,15 +64,22 @@ type
 
 const
   Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opSubtitles, 0), (opMisc, 0), (opSystem, 0)]
-  PlayerChildren = {opInterface, opFormats, opPaths, opKeys}
+          (opWeb, 1), (opSubtitles, 0), (opMisc, 0), (opSystem, 0)]
+  Parents = {opPlayer, opPlayback}
   TreeWidth = 180'f32
   TreeRow = 22'f32
   TreeIndent = 16'f32
   Row = 28'f32                  ## height of one option line
   LabelW = 210'f32              ## label column for numbers and text inputs
 
-proc newOptionsDialog*(): OptionsDialog = OptionsDialog(playerOpen: true)
+proc newOptionsDialog*(): OptionsDialog = OptionsDialog(expanded: Parents)
+
+proc parentOf(p: OptionsPage): OptionsPage =
+  ## The tree node p hangs off; p itself for a top-level node.
+  result = p
+  for (q, level) in Tree:
+    if q == p: return
+    if level == 0: result = q
 
 proc opened*(d: OptionsDialog, ui: Ui) =
   ## The window is being shown: re-read associations, start at the top.
@@ -68,6 +87,7 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   d.status = ""
   d.keyNote = ""
   d.capturing = false
+  d.confirmClear = false
   d.scroll = 0
   ui.navId = "o-tree"
   ui.navVisible = false
@@ -77,14 +97,15 @@ proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   d.page = p
   d.scroll = 0
   d.capturing = false
+  d.confirmClear = false
   ui.focusId = ""
-  if p in PlayerChildren: d.playerOpen = true
+  d.expanded.incl p.parentOf
 
 # --- tree ---------------------------------------------------------------------
 
 proc visibleRows(d: OptionsDialog): seq[(OptionsPage, int)] =
   for (p, level) in Tree:
-    if level == 0 or d.playerOpen: result.add (p, level)
+    if level == 0 or p.parentOf in d.expanded: result.add (p, level)
 
 proc dotsH(ui: Ui, x1, x2, y: float32) =
   var x = x1.round
@@ -118,7 +139,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
   for i, (p, level) in rows:
     let cy = mid(i)
     if level == 0:
-      if p != opPlayer: ui.dotsH(x0, x0 + 10, cy)
+      if p notin Parents: ui.dotsH(x0, x0 + 10, cy)
     else:
       let xc = x0 + TreeIndent
       # The first child hangs below its parent's label, the next ones off the
@@ -129,15 +150,19 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
   for i, (p, level) in rows:
     let y = rowY(i)
     let cy = mid(i)
-    if p == opPlayer:
+    proc toggle(d: OptionsDialog) =
+      if p in d.expanded:
+        d.expanded.excl p
+        if d.page.parentOf == p: d.selectPage(ui, p)
+      else: d.expanded.incl p
+    if p in Parents:
       let ex = rect(x0 - 7, cy - 7, 15, 15)
       ui.rect(ex, colBackground)
-      ui.icon(if d.playerOpen: "expand16" else: "arrow16", vec2(x0 + 0.5, cy),
+      ui.icon(if p in d.expanded: "expand16" else: "arrow16", vec2(x0 + 0.5, cy),
         if ui.hover(ex): colText else: colTextDim)
       if ui.hover(ex) and ui.pressed():
         ui.consumeClick()
-        d.playerOpen = not d.playerOpen
-        if not d.playerOpen and d.page in PlayerChildren: d.selectPage(ui, opPlayer)
+        d.toggle()
     let lx = x0 + level.float32 * TreeIndent + 12
     let label = rect(lx, y + 2, ui.textSize($p).x + 10, TreeRow - 4)
     let rowR = rect(lx, y, r.x + r.w - lx - 4, TreeRow)
@@ -152,9 +177,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
       ui.consumeClick()
       ui.navId = "o-tree"
       d.selectPage(ui, p)
-    if hov and p == opPlayer and ui.window.buttonPressed[DoubleClick]:
-      d.playerOpen = not d.playerOpen
-      if not d.playerOpen and d.page in PlayerChildren: d.selectPage(ui, opPlayer)
+    if hov and p in Parents and ui.window.buttonPressed[DoubleClick]: d.toggle()
 
   # Keyboard: Up/Down move, Left collapses (or goes to the parent), Right expands.
   if not keys or ui.navId notin ["", "o-tree"]: return
@@ -165,10 +188,10 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
   if w.buttonPressed[KeyUp] and cur > 0: d.selectPage(ui, rows[cur - 1][0])
   elif w.buttonPressed[KeyDown] and cur < rows.high: d.selectPage(ui, rows[cur + 1][0])
   elif w.buttonPressed[KeyLeft]:
-    if d.page in PlayerChildren: d.selectPage(ui, opPlayer)
-    elif d.page == opPlayer: d.playerOpen = false
-  elif w.buttonPressed[KeyRight] and d.page == opPlayer:
-    d.playerOpen = true
+    if d.page.parentOf != d.page: d.selectPage(ui, d.page.parentOf)
+    elif d.page in Parents: d.expanded.excl d.page
+  elif w.buttonPressed[KeyRight] and d.page in Parents:
+    d.expanded.incl d.page
 
 # --- page building blocks -----------------------------------------------------
 
@@ -200,6 +223,23 @@ proc textRow(ui: Ui, p: var Pane, id, label: string, value: var string, placehol
   ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
   discard ui.textField(id, rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 26),
     value, placeholder)
+  p.y += Row + 4
+
+proc button(ui: Ui, id, label: string, r: Rect, enabled: bool): bool =
+  ## A text button, greyed out and inert when not enabled.
+  if enabled: return ui.textButton(id, r, label)
+  ui.rect(r, colPanelRaised)
+  ui.border(r, colBorder)
+  ui.textIn(label, r, colTextDisabled, h = CenterAlign)
+
+proc toggleNumberRow(ui: Ui, p: var Pane, id, label: string, on: var bool,
+                     value: var int, step, lo, hi: int) =
+  ## A checkbox turning a limit on, its number beside it.
+  discard ui.checkbox(id, vec2(p.x + 8, p.y + 2), label, on)
+  var v = value.float
+  discard ui.numberField(id & "-n", rect(p.x + 8 + LabelW, p.y, 150, 26), v,
+    step.float, lo.float, hi.float)
+  value = clamp(int(round(v)), lo, hi)
   p.y += Row + 4
 
 proc hint(ui: Ui, p: var Pane, s: string) =
@@ -569,11 +609,6 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   p.y = list.y + list.h + 8
 
   let has = cur >= 0
-  proc button(ui: Ui, id, label: string, r: Rect, enabled: bool): bool =
-    if enabled: return ui.textButton(id, r, label)
-    ui.rect(r, colPanelRaised)
-    ui.border(r, colBorder)
-    ui.textIn(label, r, colTextDisabled, h = CenterAlign)
   const bw = 110'f32
   let by = p.y
   proc at(i: int): Rect = rect(list.x + i.float32 * (bw + 8), by, bw, 28)
@@ -608,6 +643,10 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.textRow(p, "o-slang", "Subtitles", c.subLangs, "e.g. eng, jpn")
   ui.textRow(p, "o-alang", "Audio", c.audioLangs, "e.g. jpn, eng")
   ui.hint(p, "Language codes in order of preference; the first matching track is picked on open.")
+  ui.group(p, "Online media")
+  ui.textRow(p, "o-cookies", "Sign in with", c.signInCookies, "auto")
+  ui.hint(p, "Browser whose cookies yt-dlp uses when a video asks to sign in (age-restricted).")
+  ui.hint(p, "auto tries each installed browser; none turns it off; or brave, chrome, firefox...")
   ui.group(p, "Seek bar")
   ui.checkRow(p, "o-prev", "Show thumbnail preview on hover", c.seekPreview)
   ui.checkRow(p, "o-snap", "Hold Shift to snap to chapters", c.snapWithShift)
@@ -619,6 +658,135 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
   ui.numberRow(p, "o-jump", "Jump (seconds)", c.seekStep, 1, 1, 600)
   ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
+
+proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
+  let web = d.web
+  ui.group(p, "Cache folder")
+  const bw = 96'f32
+  const lw = 110'f32            # narrower labels: the folder field has two buttons
+  ui.textIn("Space taken", rect(p.x + 8, p.y, lw, 26), colText)
+  proc pct(part, whole: float): string =
+    let v = 100 * part / whole
+    if v < 10: formatFloat(v, ffDecimal, 1) & "%" else: $int(round(v)) & "%"
+  var usage = fmtBytes(web.used.float)
+  if c.webSizeOn: usage.add "  (" & pct(web.used.float, float(c.webSizeGB.int64 shl 30)) &
+    &" of {c.webSizeGB} GiB)"
+  elif web.total > 0: usage.add "  (" & pct(web.used.float, web.total.float) & " of the disk)"
+  if web.free >= 0: usage.add "  " & fmtBytes(web.free.float) & " free"
+  let uw = p.w - lw - 8 - 128
+  ui.textIn(ui.ellipsize(usage, uw), rect(p.x + 8 + lw, p.y, uw, 26), colTextDim)
+  let clearR = rect(p.x + p.w - 120, p.y, 120, 26)
+  if d.confirmClear:
+    if ui.textButton("o-webclear-yes", clearR, "Really clear?", primary = true):
+      d.confirmClear = false
+      d.request = prClearWeb
+    elif ui.pressed() and not ui.hover(clearR): d.confirmClear = false
+  elif ui.button("o-webclear", "Clear cache", clearR, web.items.len > 0 or web.used > 0):
+    d.confirmClear = true
+  p.y += Row + 4
+  ui.textIn("Folder", rect(p.x + 8, p.y, lw, 26), colText)
+  let fw = max(120'f32, p.w - lw - 8 - 2 * (bw + 8))
+  discard ui.textField("o-webdir", rect(p.x + 8 + lw, p.y, fw, 26), c.webDir,
+    defaultSaveDir())
+  if ui.textButton("o-webdir-browse", rect(p.x + 16 + lw + fw, p.y, bw, 26), "Browse..."):
+    d.request = prBrowseWeb
+  if ui.textButton("o-webdir-open", rect(p.x + 24 + lw + fw + bw, p.y, bw, 26), "Open"):
+    d.request = prOpenWebDir
+  p.y += Row + 4
+  ui.hint(p, "Online media is cached here as it streams, and plays from disk when opened again.")
+  if c.webDir.expandPath notin ["", web.dir]:
+    ui.textIn("Applied on OK; what's cached in the current folder stays there.",
+      rect(p.x + 8, p.y - 2, p.w - 8, 18), colAccent, FontSmall)
+    p.y += 20
+
+  ui.group(p, "Cached media")
+  # Checked items still cached; the list may have changed since.
+  var picked: seq[string]
+  for it in web.items:
+    if it.url in d.webPicked: picked.add it.url
+  d.webPicked = picked
+  if ui.button("o-webdel", "Delete selected", rect(p.x + 8, p.y, 140, 28), picked.len > 0):
+    d.request = prDeleteWeb
+  if ui.textButton("o-webshow", rect(p.x + 156, p.y, 190, 28), "Open containing folder"):
+    d.request = prOpenWebDir
+  let count = &"{web.items.len} item(s)" & (if picked.len > 0: &", {picked.len} selected" else: "")
+  ui.textIn(count, rect(p.x + 354, p.y, p.w - 354, 28), colTextDim, FontSmall, h = RightAlign)
+  p.y += 36
+
+  const rowH = 24'f32
+  const sizeW = 76'f32
+  const savedW = 140'f32
+  const dateW = 120'f32
+  const autoH = 32'f32 + 3 * (Row + 4) + 20  # Delete automatically, below the list
+  let list = rect(p.x + 8, p.y, p.w - 8, max(160'f32, bottom - p.y - 8 - autoH))
+  ui.rect(list, colBackground)
+  ui.border(list, colBorder)
+  # Header: a box checking every item, and the columns' names.
+  let head = rect(list.x + 1, list.y + 1, list.w - 2, rowH)
+  let titleW = head.w - 32 - savedW - sizeW - dateW
+  var all = web.items.len > 0 and picked.len == web.items.len
+  if ui.checkbox("o-weball", vec2(head.x + 8, head.y + 1), "", all):
+    d.webPicked = @[]
+    if all:
+      for it in web.items: d.webPicked.add it.url
+  var x = head.x + 32
+  for (name, cw) in [("Title", titleW), ("Saved", savedW), ("Size", sizeW), ("Last opened", dateW)]:
+    ui.textIn(name, rect(x, head.y, cw - 8, rowH), colTextDim, FontSmall)
+    x += cw
+  ui.rect(rect(head.x, head.y + rowH, head.w, 1), colBorder)
+
+  let inner = rect(list.x + 1, head.y + rowH + 1, list.w - 2, list.h - rowH - 3)
+  let maxScroll = max(0'f32, web.items.len.float32 * rowH - inner.h)
+  if ui.hover(inner) and ui.scroll() != 0:
+    d.webScroll += ui.scroll() * rowH / 3
+    ui.scrollConsumed = true
+  d.webScroll = clamp(d.webScroll, 0, maxScroll)
+  let outerClip = ui.hitClip
+  ui.hitClip = inner
+  ui.sk.pushClipRect(inner)
+  for n, it in web.items:
+    let row = rect(inner.x, inner.y + n.float32 * rowH - d.webScroll, inner.w, rowH)
+    if row.y + rowH < inner.y or row.y > inner.y + inner.h: continue
+    let on = it.url in d.webPicked
+    let hov = ui.hover(row)
+    if hov: ui.rect(row, colHover)
+    let box = rect(row.x + 8, row.y + 4, 16, 16)
+    ui.rect(box, if on: colAccent else: colPanelRaised)
+    ui.border(box, if hov: colAccent else: colBorder)
+    if on: ui.icon("check16", box.xy + box.wh / 2, colOnAccent)
+    var x = row.x + 32
+    let title = if it.title.len > 0: it.title else: it.url
+    let tr = rect(x, row.y, titleW - 8, rowH)
+    ui.textIn(ui.ellipsize(title, tr.w), tr, colText)
+    if ui.hover(tr): ui.tip(tr, it.url)
+    x += titleW
+    let saved =
+      if it.duration > 0 and it.saved >= it.duration - 1: "Complete"
+      elif it.duration > 0: fmtTime(it.saved, dur = it.duration) & " / " & fmtTime(it.duration)
+      else: fmtTime(it.saved)
+    ui.textIn(saved, rect(x, row.y, savedW - 8, rowH), colTextDim, FontSmall)
+    x += savedW
+    ui.textIn(fmtBytes(it.bytes.float), rect(x, row.y, sizeW - 8, rowH), colTextDim, FontSmall)
+    x += sizeW
+    let date = if it.used > 0: fromUnix(int64(it.used)).local.format("yyyy-MM-dd HH:mm") else: ""
+    ui.textIn(date, rect(x, row.y, dateW - 8, rowH), colTextDim, FontSmall)
+    if hov and ui.pressed():
+      ui.pressId = "o-web" & $n
+      ui.consumeClick()
+    if hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == "o-web" & $n:
+      if on: d.webPicked.delete(d.webPicked.find(it.url))
+      else: d.webPicked.add it.url
+  if web.items.len == 0:
+    ui.textIn("Nothing cached", inner, colTextDim, FontSmall, h = CenterAlign)
+  ui.sk.popClipRect()
+  ui.hitClip = outerClip
+  p.y = list.y + list.h + 8
+
+  ui.group(p, "Delete automatically")
+  ui.toggleNumberRow(p, "o-webkeep", "Delete after (hours)", c.webKeepOn, c.webKeepHours, 1, 1, 87600)
+  ui.toggleNumberRow(p, "o-webcount", "Keep at most (items)", c.webCountOn, c.webCount, 1, 1, 10000)
+  ui.toggleNumberRow(p, "o-websize", "Max. disk space (GiB)", c.webSizeOn, c.webSizeGB, 1, 1, 100000)
+  ui.hint(p, "Checked on OK, at start and as media is cached; the least recently opened go first.")
 
 proc subtitlesPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Subtitles")
@@ -668,6 +836,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   of opPaths: d.pathsPage(ui, c, p)
   of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
   of opPlayback: playbackPage(ui, c, p)
+  of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
   of opSubtitles: subtitlesPage(ui, c, p)
   of opMisc: miscPage(ui, c, p)
   of opSystem: systemPage(ui, c, p)

@@ -70,7 +70,7 @@ type
     rememberPlaylist*: bool = false
     bookmarksAsChapters*: bool = false  # chapter steps also stop at bookmarks
     titleFullPath*: bool = false
-    titleUseMediaTitle*: bool = false
+    titleUseMediaTitle*: bool = true
     # Options > Player > Paths
     screenshotDir*: string = ""    # "" = ~/Pictures (or home)
     screenshotNoAsk*: bool = false # save straight into screenshotDir
@@ -87,6 +87,17 @@ type
     snapDistance*: float = 8       # pixels
     subLangs*: string = ""         # "eng, jpn": preferred subtitle languages
     audioLangs*: string = ""
+    signInCookies*: string = "auto"  # browser yt-dlp signs in with for links that ask to:
+                                     # "auto" (each installed in turn), "none", or a
+                                     # --cookies-from-browser value ("brave", "firefox:...")
+    # Options > Playback > Media Cache
+    webDir*: string = ""           # "" = the cache folder's "streams"
+    webKeepOn*: bool = true        # forget links not opened for webKeepHours
+    webKeepHours*: int = 168
+    webCountOn*: bool = false      # keep at most webCount links
+    webCount*: int = 50
+    webSizeOn*: bool = true        # keep at most webSizeGB (GiB) of streams
+    webSizeGB*: int = 20
     # Options > Subtitles
     subDelay*: float = 0           # milliseconds
     subPaths*: string = ""         # extra subtitle folders, ';'-separated
