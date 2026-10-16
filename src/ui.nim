@@ -201,6 +201,14 @@ proc tabNavigate*(ui: Ui): int =
 proc rect*(ui: Ui, r: Rect, color: ColorRGBX) =
   ui.sk.drawRect(r.xy, r.wh, color)
 
+proc gradient*(ui: Ui, r: Rect, tl, tr, br, bl: ColorRGBX) =
+  ## r filled with its corners' colors blended across it (premultiplied).
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let (p0, p1, p2, p3) = (r.xy, vec2(r.x + r.w, r.y), r.xy + r.wh, vec2(r.x, r.y + r.h))
+  ui.sk.drawTriangle([p0, p1, p2], [uv, uv, uv], [tl, tr, br])
+  ui.sk.drawTriangle([p0, p2, p3], [uv, uv, uv], [tl, br, bl])
+
 proc border*(ui: Ui, r: Rect, color: ColorRGBX, t = 1'f32) =
   ui.sk.drawRect(r.xy, vec2(r.w, t), color)
   ui.sk.drawRect(vec2(r.x, r.y + r.h - t), vec2(r.w, t), color)

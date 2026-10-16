@@ -5,7 +5,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp, websave, mediasave
+  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -14,10 +14,11 @@ const
   FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
   MinWindow = ivec2(480, 270)
   MinCompactWindow = ivec2(16, 16)  ## pixels, not UI units: compact mode shrinks all the way
-  OptionsSize = ivec2(780, 600)
+  OptionsSize = ivec2(912, 684)
   RenameSize = ivec2(400, 116)
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
+  EmbedSize = ivec2(460, 176)
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
@@ -33,10 +34,13 @@ const
 type
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync,
-    ovYtdlp
+    ovYtdlp, ovEmbed
 
   YtMode = enum
     ymInstall, ymUpdate, ymBusy, ymFailed  ## what the yt-dlp window asks or shows
+
+  EmbedMode = enum
+    emAsk, emInstall, emBusy, emFailed  ## what the Embed As MKV Chapters window asks or shows
 
   ContextMenu = enum
     cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog  ## where the right-click menu was opened
@@ -199,6 +203,16 @@ type
     renTime: float
     renText: string
     renPlaceholder: string    ## its default label, shown when renText is empty
+    embWin: Window            ## Embed as MKV Chapters confirmation, created on first use
+    embSk: Silky
+    embUi: Ui
+    embPath: string           ## the file asked about, then the one being written
+    embProc: Process          ## mkvpropedit writing its chapters
+    embTmp: string            ## the chapters file mkvpropedit reads
+    embClear: bool            ## clear the file's bookmarks once it's done
+    embMode: EmbedMode
+    embMsg: string            ## its text while installing or failed
+    mkvJob: MkvJob            ## MKVToolNix being installed
     cmdDlg: CmdDialog         ## Commands window, its window created on first use
     cmdWin: Window
     cmdSk: Silky
@@ -899,7 +913,7 @@ proc listYoutube(a: App, i: int): bool =
   if result:
     a.plIndex = i
     a.plSelected = i
-  let exe = findYtdlp()
+  let exe = findYtdlp(a.cfg.ytdlp)
   if exe.len == 0:
     # A video streams (and asks for yt-dlp on its own); a playlist asks here.
     if result:
@@ -2335,7 +2349,9 @@ proc loopSound(a: App) =
 const
   LoopFrameLook = ["vid", "sid", "secondary-sid", "sub-delay", "sub-visibility",
     "sub-align-x", "sub-align-y", "sub-margin-x", "sub-margin-y", "sub-pos",
-    "sub-scale", "video-margin-ratio-left", "video-margin-ratio-right",
+    "sub-scale", "sub-font", "sub-bold", "sub-italic", "sub-font-size",
+    "sub-color", "sub-outline-size", "sub-outline-color", "sub-shadow-offset",
+    "sub-back-color", "sub-ass-override", "video-margin-ratio-left", "video-margin-ratio-right",
     "video-margin-ratio-top", "video-margin-ratio-bottom", "keepaspect",
     "video-scale-x", "video-scale-y"]  ## what shows in a frame
 
@@ -2609,11 +2625,11 @@ proc startSave(a: App, dest: string) =
     if whole.len > 0:  # the media cache holds all of it
       if d.splitFile.ext.len == 0: d.add whole.splitFile.ext
       a.saveJob = copying(whole, d)
-    elif findYtdlp().len == 0:
+    elif findYtdlp(a.cfg.ytdlp).len == 0:
       a.osd("Saving links needs yt-dlp")
       return
     else:
-      a.saveJob = downloading(findYtdlp(), src, d, a.ytCookies.getOrDefault(src))
+      a.saveJob = downloading(findYtdlp(a.cfg.ytdlp), src, d, a.ytCookies.getOrDefault(src))
   else:
     if d.splitFile.ext.len == 0: d.add src.splitFile.ext
     a.saveJob = copying(src, d)
@@ -2748,6 +2764,10 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
       a.extPicks[a.extQueue[0]] = paths[0].absolutePath
       a.extQueue.delete(0)
       a.askExternal()
+  of "optmkvpe":  # Options' mkvpropedit Browse... button
+    if a.overlay == ovOptions: a.cfg.mkvpropedit = paths[0]
+  of "optytdlp":  # Options' yt-dlp Browse... button
+    if a.overlay == ovOptions: a.cfg.ytdlp = paths[0]
   of "optshotdir", "optopendir", "optwebdir":  # Options' Browse... buttons
     if a.overlay == ovOptions:
       if purpose == "optshotdir": a.cfg.screenshotDir = paths[0]
@@ -2821,7 +2841,9 @@ proc syncSettings(a: App) =
   ## Pushes the player-facing options to mpv (and the title) when they change.
   let c = a.cfg
   let key = &"{c.showOsd}|{c.osdTimestamp}|{c.showMillis}|{c.showRemaining}|{c.subLangs}|{c.audioLangs}|{c.subDelay}|" &
-    &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}"
+    &"{c.subPaths}|{c.titleFullPath}|{c.titleUseMediaTitle}|{c.subFont}|{c.subBold}|{c.subItalic}|" &
+    &"{c.subSize}|{c.subSpacing}|{c.subLineSpacing}|{c.subColor}|{c.subOpacity}|{c.subOutlineSize}|{c.subOutlineColor}|" &
+    &"{c.subOutlineOpacity}|{c.subShadowOffset}|{c.subShadowColor}|{c.subShadowOpacity}|{c.subStyleAss}"
   if key == a.settingsKey: return
   a.settingsKey = key
   a.applyOsd()
@@ -2831,10 +2853,26 @@ proc syncSettings(a: App) =
   h.setProp("sub-delay", c.subDelay / 1000)
   h.setProp("osd-fractions", if c.showMillis: "yes" else: "no")
   h.setProp("sub-file-paths", subPathList(c.subPaths))
+  # Options > Subtitles style: text subtitles (SRT...), and ASS ones too when asked.
+  let font = c.subFont.strip
+  h.setProp("sub-font", if font.len > 0: font else: "sans-serif")
+  h.setProp("sub-bold", c.subBold)
+  h.setProp("sub-italic", c.subItalic)
+  h.setProp("sub-font-size", clamp(c.subSize, 1, 300))
+  h.setProp("sub-spacing", clamp(c.subSpacing, -10, 10))
+  h.setProp("sub-line-spacing", clamp(c.subLineSpacing, -100, 200))
+  h.setProp("sub-color", mpvColor(c.subColor, c.subOpacity, "#FFFFFF"))
+  h.setProp("sub-outline-size", max(c.subOutlineSize, 0))
+  h.setProp("sub-outline-color", mpvColor(c.subOutlineColor, c.subOutlineOpacity, "#000000"))
+  h.setProp("sub-shadow-offset", max(c.subShadowOffset, 0))
+  h.setProp("sub-back-color", mpvColor(c.subShadowColor, c.subShadowOpacity, "#000000"))
+  h.setProp("sub-ass-override", if c.subStyleAss: "force" else: "scale")
   a.updateTitle()
 
 proc recordEnd(a: App)
 proc pruneSaved(a: App)
+
+proc hookYtdlp(a: App)
 
 proc closeOptions(a: App, ok: bool) =
   if ok:
@@ -2847,7 +2885,11 @@ proc closeOptions(a: App, ok: bool) =
       setSaveDir(dir)
       a.saved = loadSaveIndex()
     a.pruneSaved()
-  else: a.cfg = a.cfgBefore  # undo the live edits
+    a.hookYtdlp()  # another yt-dlp chosen: mpv opens links with it
+  else:
+    let swatches = a.cfg.colorSwatches  # saved colors stay, like the recent files
+    a.cfg = a.cfgBefore  # undo the live edits
+    a.cfg.colorSwatches = swatches
   a.optUi.focusId = ""
   a.overlay = ovNone
   a.syncSettings()
@@ -2908,14 +2950,14 @@ proc applyUiScale(a: App) =
   if s == a.sk.uiScale: return
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
     sk.atlasScale = s
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
-                    (a.syncWin, SyncSize), (a.ytWin, YtdlpSize)]:
+                    (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
@@ -2945,6 +2987,153 @@ proc closeRename(a: App) =
   if a.renWin.visible:
     a.renWin.visible = false
     a.window.activate()
+
+# --- Embed As MKV Chapters ---------------------------------------------------
+# The current file's bookmarks written into it as chapters by mkvpropedit
+# (MKVToolNix), in place; the chapters it has already are kept.
+
+const MatroskaExts = [".mkv", ".mka", ".mk3d", ".webm"]
+
+proc closeDialogs(a: App)  # below
+proc shortPath(path: string): string  # yt-dlp, below
+
+proc canEmbed(a: App): bool =
+  ## A Matroska file on disk, with bookmarks, and nothing being written yet.
+  let p = a.player
+  p.loaded and not p.path.isWebLink and p.path.splitFile.ext.toLowerAscii in MatroskaExts and
+    a.fileBookmarks.len > 0 and a.embProc == nil
+
+proc showEmbedWindow(a: App, mode: EmbedMode, msg = "") =
+  a.menus.close()
+  if a.overlay notin {ovNone, ovEmbed}: a.closeDialogs()
+  if a.embWin == nil:
+    (a.embWin, a.embSk, a.embUi) = a.newDialogWindow("Embed As MKV Chapters", EmbedSize)
+  a.embMode = mode
+  a.embMsg = msg
+  if a.overlay != ovEmbed:
+    a.embUi.focusId = ""
+    a.showDialog(a.embWin, EmbedSize)
+    a.overlay = ovEmbed
+
+proc showEmbed(a: App) =
+  ## Asks whether to embed the current file's bookmarks, and whether to keep
+  ## them; first, without mkvpropedit, whether to install MKVToolNix.
+  a.menus.close()
+  if not a.canEmbed: return
+  a.embPath = a.player.path
+  if a.mkvJob.running: a.showEmbedWindow(emBusy, a.embMsg)
+  elif findMkvpropedit(a.cfg.mkvpropedit).len > 0: a.showEmbedWindow(emAsk)
+  elif canInstallMkvtoolnix(): a.showEmbedWindow(emInstall)
+  else: a.osd("Embedding chapters needs mkvpropedit (MKVToolNix)")
+
+proc closeEmbed(a: App) =
+  a.embUi.focusId = ""
+  if a.overlay == ovEmbed: a.overlay = ovNone
+  if a.embWin.visible:
+    a.embWin.visible = false
+    a.window.activate()
+
+proc embedChapters(a: App): seq[Bookmark] =
+  ## The file's chapters and bookmarks together, by time, all named. A
+  ## bookmark at a chapter's time takes its place, keeping its title when the
+  ## bookmark has no name of its own.
+  let marks = a.fileBookmarks
+  for c in a.player.chapters:
+    if not marks.anyIt(abs(it.time - c.time) < 0.05):
+      result.add Bookmark(time: c.time, name: c.title)
+  for i, b in marks:
+    var name = b.name
+    if name.len == 0:
+      for c in a.player.chapters:
+        if abs(c.time - b.time) < 0.05 and c.title.len > 0: name = c.title
+    result.add Bookmark(time: b.time, name: (if name.len > 0: name else: b.label(i)))
+  result.sort(proc (x, y: Bookmark): int = cmp(x.time, y.time))
+  for i, b in result.mpairs:
+    if b.name.len == 0: b.name = &"Chapter {i + 1}"
+
+proc startEmbed(a: App, clear: bool) =
+  ## Runs mkvpropedit on the file asked about, if it's still the one playing.
+  if a.embProc != nil or not a.player.loaded or a.player.path != a.embPath: return
+  a.embTmp = getTempDir() / &"majestic-chapters-{getCurrentProcessId()}.txt"
+  try:
+    # The BOM: without one, mkvpropedit reads it in the system's code page.
+    writeFile(a.embTmp, "\xEF\xBB\xBF" & a.embedChapters.toSimpleChapters)
+  except IOError, OSError:
+    a.osd("Cannot write the chapters file")
+    return
+  const opts = when defined(windows): {poUsePath, poStdErrToStdOut, poDaemon}
+               else: {poUsePath, poStdErrToStdOut}
+  try:
+    a.embProc = startProcess(findMkvpropedit(a.cfg.mkvpropedit), args = @[a.embPath, "--chapters", a.embTmp],
+      options = opts)
+  except OSError as e:
+    a.osd("Cannot run mkvpropedit: " & e.msg)
+    return
+  a.embClear = clear
+  a.osd("Embedding chapters...")
+
+proc mkvStatus(a: App): string =
+  ## Installing MKVToolNix, for the status bar; "" when not.
+  let j = a.mkvJob
+  if not j.running: return
+  result = "Installing MKVToolNix"
+  if j.stage == mkDownload and j.progress >= 0: result.add &" {int(j.progress)}%"
+
+proc embAnswer(a: App, ok: bool, clear = false) =
+  ## The Embed As MKV Chapters window's buttons: embed (keeping the bookmarks
+  ## or clearing them) or install MKVToolNix; else cancel, close or hide.
+  let mode = a.embMode
+  a.closeEmbed()
+  if not ok: return
+  case mode
+  of emAsk: a.startEmbed(clear)
+  of emInstall:
+    a.mkvJob = installMkvtoolnix()
+    a.showEmbedWindow(emBusy, "Installing MKVToolNix's mkvpropedit to " &
+      shortPath(mkvManagedPath()) & "...")
+  of emBusy, emFailed: discard
+
+proc pollMkvtoolnix(a: App) =
+  ## Once MKVToolNix is installed, asks about embedding as it would have.
+  let j = a.mkvJob
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  if j.running: return
+  a.mkvJob = nil
+  if j.code != 0:
+    a.showEmbedWindow(emFailed, "MKVToolNix couldn't be installed: " & j.errorText)
+    return
+  a.osd("MKVToolNix installed")
+  if a.canEmbed and a.player.path == a.embPath: a.showEmbedWindow(emAsk)
+  elif a.overlay == ovEmbed: a.closeEmbed()
+
+proc pollEmbed(a: App) =
+  ## Once mkvpropedit is done: clears the bookmarks when asked to, and opens
+  ## the file anew where it was, for mpv to read its new chapters.
+  a.pollMkvtoolnix()
+  let pr = a.embProc
+  if pr == nil or pr.peekExitCode == -1: return
+  let code = pr.peekExitCode
+  let output = try: pr.outputStream.readAll except IOError, OSError: ""
+  pr.close()
+  a.embProc = nil
+  try: removeFile(a.embTmp)
+  except OSError: discard
+  let path = a.embPath
+  # 1: done, with warnings.
+  if code notin {0, 1}:
+    var err = ""
+    for line in output.splitLines:
+      if line.startsWith("Error:"): err = line[6 .. ^1].strip
+    a.osd("Embedding chapters failed" & (if err.len > 0: ": " & err else: ""))
+    return
+  # The contents changed, so did their key: the bookmarks go under the new one.
+  a.keyKnown(path, mediaKey(path))
+  if a.embClear: a.editBookmarks(path, proc (marks: var seq[Bookmark]) = marks.setLen 0)
+  if a.player.loaded and a.player.path == path and
+     a.plIndex >= 0 and a.plIndex < a.playlist.len and a.playlist[a.plIndex] == path:
+    a.playIndex(a.plIndex, a.player.timePos)
+  a.osd("Chapters embedded" & (if a.embClear: ", bookmarks cleared" else: ""))
 
 proc showSyncProps(a: App) =
   ## Opens Synchronize > Properties on this player.
@@ -3047,14 +3236,14 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   if path.isWebLink and c.parts.anyIt(it.card and it.kind == ckReference and it.content == "file"):
     let local = a.saved.getOrDefault(path).wholeFile
     if local.len > 0: path = local
-    elif findYtdlp().len == 0: fetchErr = "Opening links needs yt-dlp"
+    elif findYtdlp(a.cfg.ytdlp).len == 0: fetchErr = "Opening links needs yt-dlp"
     else:
       let tmp = getTempDir() / &"majestic-{getCurrentProcessId()}-{int64(epochTime() * 1000)}"
       let file = tmp / "media.mkv"
       fetch = "trap " & quoteShellPosix("rm -rf " & quoteShellPosix(tmp)) & " EXIT\n" &
         "mkdir -p " & quoteShellPosix(tmp) & " || exit\n" &
         "echo " & quoteShellPosix("Downloading " & path) & "\n" &
-        downloadScript(findYtdlp(), path, file, a.ytCookies.getOrDefault(path))
+        downloadScript(findYtdlp(a.cfg.ytdlp), path, file, a.ytCookies.getOrDefault(path))
       path = file
   var (script, err) = c.parts.compose(path, picks)
   if fetchErr.len > 0: err = fetchErr
@@ -3154,7 +3343,7 @@ proc hookYtdlp(a: App) =
   ## Lets mpv open links through yt-dlp, once there is one. mpv keeps the
   ## path it first found, so outside Windows it gets a link of ours, moved
   ## to whichever yt-dlp is found now.
-  let exe = findYtdlp()
+  let exe = findYtdlp(a.cfg.ytdlp)
   if exe.len == 0 or exe == a.ytHooked: return
   var path = exe
   when not defined(windows):
@@ -3224,6 +3413,7 @@ proc closeDialogs(a: App) =
   of ovYtdlp:
     a.ytUi.focusId = ""
     a.ytWin.visible = false
+  of ovEmbed: a.closeEmbed()
   else: discard
   a.overlay = ovNone
 
@@ -3279,7 +3469,7 @@ proc ytFailed(a: App, url: string) =
   a.ytUrl = url
   a.ytError = ""
   if a.ytSignIn(url): return
-  let exe = findYtdlp()
+  let exe = findYtdlp(a.cfg.ytdlp)
   if exe.len == 0:
     a.showYtdlp(ymInstall)
   elif exe != a.ytHooked:
@@ -3301,7 +3491,7 @@ proc ytAnswer(a: App, ok: bool) =
   if ok and a.ytMode == ymInstall:
     a.ytInstall("Installing yt-dlp to " & shortPath(managedPath()) & "...")
   elif ok and a.ytMode == ymUpdate:
-    a.ytJob = update(findYtdlp())
+    a.ytJob = update(findYtdlp(a.cfg.ytdlp))
     a.showYtdlp(ymBusy, "Updating yt-dlp (yt-dlp -U)...")
   else: a.closeYtdlp()
 
@@ -3365,10 +3555,10 @@ proc pollYtdlp(a: App) =
   if p.justLoaded and link.isWebLink:
     let mt = p.h.getStr("media-title")
     if mt.len > 0 and mt != link: a.linkTitles[link] = mt
-  if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp().len > 0:
+  if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp(a.cfg.ytdlp).len > 0:
     if link in a.ytCaptions: a.addCaptions(link)
     elif not a.ytCaps.running:
-      a.ytCaps = captions(findYtdlp(), link, a.ytCookies.getOrDefault(link))
+      a.ytCaps = captions(findYtdlp(a.cfg.ytdlp), link, a.ytCookies.getOrDefault(link))
   if a.ytCaps != nil and a.ytCaps.poll() and not a.ytCaps.running:
     let j = a.ytCaps
     a.ytCaps = nil
@@ -3545,8 +3735,8 @@ proc recordStep(a: App) =
     if a.entry(link).chapters.len == 0 and p.chapters.len > 0:
       a.entry(link).chapters = writeChapters(link,
         p.chapters.mapIt((it.time, it.title)), p.duration)
-    if not a.entry(link).subsDone and not a.ytSubs.running and findYtdlp().len > 0:
-      a.ytSubs = subtitles(findYtdlp(), link, saveDir() / keyOf(link) & "-subs",
+    if not a.entry(link).subsDone and not a.ytSubs.running and findYtdlp(a.cfg.ytdlp).len > 0:
+      a.ytSubs = subtitles(findYtdlp(a.cfg.ytdlp), link, saveDir() / keyOf(link) & "-subs",
         a.ytCookies.getOrDefault(link))
 
 proc pollWebSave(a: App) =
@@ -3842,6 +4032,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   bm.item("Import Bookmarks...", enabled = loaded, action = proc () = a.importBookmarksDialog())
   bm.item("Export Bookmarks...", enabled = a.fileBookmarks.len > 0,
     action = proc () = a.exportBookmarksDialog())
+  bm.item("Embed As MKV Chapters...", enabled = a.canEmbed, action = proc () = a.showEmbed())
   let marks = a.fileBookmarks
   if marks.len > 0:
     bm.sep()
@@ -4402,7 +4593,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp, ovEmbed}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -5287,7 +5478,7 @@ proc status(a: App, r: Rect) =
     elif p.hasRealVideo: "film16"
     else: "music16"
   ui.icon(fileIcon, vec2(r.x + 16, r.y + r.h / 2), if p.loaded: colAccent else: colTextDim)
-  let yt = a.ytStatus
+  let yt = if a.ytStatus.len > 0: a.ytStatus else: a.mkvStatus
   let state =
     if yt.len > 0: yt & "..."
     elif p.opening: "Opening..."
@@ -5809,6 +6000,14 @@ proc renderOptions(a: App, shot: string) =
     a.ask(dkOpenDir, "optopendir", "Start Folder",
       if d.len > 0 and dirExists(d): d else: a.startDir)
   of prShowSettings: a.openFolder(configDir())
+  of prBrowseMkvpropedit:
+    let f = findMkvpropedit(a.cfg.mkvpropedit)
+    a.ask(dkOpenFile, "optmkvpe", "mkvpropedit", if f.len > 0: f.parentDir else: "",
+      exts = (when defined(windows): @["exe"] else: @[]), filterName = "Programs")
+  of prBrowseYtdlp:
+    let f = findYtdlp(a.cfg.ytdlp)
+    a.ask(dkOpenFile, "optytdlp", "yt-dlp", if f.len > 0: f.parentDir else: "",
+      exts = (when defined(windows): @["exe"] else: @[]), filterName = "Programs")
   of prBrowseWeb:
     let d = a.cfg.webDir.expandPath
     a.ask(dkOpenDir, "optwebdir", "Media Cache Folder",
@@ -5864,6 +6063,73 @@ proc renderRename(a: App, shot: string) =
     a.closeRename()
   elif esc:
     a.closeRename()
+
+proc renderEmbed(a: App, shot: string) =
+  ## Draws the Embed As MKV Chapters window: embed and keep the bookmarks,
+  ## embed and clear them, or cancel. Enter keeps them.
+  if a.overlay != ovEmbed: return
+  let w = a.embWin
+  let ui = a.embUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeEmbed()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+  let esc = w.buttonPressed[KeyEscape]
+  if not a.beginDialogDraw(w, a.embSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.embSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = ui.size.x
+  let H = ui.size.y
+  let n = a.fileBookmarks.len
+  let text = case a.embMode
+    of emAsk:
+      &"Write {n} bookmark" & (if n == 1: "" else: "s") & " into " &
+        a.embPath.extractFilename & " as chapters? The file is changed in place; " &
+        "the chapters it has are kept. Keep the bookmarks afterwards, or clear them?"
+    of emInstall:
+      "Embedding chapters needs MKVToolNix's mkvpropedit, which wasn't found. " &
+        "Install it? Its latest release goes to " &
+        (when defined(windows): shortPath(mkvManagedPath().parentDir) & "."
+         else: shortPath(getDataDir() / "majestic-media-player" / "mkvtoolnix") &
+           ", run through " & shortPath(mkvManagedPath()) & ".")
+    of emBusy, emFailed: a.embMsg
+  var y = 14'f32
+  for line in ui.wrapText(text, W - 32, 5):
+    ui.textIn(line, rect(16, y, W - 32, 22), colText)
+    y += 22
+  let j = a.mkvJob
+  if a.embMode == emBusy and j.running:
+    let r = rect(16, min(y + 10, H - 56), W - 32, 6)
+    ui.rect(r, colTrack)
+    if j.stage == mkDownload and j.progress >= 0:
+      ui.rect(rect(r.x, r.y, r.w * clamp(j.progress / 100, 0, 1), r.h), colAccent)
+  let bw = if a.embMode == emAsk: 130'f32 else: 100'f32
+  let br = rect(W - 16 - bw, H - 44, bw, 28)
+  var ok, clear, cancel = false
+  case a.embMode
+  of emAsk:
+    ok = ui.textButton("emb-keep", br, "Keep Bookmarks", primary = true)
+    clear = ui.textButton("emb-clear", rect(br.x - bw - 8, br.y, bw, br.h), "Clear Bookmarks")
+    cancel = ui.textButton("emb-cancel", rect(br.x - 2 * (bw + 8), br.y, bw, br.h), "Cancel")
+  of emInstall:
+    ok = ui.textButton("emb-install", br, "Install", primary = true)
+    cancel = ui.textButton("emb-cancel", rect(br.x - bw - 8, br.y, bw, br.h), "Cancel")
+  of emBusy: cancel = ui.textButton("emb-hide", br, "Hide")
+  of emFailed: cancel = ui.textButton("emb-close", br, "Close", primary = true)
+  ui.drawTooltip()
+  a.embSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-embed.png")
+  a.endDialogDraw(w, a.embSk, size)
+  if (ok or clear or enter) and a.embMode in {emAsk, emInstall}: a.embAnswer(true, clear)
+  elif cancel or esc or (enter and a.embMode == emFailed): a.embAnswer(false)
 
 proc renderSyncProps(a: App, shot: string) =
   ## Draws Synchronize > Properties; its changes apply as they are made.
@@ -6455,6 +6721,8 @@ proc frame(a: App) =
       if ui.pressed(): a.syncWin.activate()
     of ovYtdlp:
       if ui.pressed(): a.ytWin.activate()
+    of ovEmbed:
+      if ui.pressed(): a.embWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -6539,6 +6807,7 @@ proc frame(a: App) =
   a.renderPick(shot)
   a.renderSyncProps(shot)
   a.renderYtdlp(shot)
+  a.renderEmbed(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -6551,6 +6820,7 @@ proc keyUi(a: App): Ui =
   of ovPick: a.pickUi
   of ovSync: a.syncUi
   of ovYtdlp: a.ytUi
+  of ovEmbed: a.embUi
   else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
@@ -6673,6 +6943,13 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "uiscale": a.cfg.uiScale = parseFloat(arg)  # percent, as Options sets it
   of "set": a.player.h.setProp(st.args[0], st.args[1 .. ^1].join(" "))
   of "ytdlp": a.ytAnswer(arg == "1")  # 1 | 0: the yt-dlp window's Install/Update or Cancel
+  of "embed":  # keep | clear | install | 0: the Embed As MKV Chapters window's buttons
+    if arg == "show": a.showEmbed()
+    else: a.embAnswer(arg != "0", arg == "clear")
+  of "embdump":
+    stderr.writeLine "embed mode=", a.embMode, " overlay=", a.overlay, " msg=", a.embMsg,
+      " status=", a.mkvStatus, " exe=", findMkvpropedit(a.cfg.mkvpropedit), " marks=", a.fileBookmarks.len,
+      " chapters=", a.player.chapters.len, " running=", a.embProc != nil
   of "ytdump":
     stderr.writeLine "ytdlp status=", a.ytStatus, " mode=", a.ytMode, " overlay=", a.overlay,
       " opening=", a.player.opening, " loaded=", a.player.loaded, " path=", a.player.path,
@@ -6853,6 +7130,7 @@ proc main() =
     if a.pickWin != nil: a.pickWin.runeInputEnabled = true
     if a.syncWin != nil: a.syncWin.runeInputEnabled = true
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
+    if a.embWin != nil: a.embWin.runeInputEnabled = true
 
   proc step(): bool =
     ## One pass of the main loop after reading events; false when there was
@@ -6891,6 +7169,7 @@ proc main() =
     a.pollYtdlp()
     a.pollWebSave()
     a.pollSave()
+    a.pollEmbed()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -6968,7 +7247,7 @@ proc main() =
       stepping = true
       discard step()
       # Handled: the main loop mustn't handle it again once pollEvents returns.
-      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin]:
+      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin]:
         if w != nil: w.clearFrameInput()
       enableRunes()
       stepping = false)

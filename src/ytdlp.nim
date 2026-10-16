@@ -50,11 +50,15 @@ proc managedPath*(): string =
   when defined(windows): getEnv("LOCALAPPDATA") / "Programs" / "yt-dlp" / "yt-dlp.exe"
   else: getHomeDir() / ".local" / "bin" / "yt-dlp"
 
-proc findYtdlp*(): string =
-  ## The yt-dlp the player installed, once it has (a launcher's PATH may lack
+proc findYtdlp*(custom = ""): string =
+  ## `custom` (Options > Player > Paths) when that file exists; else the
+  ## yt-dlp the player installed, once it has (a launcher's PATH may lack
   ## ~/.local/bin, or have a package manager's yt-dlp first, which -U can't
   ## update); else the one on PATH; "" when there is none.
-  if fileExists(managedPath()): managedPath() else: findExe("yt-dlp")
+  let c = custom.strip.expandTilde
+  if c.len > 0 and fileExists(c): c
+  elif fileExists(managedPath()): managedPath()
+  else: findExe("yt-dlp")
 
 proc downloadDir*(): string = getCacheDir("majestic-media-player") / "yt-dlp"
 

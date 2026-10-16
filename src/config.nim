@@ -76,6 +76,8 @@ type
     screenshotDir*: string = ""    # "" = ~/Pictures (or home)
     screenshotNoAsk*: bool = false # save straight into screenshotDir
     openDir*: string = ""          # "" = the playing file's folder, else lastDir
+    mkvpropedit*: string = ""      # "" = found automatically (mkvtoolnix.findMkvpropedit)
+    ytdlp*: string = ""            # "" = found automatically (ytdlp.findYtdlp)
     # Options > Player > Keys
     keys*: Table[string, string]   # command id -> "Home|0" ("" = none); only changed keys
     # Options > Playback
@@ -102,6 +104,22 @@ type
     # Options > Subtitles
     subDelay*: float = 0           # milliseconds
     subPaths*: string = ""         # extra subtitle folders, ';'-separated
+    subFont*: string = ""          # font family, "" = mpv's sans-serif
+    subBold*: bool = false
+    subItalic*: bool = false
+    subSize*: float = 38           # mpv's sub-font-size, scaled pixels at 720 lines
+    subSpacing*: float = 0         # mpv's sub-spacing (kerning), same scaled pixels
+    subLineSpacing*: float = 0     # mpv's sub-line-spacing, same scaled pixels
+    subColor*: string = "#FFFFFF"  # colors as #RRGGBB, opacity apart in percent
+    subOpacity*: float = 100
+    subOutlineSize*: float = 1.65
+    subOutlineColor*: string = "#000000"
+    subOutlineOpacity*: float = 100
+    subShadowOffset*: float = 0
+    subShadowColor*: string = "#000000"
+    subShadowOpacity*: float = 69
+    subStyleAss*: bool = false     # restyle ASS/SSA subtitles too (sub-ass-override=force)
+    colorSwatches*: seq[string]    # the color picker's saved colors, newest first
     # Options > Miscellaneous
     panStep*: float = 10           # pixels
     rotateStep*: float = 5         # degrees
@@ -121,6 +139,36 @@ const
   LoopFramesMaxMB* = 4096          ## hard cap of loopFramesMB (4 GB)
   OsdScaleMin* = 0.25             ## range of osdScale
   OsdScaleMax* = 8.0
+
+proc validColor*(hex: string): bool =
+  ## "#RRGGBB" (or "RRGGBB") as typed in Options.
+  let h = hex.strip.strip(trailing = false, chars = {'#'})
+  h.len == 6 and h.allIt(it in HexDigits)
+
+proc mpvColor*(hex: string, opacity: float, fallback: string): string =
+  ## An Options color and opacity (percent) in mpv's "#AARRGGBB"; fallback
+  ## ("#RRGGBB") when the typed color isn't one.
+  let h = (if hex.validColor: hex else: fallback).strip.strip(trailing = false, chars = {'#'})
+  "#" & toHex(int(round(clamp(opacity, 0, 100) * 2.55)), 2) & h.toUpperAscii
+
+proc resetSubStyle*(c: var Config) =
+  ## Options > Subtitles > Default > Reset style: the style fields back to their defaults.
+  let d = Config()
+  c.subFont = d.subFont
+  c.subBold = d.subBold
+  c.subItalic = d.subItalic
+  c.subSize = d.subSize
+  c.subSpacing = d.subSpacing
+  c.subLineSpacing = d.subLineSpacing
+  c.subColor = d.subColor
+  c.subOpacity = d.subOpacity
+  c.subOutlineSize = d.subOutlineSize
+  c.subOutlineColor = d.subOutlineColor
+  c.subOutlineOpacity = d.subOutlineOpacity
+  c.subShadowOffset = d.subShadowOffset
+  c.subShadowColor = d.subShadowColor
+  c.subShadowOpacity = d.subShadowOpacity
+  c.subStyleAss = d.subStyleAss
 
 proc expandPath*(p: string): string =
   ## A folder typed in Options: trimmed, with ~ expanded.

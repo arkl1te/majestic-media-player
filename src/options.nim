@@ -4,7 +4,7 @@
 
 import std/[os, strutils, strformat, math, tables, times]
 import silky, vmath, bumpy, chroma, pixie
-import ui, theme, config, assoc, keymap, websave, mediainfo
+import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist
 
 type
   OptionsPage* = enum
@@ -14,8 +14,10 @@ type
     opPaths = "Paths"
     opKeys = "Keys"
     opPlayback = "Playback"
+    opOnline = "Online"
     opWeb = "Media Cache"
     opSubtitles = "Subtitles"
+    opSubStyle = "Default"
     opMisc = "Miscellaneous"
     opSystem = "System"
 
@@ -25,7 +27,7 @@ type
   PathRequest* = enum
     ## Paths page buttons the caller carries out (file dialogs, file manager).
     prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
-    prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb
+    prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp
 
   WebInfo* = object
     ## Playback > Media Cache: the cached links, filled in by the caller.
@@ -56,6 +58,23 @@ type
     webPicked*: seq[string]     ## Media Cache page: links checked in the list
     webScroll: float32
     confirmClear: bool          ## Media Cache page: Clear pressed once, asking again
+    picker: string              ## Subtitles page: color row whose picker is open
+    pickAt: Rect                ## that row's swatch, where the picker hangs
+    pickH, pickS, pickV: float  ## the picker's color, 0..1 (hue kept while it's gray)
+    pickFrom: string            ## the color it opened with (Esc goes back to it)
+    pickHex: string             ## the picked color, for the row to take
+    pickNew: bool               ## pickHex changed since the row last took it
+    pickClose: bool             ## close once the row took pickHex
+    pickDrag: int               ## 1: dragging in the square, 2: on the hue bar
+    screenPicking: bool         ## the desktop is letting the user pick a color on screen
+    screenNote: string          ## why picking on screen failed; "" while it may work
+    fonts: seq[string]          ## Subtitles > Default: the installed font families
+    fontsLoaded: bool
+    fontOpen: bool              ## the Font row's list is showing
+    fontQuery: string           ## what the list is narrowed to ("" = every font)
+    fontHi: int                 ## the list's highlighted row, -1 when none
+    fontTop: int                ## its first visible row
+    fontAt: Rect                ## the Font field and its arrow, where the list hangs
 
   Pane = object
     ## Layout cursor for a page.
@@ -64,8 +83,9 @@ type
 
 const
   Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
-          (opWeb, 1), (opSubtitles, 0), (opMisc, 0), (opSystem, 0)]
-  Parents = {opPlayer, opPlayback}
+          (opOnline, 1), (opWeb, 1), (opSubtitles, 0),
+          (opSubStyle, 1), (opMisc, 0), (opSystem, 0)]
+  Parents = {opPlayer, opPlayback, opSubtitles}
   TreeWidth = 180'f32
   TreeRow = 22'f32
   TreeIndent = 16'f32
@@ -88,6 +108,8 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   d.keyNote = ""
   d.capturing = false
   d.confirmClear = false
+  d.picker = ""
+  d.fontOpen = false
   d.scroll = 0
   ui.navId = "o-tree"
   ui.navVisible = false
@@ -98,6 +120,7 @@ proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   d.scroll = 0
   d.capturing = false
   d.confirmClear = false
+  d.fontOpen = false
   ui.focusId = ""
   d.expanded.incl p.parentOf
 
@@ -196,7 +219,7 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool) =
 # --- page building blocks -----------------------------------------------------
 
 proc group(ui: Ui, p: var Pane, title: string) =
-  if p.started: p.y += 6
+  if p.started: p.y += 6 + 7    # plus half an em of the 13 px header font, whole pixels
   p.started = true
   ui.groupHeader(vec2(p.x, p.y), p.w, title)
   p.y += 26
@@ -262,6 +285,14 @@ proc folderNote(ui: Ui, p: var Pane, value: string) =
   let d = value.expandPath
   if d.len > 0 and not dirExists(d):
     ui.textIn("This folder does not exist.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
+      colAccent, FontSmall)
+    p.y += 20
+
+proc fileNote(ui: Ui, p: var Pane, value: string) =
+  ## Warns when a typed program does not exist.
+  let f = value.expandPath
+  if f.len > 0 and not fileExists(f):
+    ui.textIn("This file does not exist.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
       colAccent, FontSmall)
     p.y += 20
 
@@ -437,6 +468,15 @@ proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
     d.request = prBrowseOpen
   ui.folderNote(p, c.openDir)
   ui.hint(p, "Empty: the playing file's folder, else the last folder a file was opened from.")
+  ui.group(p, "Programs")
+  if ui.folderRow(p, "o-mkvpe", "mkvpropedit", c.mkvpropedit, "Found automatically"):
+    d.request = prBrowseMkvpropedit
+  ui.fileNote(p, c.mkvpropedit)
+  if ui.folderRow(p, "o-ytdlp", "yt-dlp", c.ytdlp, "Found automatically"):
+    d.request = prBrowseYtdlp
+  ui.fileNote(p, c.ytdlp)
+  ui.hint(p, "mkvpropedit embeds bookmarks as chapters; yt-dlp opens and saves online videos.")
+  ui.hint(p, "Empty: the one the player installed, else the one on PATH.")
   ui.group(p, "Settings")
   ui.textIn("Settings folder", rect(p.x + 8, p.y, LabelW, 26), colText)
   const bw = 96'f32
@@ -643,10 +683,6 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.textRow(p, "o-slang", "Subtitles", c.subLangs, "e.g. eng, jpn")
   ui.textRow(p, "o-alang", "Audio", c.audioLangs, "e.g. jpn, eng")
   ui.hint(p, "Language codes in order of preference; the first matching track is picked on open.")
-  ui.group(p, "Online media")
-  ui.textRow(p, "o-cookies", "Sign in with", c.signInCookies, "auto")
-  ui.hint(p, "Browser whose cookies yt-dlp uses when a video asks to sign in (age-restricted).")
-  ui.hint(p, "auto tries each installed browser; none turns it off; or brave, chrome, firefox...")
   ui.group(p, "Seek bar")
   ui.checkRow(p, "o-prev", "Show thumbnail preview on hover", c.seekPreview)
   ui.checkRow(p, "o-snap", "Hold Shift to snap to chapters", c.snapWithShift)
@@ -658,6 +694,12 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
   ui.numberRow(p, "o-jump", "Jump (seconds)", c.seekStep, 1, 1, 600)
   ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
+
+proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Sign-in for age-restricted videos")
+  ui.textRow(p, "o-cookies", "Sign in with", c.signInCookies, "auto")
+  ui.hint(p, "Browser whose cookies yt-dlp uses when a video asks to sign in (age-restricted).")
+  ui.hint(p, "auto tries each installed browser; none turns it off; or brave, chrome, firefox...")
 
 proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let web = d.web
@@ -699,6 +741,12 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
       rect(p.x + 8, p.y - 2, p.w - 8, 18), colAccent, FontSmall)
     p.y += 20
 
+  ui.group(p, "Delete automatically")
+  ui.toggleNumberRow(p, "o-webkeep", "Delete after (hours)", c.webKeepOn, c.webKeepHours, 1, 1, 87600)
+  ui.toggleNumberRow(p, "o-webcount", "Keep at most (items)", c.webCountOn, c.webCount, 1, 1, 10000)
+  ui.toggleNumberRow(p, "o-websize", "Max. disk space (GiB)", c.webSizeOn, c.webSizeGB, 1, 1, 100000)
+  ui.hint(p, "Checked on OK, at start and as media is cached; the least recently opened go first.")
+
   ui.group(p, "Cached media")
   # Checked items still cached; the list may have changed since.
   var picked: seq[string]
@@ -717,8 +765,7 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
   const sizeW = 76'f32
   const savedW = 140'f32
   const dateW = 120'f32
-  const autoH = 32'f32 + 3 * (Row + 4) + 20  # Delete automatically, below the list
-  let list = rect(p.x + 8, p.y, p.w - 8, max(160'f32, bottom - p.y - 8 - autoH))
+  let list = rect(p.x + 8, p.y, p.w - 8, max(160'f32, bottom - p.y - 8))
   ui.rect(list, colBackground)
   ui.border(list, colBorder)
   # Header: a box checking every item, and the columns' names.
@@ -782,18 +829,434 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
   ui.hitClip = outerClip
   p.y = list.y + list.h + 8
 
-  ui.group(p, "Delete automatically")
-  ui.toggleNumberRow(p, "o-webkeep", "Delete after (hours)", c.webKeepOn, c.webKeepHours, 1, 1, 87600)
-  ui.toggleNumberRow(p, "o-webcount", "Keep at most (items)", c.webCountOn, c.webCount, 1, 1, 10000)
-  ui.toggleNumberRow(p, "o-websize", "Max. disk space (GiB)", c.webSizeOn, c.webSizeGB, 1, 1, 100000)
-  ui.hint(p, "Checked on OK, at start and as media is cached; the least recently opened go first.")
+const SubSwatches = ["#FFFFFF", "#FFF3A0", "#FFE000", "#7FE8FF", "#A0A0A0", "#000000"]
+  ## Options > Subtitles: colors one click away
 
-proc subtitlesPage(ui: Ui, c: var Config, p: var Pane) =
+const PickerFocus = "o-picker"  ## focusId while a color picker is open
+
+proc hexColor(hex: string): Color =
+  parseHtmlColor("#" & hex.strip.strip(trailing = false, chars = {'#'}))
+
+proc hsvHex(h, s, v: float): string =
+  ## Hue, saturation, value (0..1) as #RRGGBB.
+  let k = (h mod 1) * 6
+  proc f(n: float): float =
+    let t = (n + k) mod 6
+    v - v * s * clamp(min(t, 4 - t), 0, 1)
+  "#" & toHex(int(round(f(5) * 255)), 2) & toHex(int(round(f(3) * 255)), 2) &
+    toHex(int(round(f(1) * 255)), 2)
+
+proc hexHsv(hex: string): (float, float, float) =
+  let c = hexColor(hex)
+  let (r, g, b) = (c.r.float, c.g.float, c.b.float)
+  let v = max(r, max(g, b))
+  let d = v - min(r, min(g, b))
+  let s = if v > 0: d / v else: 0.0
+  var h = 0.0
+  if d > 0:
+    h = (if v == r: (g - b) / d elif v == g: 2 + (b - r) / d else: 4 + (r - g) / d) / 6
+    if h < 0: h += 1
+  (h, s, v)
+
+proc rgbHex(rgb: (float, float, float)): string =
+  proc b(v: float): string = toHex(int(round(clamp(v, 0, 1) * 255)), 2)
+  "#" & b(rgb[0]) & b(rgb[1]) & b(rgb[2])
+
+proc openPicker(d: OptionsDialog, ui: Ui, id, value: string, at: Rect) =
+  d.picker = id
+  d.pickAt = at
+  d.pickFrom = if value.validColor: value else: "#FFFFFF"
+  (d.pickH, d.pickS, d.pickV) = hexHsv(d.pickFrom)
+  d.pickNew = false
+  d.pickClose = false
+  d.pickDrag = 0
+  ui.focusId = PickerFocus      # the window's own keys (Esc, Enter, Tab) stand back
+  ui.navVisible = false
+
+const
+  PickPad = 10'f32
+  PickSq = vec2(200, 160)       ## saturation (across) / value (down) square
+  PickHueW = 18'f32
+  PickFootH = 26'f32
+  PickSwatch = 20'f32           ## saved colors, in a row under the footer
+  PickSwatchStep = 24'f32
+  MaxSwatches = 9               ## as many as the row fits
+
+proc pickerRect(d: OptionsDialog, ui: Ui): Rect =
+  ## Below the swatch, or above it when the window ends first.
+  let w = PickPad * 3 + PickSq.x + PickHueW
+  let h = PickPad * 4 + PickSq.y + PickFootH + PickSwatch
+  let a = d.pickAt
+  let y = if a.y + a.h + 4 + h <= ui.size.y - 4: a.y + a.h + 4 else: max(4'f32, a.y - 4 - h)
+  rect(clamp(a.x, 4, max(4'f32, ui.size.x - w - 4)), y, w, h)
+
+proc pickerParts(r: Rect): tuple[sq, hue, old, cur, screen, save, saved: Rect] =
+  let sq = rect(r.x + PickPad, r.y + PickPad, PickSq.x, PickSq.y)
+  let fy = sq.y + sq.h + PickPad
+  let right = r.x + r.w - PickPad
+  (sq, rect(sq.x + sq.w + PickPad, sq.y, PickHueW, sq.h),
+   rect(sq.x, fy, 30, PickFootH), rect(sq.x + 30, fy, 30, PickFootH),
+   rect(right - PickFootH * 2 - 4, fy, PickFootH, PickFootH), rect(right - PickFootH, fy, PickFootH, PickFootH),
+   rect(sq.x, fy + PickFootH + PickPad, right - sq.x, PickSwatch))
+
+proc savedAt(row: Rect, m: Vec2, count: int): int =
+  ## The saved color under m, or -1.
+  if not m.inside(row): return -1
+  let i = int((m.x - row.x) / PickSwatchStep)
+  if i < count and m.x - row.x - i.float32 * PickSwatchStep < PickSwatch: i else: -1
+
+proc pickerInput(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## Before anything else is drawn: the open picker takes the mouse and keys.
+  var shot = spIdle
+  var rgb: (float, float, float)
+  if d.screenPicking:
+    shot = pollScreenPick(rgb)
+    if shot != spWaiting: d.screenPicking = false
+    if shot == spFailed: d.screenNote = "The desktop couldn't pick a color"
+  if d.picker.len == 0 or d.pickClose: return
+  let w = ui.window
+  let r = d.pickerRect(ui)
+  let parts = r.pickerParts
+  let m = ui.mouse
+  let was = (d.pickH, d.pickS, d.pickV)
+  if shot == spPicked: (d.pickH, d.pickS, d.pickV) = hexHsv(rgbHex(rgb))
+  let saved = parts.saved.savedAt(m, c.colorSwatches.len)
+  if w.buttonPressed[MouseLeft]:
+    if m.inside(parts.sq): d.pickDrag = 1
+    elif m.inside(parts.hue): d.pickDrag = 2
+    elif m.inside(parts.old): (d.pickH, d.pickS, d.pickV) = hexHsv(d.pickFrom)
+    elif m.inside(parts.screen):
+      if not d.screenPicking and d.screenNote.len == 0:
+        if startScreenPick(): d.screenPicking = true
+        else: d.screenNote = "Picking on screen isn't available on this desktop"
+    elif m.inside(parts.save):
+      let hex = hsvHex(d.pickH, d.pickS, d.pickV)
+      let i = c.colorSwatches.find(hex)
+      if i >= 0: c.colorSwatches.delete(i)
+      c.colorSwatches.insert(hex, 0)
+      if c.colorSwatches.len > MaxSwatches: c.colorSwatches.setLen(MaxSwatches)
+    elif saved >= 0: (d.pickH, d.pickS, d.pickV) = hexHsv(c.colorSwatches[saved])
+    elif not m.inside(r) and not d.screenPicking: d.pickClose = true
+  elif w.buttonPressed[MouseRight]:
+    if saved >= 0: c.colorSwatches.delete(saved)
+    elif not m.inside(r) and not d.screenPicking: d.pickClose = true
+  if not w.buttonDown[MouseLeft]: d.pickDrag = 0
+  case d.pickDrag
+  of 1:
+    d.pickS = clamp((m.x - parts.sq.x) / parts.sq.w, 0, 1)
+    d.pickV = 1 - clamp((m.y - parts.sq.y) / parts.sq.h, 0, 1)
+  of 2: d.pickH = clamp((m.y - parts.hue.y) / parts.hue.h, 0, 0.9999)
+  else: discard
+  if m.inside(parts.hue) and ui.scroll() != 0:
+    d.pickH = clamp(d.pickH + (if ui.scroll() < 0: -0.01 else: 0.01), 0, 0.9999)
+  if w.buttonPressed[KeyEscape]:
+    (d.pickH, d.pickS, d.pickV) = hexHsv(d.pickFrom)
+    d.pickClose = true
+  elif w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]: d.pickClose = true
+  if (d.pickH, d.pickS, d.pickV) != was or w.buttonPressed[KeyEscape]:
+    d.pickHex = hsvHex(d.pickH, d.pickS, d.pickV)
+    if w.buttonPressed[KeyEscape]: d.pickHex = d.pickFrom
+    d.pickNew = true
+  ui.captured = true            # nothing under the picker reacts
+
+proc drawPicker(d: OptionsDialog, ui: Ui, cfg: Config) =
+  if d.picker.len == 0: return
+  let r = d.pickerRect(ui)
+  let parts = r.pickerParts
+  ui.sk.pushLayer(PopupsLayer)
+  defer: ui.sk.popLayer()
+  ui.rect(rect(r.x + 3, r.y + 3, r.w, r.h), rgbx(0, 0, 0, 90))  # shadow
+  ui.rect(r, colPopup)
+  ui.border(r, colBorder)
+  let hue = hexColor(hsvHex(d.pickH, 1, 1)).rgbx
+  let white = rgbx(255, 255, 255, 255)
+  let black = rgbx(0, 0, 0, 255)
+  let clear = rgbx(0, 0, 0, 0)
+  ui.gradient(parts.sq, white, hue, hue, white)
+  ui.gradient(parts.sq, clear, clear, black, black)
+  ui.border(parts.sq, colBorder)
+  let c = vec2(parts.sq.x + d.pickS.float32 * parts.sq.w, parts.sq.y + (1 - d.pickV.float32) * parts.sq.h)
+  ui.sk.pushClipRect(parts.sq)
+  ui.border(rect(c.x - 6, c.y - 6, 12, 12), black, 1)
+  ui.border(rect(c.x - 5, c.y - 5, 10, 10), white, 2)
+  ui.sk.popClipRect()
+  let seg = parts.hue.h / 6
+  for i in 0 ..< 6:
+    let top = hexColor(hsvHex(i / 6, 1, 1)).rgbx
+    let bottom = hexColor(hsvHex((i + 1) / 6, 1, 1)).rgbx
+    ui.gradient(rect(parts.hue.x, parts.hue.y + i.float32 * seg, parts.hue.w, seg), top, top, bottom, bottom)
+  ui.border(parts.hue, colBorder)
+  let hy = parts.hue.y + d.pickH.float32 * parts.hue.h
+  ui.rect(rect(parts.hue.x - 3, hy - 2, parts.hue.w + 6, 4), black)
+  ui.rect(rect(parts.hue.x - 2, hy - 1, parts.hue.w + 4, 2), white)
+  ui.rect(parts.old, hexColor(d.pickFrom).rgbx)
+  ui.rect(parts.cur, hexColor(hsvHex(d.pickH, d.pickS, d.pickV)).rgbx)
+  ui.border(rect(parts.old.x, parts.old.y, 60, PickFootH), colBorder)
+  ui.textIn(hsvHex(d.pickH, d.pickS, d.pickV), rect(parts.cur.x + parts.cur.w + 10, parts.cur.y, 80, PickFootH), colText)
+  let m = ui.mouse
+  proc button(r: Rect, icon: string, on, enabled: bool) =
+    let hov = enabled and m.inside(r)
+    if hov: ui.rect(r, if ui.down(): colPressed else: colHover)
+    ui.icon(icon & "16", r.xy + r.wh / 2,
+      if not enabled: colTextDisabled elif on: colAccent elif hov: colWhite else: colText)
+  button(parts.screen, "eyedropper", d.screenPicking, d.screenNote.len == 0)
+  button(parts.save, "plus", false, true)
+  for i, hex in cfg.colorSwatches:
+    let s = rect(parts.saved.x + i.float32 * PickSwatchStep, parts.saved.y, PickSwatch, PickSwatch)
+    ui.rect(s, hexColor(hex).rgbx)
+    ui.border(s, if m.inside(s): colAccent else: colBorder)
+  if cfg.colorSwatches.len == 0:
+    ui.textIn("Saved colors show here", parts.saved, colTextDim, FontSmall)
+  template tip(at: Rect, s: string) =
+    if m.inside(at):
+      ui.tooltip = s
+      ui.tooltipAnchor = at
+  tip(parts.old, "Back to " & d.pickFrom & " (Esc)")
+  tip(parts.screen, if d.screenNote.len > 0: d.screenNote
+                    elif d.screenPicking: "Picking on screen..."
+                    else: "Pick a color anywhere on screen")
+  tip(parts.save, "Save this color")
+  let saved = parts.saved.savedAt(m, cfg.colorSwatches.len)
+  if saved >= 0:
+    tip(parts.saved, cfg.colorSwatches[saved] & "  (right-click: remove)")
+
+proc colorRow(d: OptionsDialog, ui: Ui, p: var Pane, id, label: string, value: var string,
+              opacity: var float) =
+  ## A #RRGGBB field with its swatch (click: a color picker), an opacity in
+  ## percent and a few colors to pick from.
+  if d.picker == id:
+    if d.pickNew:
+      value = d.pickHex
+      d.pickNew = false
+    if d.pickClose:
+      d.picker = ""
+      if ui.focusId == PickerFocus: ui.focusId = ""
+  ui.textIn(label, rect(p.x + 8, p.y, LabelW, 26), colText)
+  var x = p.x + 8 + LabelW
+  let ok = value.validColor
+  let sw = rect(x, p.y, 26, 26)
+  if d.picker == id: d.pickAt = sw  # follows the page
+  if ui.hover(sw):
+    ui.tip(sw, "Pick a color")
+    if ui.pressed():
+      ui.consumeClick()
+      d.openPicker(ui, id, value, sw)
+  if ok:
+    var col = parseHtmlColor("#" & value.strip.strip(trailing = false, chars = {'#'}))
+    col.a = clamp(opacity, 0, 100) / 100
+    ui.rect(sw, colBackground)
+    ui.rect(sw, col.rgbx)
+  else:
+    ui.rect(sw, colBackground)
+    ui.textIn("?", sw, colAccent, h = CenterAlign)
+  ui.border(sw, if ui.hover(sw) or d.picker == id: colAccent else: colBorder)
+  x += 32
+  discard ui.textField(id, rect(x, p.y, 90, 26), value, "#RRGGBB")
+  x += 98
+  discard ui.numberField(id & "-a", rect(x, p.y, 110, 26), opacity, 5, 0, 100)
+  ui.textIn("%", rect(x + 114, p.y, 20, 26), colTextDim)
+  x += 140
+  for i, hex in SubSwatches:
+    let r = rect(x + i.float32 * 24, p.y + 3, 20, 20)
+    if r.x + r.w > p.x + p.w: break
+    let hov = ui.hover(r)
+    ui.rect(r, parseHtmlColor(hex).rgbx)
+    ui.border(r, if hov: colAccent else: colBorder)
+    if hov:
+      ui.tip(r, hex)
+      if ui.pressed():
+        ui.pressId = id & "-sw" & $i
+        ui.consumeClick()
+      if ui.window.buttonReleased[MouseLeft] and ui.pressId == id & "-sw" & $i:
+        value = hex
+  p.y += Row + 4
+  if not ok:
+    ui.textIn("Not a color; type it as #RRGGBB.", rect(p.x + 8 + LabelW, p.y - 2, p.w - LabelW - 8, 18),
+      colAccent, FontSmall)
+    p.y += 20
+
+
+const
+  FontFocus = "o-sfont"         ## the Font field's id
+  FontRowH = 22'f32             ## a row of its list
+  FontRows = 12                 ## rows the list shows at once
+
+proc fontMatches(d: OptionsDialog): seq[string] =
+  let q = d.fontQuery.strip.toLowerAscii
+  for f in d.fonts:
+    if q.len == 0 or q in f.toLowerAscii: result.add f
+
+proc fontListRect(d: OptionsDialog, ui: Ui, n: int): Rect =
+  ## Below the field, or above it when the window ends first.
+  let h = max(1, min(n, FontRows)).float32 * FontRowH + 2
+  let a = d.fontAt
+  let y = if a.y + a.h + 2 + h <= ui.size.y - 4: a.y + a.h + 2 else: max(4'f32, a.y - 2 - h)
+  rect(a.x, y, a.w, h)
+
+proc showFontHi(d: OptionsDialog, n: int) =
+  ## Scrolls the list so the highlighted row is in it.
+  if d.fontHi >= 0:
+    if d.fontHi < d.fontTop: d.fontTop = d.fontHi
+    elif d.fontHi >= d.fontTop + FontRows: d.fontTop = d.fontHi - FontRows + 1
+  d.fontTop = clamp(d.fontTop, 0, max(0, n - FontRows))
+
+proc openFonts(d: OptionsDialog, query, current: string) =
+  ## Shows the list narrowed to query, highlighting current (or the first
+  ## font starting with the query).
+  if not d.fontsLoaded:
+    d.fonts = systemFonts()
+    d.fontsLoaded = true
+  d.fontOpen = true
+  d.fontQuery = query
+  let m = d.fontMatches
+  d.fontHi = -1
+  let cur = current.strip.toLowerAscii
+  let q = query.strip.toLowerAscii
+  for i, f in m:
+    if f.toLowerAscii == cur:
+      d.fontHi = i
+      break
+  if d.fontHi < 0 and q.len > 0:
+    for i, f in m:
+      if f.toLowerAscii.startsWith(q):
+        d.fontHi = i
+        break
+  d.fontTop = d.fontHi - FontRows div 2
+  d.showFontHi(m.len)
+
+proc fontInput(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## Before anything else is drawn: the open font list takes the mouse over
+  ## it, the arrows, Enter and Esc.
+  if not d.fontOpen: return
+  let w = ui.window
+  let m = d.fontMatches
+  let r = d.fontListRect(ui, m.len)
+  let mouse = ui.mouse
+  if mouse.inside(r):
+    if ui.scroll() != 0:
+      d.fontTop += (if ui.scroll() < 0: -3 else: 3)
+      d.fontTop = clamp(d.fontTop, 0, max(0, m.len - FontRows))
+      ui.scrollConsumed = true
+    if w.buttonPressed[MouseLeft]:
+      let i = d.fontTop + int((mouse.y - r.y - 1) / FontRowH)
+      if i >= 0 and i < m.len:
+        c.subFont = m[i]
+        d.fontOpen = false
+    ui.captured = true          # nothing under the list reacts
+  elif w.buttonPressed[MouseLeft] and not mouse.inside(d.fontAt):
+    d.fontOpen = false
+  if w.buttonPressed[KeyDown] and m.len > 0:
+    d.fontHi = min(d.fontHi + 1, m.high)
+    d.showFontHi(m.len)
+  elif w.buttonPressed[KeyUp] and m.len > 0:
+    d.fontHi = max(d.fontHi - 1, 0)
+    d.showFontHi(m.len)
+  elif w.buttonPressed[KeyPageDown] and m.len > 0:
+    d.fontHi = min(d.fontHi + FontRows, m.high)
+    d.showFontHi(m.len)
+  elif w.buttonPressed[KeyPageUp] and m.len > 0:
+    d.fontHi = max(d.fontHi - FontRows, 0)
+    d.showFontHi(m.len)
+  if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]:
+    if d.fontHi >= 0 and d.fontHi < m.len: c.subFont = m[d.fontHi]
+    d.fontOpen = false
+  elif w.buttonPressed[KeyEscape]:
+    d.fontOpen = false
+
+proc drawFonts(d: OptionsDialog, ui: Ui, c: Config) =
+  if not d.fontOpen: return
+  let m = d.fontMatches
+  let r = d.fontListRect(ui, m.len)
+  ui.sk.pushLayer(PopupsLayer)
+  defer: ui.sk.popLayer()
+  ui.rect(rect(r.x + 3, r.y + 3, r.w, r.h), rgbx(0, 0, 0, 90))  # shadow
+  ui.rect(r, colPopup)
+  ui.border(r, colBorder)
+  ui.sk.pushClipRect(r)
+  defer: ui.sk.popClipRect()
+  if m.len == 0:
+    ui.textIn(if d.fonts.len == 0: "No fonts found" else: "No matching fonts",
+      rect(r.x + 8, r.y + 1, r.w - 16, FontRowH), colTextDim)
+    return
+  let mouse = ui.mouse
+  let cur = c.subFont.strip.toLowerAscii
+  for row in 0 ..< min(FontRows, m.len - d.fontTop):
+    let i = d.fontTop + row
+    let rr = rect(r.x + 1, r.y + 1 + row.float32 * FontRowH, r.w - 2, FontRowH)
+    let hi = i == d.fontHi
+    if hi: ui.rect(rr, colAccent)
+    elif mouse.inside(rr): ui.rect(rr, colHover)
+    let col = if hi: colOnAccent elif m[i].toLowerAscii == cur: colAccent else: colText
+    ui.textIn(ui.ellipsize(m[i], rr.w - 20), rect(rr.x + 8, rr.y, rr.w - 16, rr.h), col)
+  if m.len > FontRows:
+    let th = max(16'f32, r.h * FontRows / m.len.float32)
+    let ty = r.y + (r.h - th) * (d.fontTop.float32 / float32(m.len - FontRows))
+    ui.rect(rect(r.x + r.w - 5, ty, 3, th), colTrack)
+
+proc fontRow(d: OptionsDialog, ui: Ui, p: var Pane, value: var string) =
+  ## A font family field with an arrow opening the installed fonts; typing
+  ## narrows the list to the matching ones.
+  ui.textIn("Font", rect(p.x + 8, p.y, LabelW, 26), colText)
+  let fw = max(120'f32, p.w - LabelW - 8) - 26
+  let field = rect(p.x + 8 + LabelW, p.y, fw, 26)
+  let arrow = rect(field.x + fw, p.y, 26, 26)
+  d.fontAt = rect(field.x, field.y, fw + 26, 26)  # follows the page
+  let focused = ui.focusId == FontFocus
+  let ev = ui.textField(FontFocus, field, value, "sans-serif")
+  let wasOpen = d.fontOpen
+  if eeChanged in ev: d.openFonts(value, "")
+  elif focused and not d.fontOpen and ui.window.buttonPressed[KeyDown]:
+    d.openFonts("", value)
+  if d.fontOpen and ui.focusId != FontFocus and not ui.mouse.inside(d.fontListRect(ui, d.fontMatches.len)):
+    d.fontOpen = false          # Tab or a click left the field
+  let hov = ui.hover(arrow)
+  ui.rect(arrow, if hov and ui.down(): colPressed elif hov: colHover else: colPanelRaised)
+  ui.border(arrow, if hov or d.fontOpen: colAccent else: colBorder)
+  ui.icon("expand16", arrow.xy + arrow.wh / 2, if hov: colText else: colTextDim)
+  if hov:
+    ui.tip(arrow, "Installed fonts")
+    if ui.pressed():
+      ui.consumeClick()
+      if wasOpen: d.fontOpen = false
+      else:
+        d.openFonts("", value)
+        ui.focusId = FontFocus  # typing narrows the list, Esc / Enter reach it
+        ui.focusFresh = true
+        ui.navId = FontFocus
+  p.y += Row + 4
+
+proc subtitlesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Subtitles")
   ui.numberRow(p, "o-sdelay", "Delay (milliseconds)", c.subDelay, 50, -600_000, 600_000)
   ui.textRow(p, "o-spaths", "Autoload paths", c.subPaths, "e.g. Subs;Subtitles;~/subs")
   ui.hint(p, "Folders searched for subtitles matching the file's name, separated by ';'.")
   ui.hint(p, "Relative paths start at the media file's folder.")
+
+proc subStylePage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Default style")
+  d.fontRow(ui, p, c.subFont)
+  ui.textIn("Style", rect(p.x + 8, p.y, LabelW, 26), colText)
+  discard ui.checkbox("o-sbold", vec2(p.x + 8 + LabelW, p.y + 2), "Bold", c.subBold)
+  discard ui.checkbox("o-sitalic", vec2(p.x + 8 + LabelW + 90, p.y + 2), "Italic", c.subItalic)
+  p.y += Row + 4
+  ui.numberRow(p, "o-ssize", "Size", c.subSize, 2, 1, 300)
+  ui.numberRow(p, "o-sspacing", "Character spacing", c.subSpacing, 0.5, -10, 10, 1)
+  ui.numberRow(p, "o-slinesp", "Line spacing", c.subLineSpacing, 1, -100, 200, 1)
+  d.colorRow(ui, p, "o-scolor", "Color", c.subColor, c.subOpacity)
+  p.gap
+  ui.numberRow(p, "o-soutline", "Outline size", c.subOutlineSize, 0.25, 0, 20, 2)
+  d.colorRow(ui, p, "o-soutcolor", "Outline color", c.subOutlineColor, c.subOutlineOpacity)
+  p.gap
+  ui.numberRow(p, "o-sshadow", "Shadow offset", c.subShadowOffset, 0.5, 0, 20, 2)
+  d.colorRow(ui, p, "o-sshcolor", "Shadow color", c.subShadowColor, c.subShadowOpacity)
+  p.gap
+  ui.checkRow(p, "o-sass", "Also restyle styled (ASS/SSA) subtitles", c.subStyleAss)
+  ui.hint(p, if c.subStyleAss: "Styled subtitles lose their own fonts, colors and positioning."
+             else: "Styled subtitles keep their own look; this style is for plain ones (SRT...).")
+  p.gap
+  if ui.textButton("o-sreset", rect(p.x + 8, p.y, 140, 28), "Reset style"):
+    c.resetSubStyle()
+  p.y += 34
 
 proc miscPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Steps")
@@ -817,6 +1280,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   # Keys that belong to the window, not to a text field being edited.
   let keys = ui.focusId.len == 0
   let enter = keys and (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter])
+  d.pickerInput(ui, c)
+  d.fontInput(ui, c)
 
   let body = rect(r.x + 16, r.y + 16, r.w - 32, r.h - 16 - 58)
   let treeR = rect(body.x, body.y, TreeWidth, body.h)
@@ -836,8 +1301,10 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   of opPaths: d.pathsPage(ui, c, p)
   of opKeys: d.keysPage(ui, c, p, pageR.y + pageR.h)
   of opPlayback: playbackPage(ui, c, p)
+  of opOnline: onlinePage(ui, c, p)
   of opWeb: d.webPage(ui, c, p, pageR.y + pageR.h)
-  of opSubtitles: subtitlesPage(ui, c, p)
+  of opSubtitles: d.subtitlesPage(ui, c, p)
+  of opSubStyle: d.subStylePage(ui, c, p)
   of opMisc: miscPage(ui, c, p)
   of opSystem: systemPage(ui, c, p)
   ui.hitClip = outerClip
@@ -864,6 +1331,8 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
     result = oaCancel
   # Enter means OK unless a focused button took it.
   if result == oaNone and enter and not ui.enterUsed: result = oaOk
+  d.drawPicker(ui, c)
+  d.drawFonts(ui, c)
   if result != oaNone:
     ui.focusId = ""
     return
@@ -871,7 +1340,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, r: Rect): OptionsAction =
   # Tab / Shift+Tab: tree, page controls, OK, Cancel. Scroll the page so a
   # newly focused control is visible.
   # A Tab that was just bound to a command doesn't move the focus too.
-  let i = if d.keyTaken: -1 else: ui.tabNavigate()
+  let i = if d.keyTaken or d.picker.len > 0: -1 else: ui.tabNavigate()
   if i >= pageStops and i < pageStopsEnd:
     let sr = ui.tabStops[i].r
     if sr.y < pageR.y: d.scroll -= pageR.y - sr.y + 4
