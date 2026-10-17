@@ -15,7 +15,7 @@ const
   MinWindow = ivec2(480, 270)
   MinCompactWindow = ivec2(16, 16)  ## pixels, not UI units: compact mode shrinks all the way
   OptionsSize = ivec2(912, 684)
-  RenameSize = ivec2(400, 116)
+  RenameSize = ivec2(400, 178)
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
@@ -196,12 +196,14 @@ type
     bookmarks: Bookmarks      ## per-file bookmarks, shown on the seek bar
     bmPath, bmKey: string     ## the current file and its mediaKey, once known
     bmPending: string         ## the file whose mediaKey is being worked out
-    renWin: Window            ## Rename Bookmark dialog, created on first use
+    renWin: Window            ## Edit Bookmark dialog, created on first use
     renSk: Silky
     renUi: Ui
-    renPath: string           ## the bookmark being renamed: its file and time
-    renTime: float
+    renPath: string           ## the bookmark being edited: its file and time
+    renTime: float            ## its time now, moved as the Time field is left
+    renOrigTime: float        ## its time when opened, restored on Cancel
     renText: string
+    renTimeText: string       ## the Time field
     renPlaceholder: string    ## its default label, shown when renText is empty
     embWin: Window            ## Embed as MKV Chapters confirmation, created on first use
     embSk: Silky
@@ -1606,6 +1608,38 @@ proc renameBookmark(a: App, path: string, t: float, name: string) =
     for b in marks.mitems:
       if b.time == t: b.name = name)
 
+proc moveBookmark(a: App, path: string, t, to: float): bool =
+  ## Moves a file's bookmark at time t to time `to`, keeping them in order.
+  ## False when another bookmark is already there.
+  var moved = false
+  a.editBookmarks(path, proc (marks: var seq[Bookmark]) =
+    if marks.anyIt(it.time != t and abs(it.time - to) < 0.0005): return
+    for i, b in marks:
+      if b.time == t:
+        var m = b
+        m.time = to
+        marks.delete(i)
+        var j = 0
+        while j < marks.len and marks[j].time < to: inc j
+        marks.insert(m, j)
+        moved = true
+        break)
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)  # the seek bar shows it now
+  moved
+
+proc snapToFrame(a: App, path: string, t: float): float =
+  ## Time t on the nearest frame of the current file's video track, when
+  ## path is that file and its frame rate is known.
+  let p = a.player
+  result = if p.duration > 0 and path == p.path: clamp(t, 0, p.duration) else: max(t, 0)
+  if path != p.path: return
+  for tr in p.tracks:
+    if tr.kind == "video" and tr.selected and not tr.albumArt and tr.fps > 0:
+      # The last frame starts before the end, so past it round down.
+      result = round(result * tr.fps) / tr.fps
+      if p.duration > 0 and result > p.duration: result = floor(p.duration * tr.fps) / tr.fps
+      return
+
 proc xfChanged(a: App, msg: string) =
   a.osd(msg)
 
@@ -2965,23 +2999,30 @@ proc applyUiScale(a: App) =
   a.dirtyUntil = now() + 0.5
 
 proc showRename(a: App, i: int) =
-  ## Opens the Rename Bookmark dialog for the current file's bookmark i.
+  ## Opens the Edit Bookmark dialog for the current file's bookmark i.
   let marks = a.fileBookmarks
   if i < 0 or i >= marks.len: return
   a.menus.close()
   a.renPath = a.player.path
   a.renTime = marks[i].time
+  a.renOrigTime = a.renTime
+  a.renTimeText = fmtTime(a.renTime, true, a.player.duration)
   a.renText = marks[i].name
   a.renPlaceholder = marks[i].label(i)
   if a.renWin == nil:
-    (a.renWin, a.renSk, a.renUi) = a.newDialogWindow("Rename Bookmark", RenameSize)
+    (a.renWin, a.renSk, a.renUi) = a.newDialogWindow("Edit Bookmark", RenameSize)
   # Type right away, the caret after the current name.
   a.renUi.focusId = "ren-name"
   a.renUi.focusFresh = true
   a.showDialog(a.renWin, RenameSize)
   a.overlay = ovRename
 
-proc closeRename(a: App) =
+proc closeRename(a: App, keep = false) =
+  ## Closes the Edit Bookmark dialog; unless kept, as on Cancel, the
+  ## bookmark goes back to where it was.
+  if not keep and a.renTime != a.renOrigTime:
+    discard a.moveBookmark(a.renPath, a.renTime, a.renOrigTime)
+    a.renTime = a.renOrigTime
   a.renUi.focusId = ""
   a.overlay = ovNone
   if a.renWin.visible:
@@ -6030,7 +6071,9 @@ proc renderOptions(a: App, shot: string) =
     if findExe("kbuildsycoca6").len > 0: a.spawn("kbuildsycoca6")
 
 proc renderRename(a: App, shot: string) =
-  ## Draws the Rename Bookmark window; Enter does what its button does.
+  ## Draws the Edit Bookmark window; Enter does what Save does, Escape what
+  ## Cancel does. Leaving the Time field moves the bookmark there, onto the
+  ## nearest frame, so the seek bar shows it right away.
   if a.overlay != ovRename: return
   let w = a.renWin
   let ui = a.renUi
@@ -6050,9 +6093,28 @@ proc renderRename(a: App, shot: string) =
     colPanel.b.float32 / 255, 1)
   glClear(GL_COLOR_BUFFER_BIT)
   let W = ui.size.x
+  proc commitTime() =
+    ## The Time field was left: the bookmark moves to the nearest frame.
+    if esc: return  # Cancel puts it back anyway
+    try:
+      let t = a.snapToFrame(a.renPath, parseTime(a.renTimeText))
+      if t != a.renTime and a.moveBookmark(a.renPath, a.renTime, t): a.renTime = t
+    except ValueError: discard
+    a.renTimeText = fmtTime(a.renTime, true, a.player.duration)
+  # Switching to another window leaves the field too.
+  if ui.focusId == "ren-time" and not w.focused:
+    ui.focusId = ""
+    commitTime()
+  let wasTime = ui.focusId == "ren-time"
   ui.textIn("Name", rect(16, 10, W - 32, 22), colTextDim, FontSmall)
   discard ui.textField("ren-name", rect(16, 34, W - 32, 28), a.renText, a.renPlaceholder)
-  let ok = ui.textButton("ren-ok", rect(W - 116, 74, 100, 28), "Rename", primary = true)
+  # Clicking the Name field takes the focus before the Time field sees the click.
+  if wasTime and ui.focusId != "ren-time": commitTime()
+  ui.textIn("Time", rect(16, 72, W - 32, 22), colTextDim, FontSmall)
+  if eeCommitted in ui.textField("ren-time", rect(16, 96, W - 32, 28), a.renTimeText):
+    commitTime()
+  let cancel = ui.textButton("ren-cancel", rect(W - 224, 136, 100, 28), "Cancel")
+  let ok = ui.textButton("ren-ok", rect(W - 116, 136, 100, 28), "Save", primary = true)
   ui.drawTooltip()
   a.renSk.endUi()
   ui.endFrame()
@@ -6060,8 +6122,8 @@ proc renderRename(a: App, shot: string) =
   a.endDialogDraw(w, a.renSk, size)
   if ok or enter:
     a.renameBookmark(a.renPath, a.renTime, a.renText.strip)
-    a.closeRename()
-  elif esc:
+    a.closeRename(keep = true)
+  elif esc or cancel:
     a.closeRename()
 
 proc renderEmbed(a: App, shot: string) =

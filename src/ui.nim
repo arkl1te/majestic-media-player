@@ -762,3 +762,14 @@ proc fmtTime*(t: float, millis = false, dur = -1.0): string =
     if dur > 0 and dur < 3600 and s < 3600: &"{s div 60:02}:{s mod 60:02}"
     else: &"{s div 3600:02}:{(s mod 3600) div 60:02}:{s mod 60:02}"
   if millis: result.add &".{ms mod 1000:03}"
+
+proc parseTime*(s: string): float =
+  ## The other way from fmtTime: "SS", "MM:SS" or "HH:MM:SS", each with an
+  ## optional fraction on the seconds. Raises ValueError on anything else.
+  let parts = s.strip.split(':')
+  if parts.len > 3: raise newException(ValueError, "too many fields: " & s)
+  for i, f in parts:
+    let v = f.strip.parseFloat
+    if not (v >= 0 and v < Inf) or (i < parts.high and v != floor(v)):
+      raise newException(ValueError, "bad field: " & f)
+    result = result * 60 + v
