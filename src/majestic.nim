@@ -3879,7 +3879,12 @@ proc recordEnd(a: App) =
   let url = a.recUrl
   a.recUrl = ""
   if a.player.path == url: a.player.stopDump()
-  if a.rec.stop - a.rec.start < 1:
+  # A dump that failed (mpv couldn't write a track) leaves a file that would
+  # play without it, if at all: the link streams again next time instead.
+  if a.player.dumpFailed or a.rec.stop - a.rec.start < 1:
+    if a.player.dumpFailed and url in a.saved:  # written now and then (recordStep)
+      a.entry(url).segs.keepItIf(it.file != a.rec.file)
+      a.saved.save()
     try: removeFile(a.rec.file)
     except OSError: discard
     return

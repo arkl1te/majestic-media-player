@@ -40,6 +40,7 @@ type
     fullDuration*: float      ## and the link's length, shown as the duration
     beyond*: float = -1       ## a seek asked for past the saved part
     dumping*: bool            ## writing what it streams to a file (dumpFrom)
+    dumpFailed*: bool         ## that ended in an error (its file is no good)
     dumpId: uint64
     loaded*: bool             ## a file is open
     opening*: bool            ## a file is being opened (links take a while)
@@ -194,7 +195,10 @@ proc useYtdlp*(p: Player, path: string) =
   ## The hook looks for yt-dlp once, on the first link, and keeps what it
   ## found (nothing included), so each path gets a hook of its own, loaded
   ## once there is a yt-dlp to find (setting ytdl later loads none).
-  p.h.setProp("script-opts", "ytdl_hook-ytdl_path=" & path)
+  # all_formats (the hook's default in newer mpv) opens each format lazily,
+  # its video track without a codec until then: dump-cache can't write
+  # that, so a saved link would come back without its picture.
+  p.h.setProp("script-opts", "ytdl_hook-ytdl_path=" & path & ",ytdl_hook-all_formats=no")
   p.h.command("load-script", "@ytdl_hook.lua")
 
 proc newLoopSound*(volume: float): Player =
@@ -397,7 +401,9 @@ proc pollEvents*(p: Player): bool =
         p.opening = false
     of evPlaybackRestart: inc p.restarts
     of evCommandReply:
-      if ev.replyUserdata == DumpReply + p.dumpId: p.dumping = false
+      if ev.replyUserdata == DumpReply + p.dumpId:
+        p.dumping = false
+        p.dumpFailed = ev.error < 0
       elif ev.replyUserdata == ExpandReply and ev.error >= 0:
         let n = cast[ptr MpvNode](ev.data)
         if n.format == fmtString: p.expanded.add $n.u.str
@@ -572,6 +578,7 @@ proc dumpFrom*(p: Player, start: float, file: string) =
   ## all it reads after, until stopDump, an error or another file.
   inc p.dumpId
   p.dumping = true
+  p.dumpFailed = false
   let args = ["dump-cache", formatFloat(start, ffDecimal, 6), "no", file]
   var cargs: array[5, cstring]
   for i, a in args: cargs[i] = a.cstring
