@@ -11,7 +11,12 @@ from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 const
   AppName = "Majestic Media Player"
   AppVersion = staticRead("../VERSION").strip  # single source of truth: /VERSION
-  FontData = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
+  # Bytes, not a string: MSVC refuses a C string literal past 64 KB.
+  FontData = block:
+    const s = staticRead("../assets/fonts/IBMPlexSans-Regular.ttf")
+    var bytes: array[s.len, byte]
+    for i, c in s: bytes[i] = byte(c)
+    bytes
   MinWindow = ivec2(480, 270)
   MinCompactWindow = ivec2(16, 16)  ## pixels, not UI units: compact mode shrinks all the way
   OptionsSize = ivec2(912, 684)
@@ -288,6 +293,7 @@ type
                               ## whose cookies yt-dlp signs in with (cookieBrowsers)
     ytCookieTried: seq[string]  ## the browsers tried on the link being opened
     streamArgs: tuple[url: string, start: float, opts: string]
+    streamPos: float          ## where the link's stream last played, to go on from
                               ## the link last streamed, to try again with
     stopOnLoad: bool          ## Stop, once the link loads (going online stopped)
     saved: SaveIndex          ## links kept on disk as they streamed (websave)
@@ -412,19 +418,25 @@ proc alt(w: Window): bool = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt
 
 proc updateOsdApart(a: App)
 
-proc osd(a: App, msg: string) =
+const OsdError = 8.0  ## seconds a failure stays up: time to read it, or screenshot it
+
+proc ownOsd(a: App): bool =
+  ## mpv draws the OSD into the picture, which a 360° view would warp onto
+  ## the sphere (out of sight), and without one (audio, a link that didn't
+  ## open) there's nothing to draw it in: the app shows the message instead.
+  a.player.isSpherical or not a.player.hasVideo
+
+proc osd(a: App, msg: string, secs = 1.5) =
   a.updateOsdApart()  # the transform may have just changed
-  # mpv draws the OSD into the picture, which a 360° view would warp onto
-  # the sphere (out of sight): show the message over the frame instead.
-  if a.player.isSpherical:
+  if a.ownOsd:
     if a.cfg.showOsd:
       a.osdMsg = msg
-      a.osdUntil = now() + 1.5
+      a.osdUntil = now() + secs
       a.dirtyUntil = max(a.dirtyUntil, a.osdUntil + 0.1)
   elif a.osdApart:
-    a.osdLayer.h.commandAsync("show-text", msg, "1500")
+    a.osdLayer.h.commandAsync("show-text", msg, $int(secs * 1000))
   else:
-    a.player.osd(msg)
+    a.player.osd(msg, secs)
 
 proc fileTitle(path: string): string = path.extractFilename
 
@@ -869,6 +881,7 @@ proc streamLink(a: App, url: string, start: float, opts: string) =
   ## Streams a link (mpv's yt-dlp hook), noting how, to try again should it fail.
   a.ytWatch = true
   a.streamArgs = (url, start, opts)
+  a.streamPos = start
   a.player.load(url, start, false, a.withRaw(url, opts))
 
 proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float]) =
@@ -3493,7 +3506,7 @@ proc ytGiveUp(a: App) =
   else:
     a.ytError = "couldn't stream it" &
       (if p.loadError.len > 0: " (" & p.loadError & ")" else: "")
-  a.osd("Couldn't open the link: " & a.ytError)
+  a.osd("Couldn't open the link: " & a.ytError, OsdError)
 
 proc closeDialogs(a: App) =
   ## Closes whichever dialog or overlay is up (as Cancel would).
@@ -3571,6 +3584,8 @@ proc ytFailed(a: App, url: string) =
     a.ytOpen(url, HookStart)
   elif a.ytTries < StreamTries:
     inc a.ytTries
+    a.osd("Couldn't stream the link" & (if a.player.loadError.len > 0:
+      " (" & a.player.loadError & ")" else: "") & ", trying again...", OsdError)
     a.ytOpen(url)
   else:
     (a.ytCurrent, a.ytLatest) = ("", "")
@@ -3630,7 +3645,7 @@ proc pollYtList(a: App) =
   a.ytList = nil
   if j.code != 0 and a.ytListUsed == 0:
     a.ytListed.excl link  # to try again
-    a.osd("Couldn't load the playlist: " & errorReason(j.errorText))
+    a.osd("Couldn't load the playlist: " & errorReason(j.errorText), OsdError)
   elif a.ytListUsed > 1 or id.len == 0:
     a.osd(&"Playlist: {a.ytListUsed} videos")
 
@@ -3644,6 +3659,16 @@ proc pollYtdlp(a: App) =
   if a.ytWatch and not p.opening and (p.loaded or p.loadError.len > 0):
     a.ytWatch = false
     if p.loadError.len > 0: a.ytFailed(p.path)
+  # A stream YouTube turned down (403) once open: mpv skips to the end, which
+  # is a failed link, not the video over (no After playback). It goes on
+  # from where it last played.
+  if p.loaded and p.source.len == 0 and p.path.isWebLink and p.path == a.streamArgs.url:
+    if not p.eofReached: a.streamPos = p.timePos
+    elif not p.eofHandled and p.streamError.len > 0:
+      p.eofHandled = true
+      p.loadError = p.streamError
+      a.streamArgs.start = a.streamPos
+      a.ytFailed(p.path)
   # A link opened (streamed or from disk): its automatic captions join.
   let link = a.ytCurrentLink
   if p.justLoaded and link.isWebLink:
@@ -6074,9 +6099,9 @@ proc idleScreen(a: App, area: Rect) =
     ui.icon("crown96", c - vec2(0, 24), colAccentDim)
     ui.textIn(AppName, rect(area.x, c.y + 34, area.w, 30), colTextDim, FontTitle, h = CenterAlign)
 
-proc sphereOsd(a: App, area: Rect) =
-  ## The OSD message of a 360° view (see osd), top left of the frame.
-  if not a.player.isSpherical or now() >= a.osdUntil or a.osdMsg.len == 0: return
+proc ownOsdMsg(a: App, area: Rect) =
+  ## The OSD message mpv can't show (ownOsd), top left of the frame.
+  if not a.ownOsd or now() >= a.osdUntil or a.osdMsg.len == 0: return
   let ui = a.ui
   let sz = ui.textSize(a.osdMsg, FontTitle)
   let r = rect(area.x + 16, area.y + 16, sz.x + 20, sz.y + 10)
@@ -6885,7 +6910,7 @@ proc frame(a: App) =
   glClear(GL_COLOR_BUFFER_BIT)
   a.drawVideo(a.px(videoArea), fb)
   a.idleScreen(videoArea)
-  a.sphereOsd(videoArea)
+  a.ownOsdMsg(videoArea)
 
   # Compact mode: dragging the window's outer pixels resizes it.
   let edge = if a.overlay == ovNone and not a.menus.isOpen and a.rectEdit == nil and

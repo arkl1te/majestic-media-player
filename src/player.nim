@@ -71,6 +71,8 @@ type
     hookError*: string        ## yt-dlp's error opening the link (mpv's hook),
                               ## "ERROR: ..."; mpv's own (loadError) is then
                               ## about the web page it tried in its place
+    streamError*: string      ## why a link's stream was cut short ("HTTP error
+                              ## 403"): mpv then skips to the end
     sphere*: SphereInfo       ## 360° metadata of the open file
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
@@ -406,6 +408,9 @@ proc pollEvents*(p: Player): bool =
       if $m.prefix == "ytdl_hook":
         for line in ($m.text).splitLines:
           if line.startsWith("ERROR:"): p.hookError = line.strip
+      elif p.streamError.len == 0 and $m.level == "error" and
+           ($m.prefix in ["curl", "timeline"] or "HTTP error" in $m.text):
+        p.streamError = ($m.text).strip
       if logAll: stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
@@ -430,6 +435,7 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   p.duration = fullDuration
   p.loadError = ""
   p.hookError = ""
+  p.streamError = ""
   p.opening = true
   p.buffered.setLen 0
   p.cacheAhead = -1
@@ -581,8 +587,8 @@ proc frameStep*(p: Player, forward: bool) =
   inc p.jumps
   p.h.commandAsync(if forward: "frame-step" else: "frame-back-step")
 
-proc osd*(p: Player, msg: string) =
-  p.h.commandAsync("show-text", msg, "1500")
+proc osd*(p: Player, msg: string, secs = 1.5) =
+  p.h.commandAsync("show-text", msg, $int(secs * 1000))
 
 proc expandText*(p: Player, text: string) =
   ## Expands mpv ${property} references as the OSD would show them; the
