@@ -53,7 +53,7 @@
             * Full size (radio)
             * Double size (radio)
             * Stretch to window (radio)
-            * Touch window from inside (radio, default)
+            * Fit (radio, default)
             * Aspect ratio
                 * Original (default)
                 * 4:3

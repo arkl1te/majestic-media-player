@@ -5,7 +5,7 @@ import jsony, crunchy/sha256
 
 type
   FrameMode* = enum
-    fmHalf, fmFull, fmDouble, fmStretch, fmTouchInside
+    fmHalf, fmFull, fmDouble, fmStretch, fmFit
 
   OnTopMode* = enum
     otDefault, otAlways, otWhilePlaying, otWhilePlayingVideo
@@ -46,7 +46,7 @@ type
     seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
     showOsd*: bool = true
-    frameMode*: FrameMode = fmTouchInside
+    frameMode*: FrameMode = fmFit
     aspectOverride*: string = ""   # "" = original, else "4:3", "16:9", ...
     preserveAspect*: bool = true
     onTop*: OnTopMode = otDefault
@@ -186,6 +186,10 @@ proc screenshotFolder*(c: Config): string =
 proc newHook*(c: var Config) =
   c = Config()
 
+proc enumHook*(s: string, v: var FrameMode) =
+  ## By name, taking the one older versions wrote for Fit too.
+  v = if s == "fmTouchInside": fmFit else: parseEnum[FrameMode](s, fmFit)
+
 proc configDir*(): string = getConfigDir() / "majestic-media-player"
 
 proc configPath(): string = configDir() / "config.json"
@@ -220,6 +224,47 @@ proc addRecent*(c: var Config, path: string) =
   c.recentFiles.insert(path, 0)
   if c.recentFiles.len > MaxRecent:
     c.recentFiles.setLen(MaxRecent)
+
+# --- state brought back after restarting into an update ----------------------
+
+type
+  ResumeState* = object
+    ## What the player was doing as it restarted into an update (Help >
+    ## Check for Updates), whatever the Remember options say.
+    playlist*: seq[string]
+    titles*: Table[string, string]  # its links' titles
+    index*: int = -1               # the entry open, else -1
+    selected*: int = -1            # the entry selected
+    time*: float
+    paused*, stopped*: bool
+    speed*: float = 1
+    tracks*: seq[tuple[kind, file: string]]  # tracks added from files
+    aid*, sid*, vid*: int          # selected tracks, 0 for none
+    loopA*, loopB*: float
+    hasLoopA*, hasLoopB*, abLoop*: bool
+    windowX*, windowY*, windowW*, windowH*: int  # the frame unmaximized, windowed
+    maximized*, fullscreen*: bool
+    transform*: SavedTransform
+
+proc resumePath(): string = configDir() / "resume.json"
+
+proc save*(r: ResumeState) =
+  try:
+    createDir(configDir())
+    writeAtomic(resumePath(), r.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", resumePath(), ": ", e.msg
+
+proc takeResume*(): tuple[ok: bool, state: ResumeState] =
+  ## The state saved for this start, once: the file is removed.
+  let path = resumePath()
+  if not fileExists(path): return
+  try:
+    result = (true, readFile(path).fromJson(ResumeState))
+  except CatchableError as e:
+    stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+  try: removeFile(path)
+  except OSError: discard
 
 # --- remembered playback positions -------------------------------------------
 

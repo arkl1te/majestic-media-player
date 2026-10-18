@@ -5,7 +5,7 @@ import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, alg
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix
+  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -19,6 +19,7 @@ const
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
+  UpdateSize = ivec2(500, 260)
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
@@ -34,10 +35,13 @@ const
 type
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync,
-    ovYtdlp, ovEmbed
+    ovYtdlp, ovEmbed, ovUpdate
 
   YtMode = enum
     ymInstall, ymUpdate, ymBusy, ymFailed  ## what the yt-dlp window asks or shows
+
+  UpdateMode = enum
+    umChecking, umLatest, umAsk, umBusy, umFailed  ## what the Check for Updates window asks or shows
 
   EmbedMode = enum
     emAsk, emInstall, emBusy, emFailed  ## what the Embed As MKV Chapters window asks or shows
@@ -213,6 +217,15 @@ type
     embTmp: string            ## the chapters file mkvpropedit reads
     embClear: bool            ## clear the file's bookmarks once it's done
     embMode: EmbedMode
+    upJob: UpJob              ## Check for Updates at work: the check, then getting the release
+    upMode: UpdateMode
+    upMsg: string             ## the Check for Updates window's text when it failed
+    upWin: Window             ## the Check for Updates window, created on first use
+    upSk: Silky
+    upUi: Ui
+    upRestart: bool           ## restarting into the update: the state is saved for it
+    resume: ResumeState       ## the state from before restarting into an update,
+    resuming: bool            ## brought back as its file opens
     embMsg: string            ## its text while installing or failed
     mkvJob: MkvJob            ## MKVToolNix being installed
     cmdDlg: CmdDialog         ## Commands window, its window created on first use
@@ -501,8 +514,10 @@ proc updateTitle(a: App) =
     a.window.title = t
 
 proc updateAspectHints(a: App) =
-  let enforce = not a.fullscreen and a.cfg.preserveAspect and
-    a.cfg.frameMode == fmTouchInside and a.player.hasVideo and not a.player.stopped
+  # Not on Windows, to resize freely as on KWin, which ignores the hint: Fit
+  # letterboxes the video in whatever shape the window is given.
+  let enforce = not defined(windows) and not a.fullscreen and a.cfg.preserveAspect and
+    a.cfg.frameMode == fmFit and a.player.hasVideo and not a.player.stopped
   let aspect = if enforce: a.videoAspect else: 0.0
   let chrome = a.chromeSize
   let key = &"{aspect:.4f}/{chrome.x}/{chrome.y}"
@@ -988,6 +1003,41 @@ proc openPaths(a: App, paths: seq[string]) =
   a.playlist = files
   a.plScroll = 0
   a.playIndex(0)
+
+proc saveResume(a: App) =
+  ## What the player is doing, for it to restart into an update with.
+  let p = a.player
+  var r = ResumeState(playlist: a.playlist, index: (if p.loaded: a.plIndex else: -1),
+    selected: a.plSelected, time: p.timePos, paused: p.paused, stopped: p.stopped,
+    speed: p.speed, aid: p.selectedTrack("audio"), sid: p.selectedTrack("sub"),
+    vid: p.selectedTrack("video"), loopA: a.loopA, loopB: a.loopB,
+    hasLoopA: a.hasLoopA, hasLoopB: a.hasLoopB, abLoop: a.abLoop,
+    windowX: a.cfg.windowX, windowY: a.cfg.windowY, windowW: a.cfg.windowW,
+    windowH: a.cfg.windowH, maximized: a.window.maximized, fullscreen: a.fullscreen,
+    transform: a.cfg.transform)
+  for f in a.playlist:
+    if f in a.linkTitles: r.titles[f] = a.linkTitles[f]
+  # A link's captions come back by themselves (addCaptions).
+  for t in p.tracks:
+    if t.external and t.kind in ["sub", "audio"] and not t.file.contains("://"):
+      r.tracks.add (t.kind, t.file)
+  r.save()
+
+proc resumeState(a: App, r: ResumeState) =
+  ## The playlist and its file as they were before restarting into an
+  ## update: where it was, paused or stopped as it was (its tracks and loop
+  ## once it opens).
+  a.playlist = r.playlist.filterIt(fileExists(it) or it.contains("://"))
+  a.linkTitles = r.titles
+  if r.fullscreen: a.setFullscreen(true)
+  let at = if r.index in 0 ..< r.playlist.len: a.playlist.find(r.playlist[r.index]) else: -1
+  if at < 0:
+    if r.selected in 0 ..< r.playlist.len: a.plSelected = a.playlist.find(r.playlist[r.selected])
+    return
+  a.resume = r
+  a.resuming = true
+  a.playIndex(at, r.time)
+  if r.paused or r.stopped: a.player.h.setProp("pause", true)
 
 proc closeFile(a: App) =
   if a.editLocked: return
@@ -2984,14 +3034,15 @@ proc applyUiScale(a: App) =
   if s == a.sk.uiScale: return
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
     sk.atlasScale = s
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
-                    (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize)]:
+                    (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize),
+                    (a.upWin, UpdateSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
@@ -3036,6 +3087,7 @@ proc closeRename(a: App, keep = false) =
 const MatroskaExts = [".mkv", ".mka", ".mk3d", ".webm"]
 
 proc closeDialogs(a: App)  # below
+proc closeUpdate(a: App)  # Check for Updates, below
 proc shortPath(path: string): string  # yt-dlp, below
 
 proc canEmbed(a: App): bool =
@@ -3455,6 +3507,7 @@ proc closeDialogs(a: App) =
     a.ytUi.focusId = ""
     a.ytWin.visible = false
   of ovEmbed: a.closeEmbed()
+  of ovUpdate: a.closeUpdate()
   else: discard
   a.overlay = ovNone
 
@@ -3637,6 +3690,94 @@ proc pollYtdlp(a: App) =
       a.ytOpen(a.ytUrl, HookStart)
     else:
       a.showYtdlp(ymFailed, "yt-dlp couldn't be installed: " & j.errorText)
+
+# --- Check for Updates -------------------------------------------------------
+# The latest release, looked up on GitHub; once agreed to, it's got ready in
+# the background (updater) and installed, and the player restarts into it,
+# its state brought back (ResumeState).
+
+proc showUpdate(a: App, mode: UpdateMode, msg = "") =
+  a.menus.close()
+  if a.overlay notin {ovNone, ovUpdate}: a.closeDialogs()
+  if a.upWin == nil:
+    (a.upWin, a.upSk, a.upUi) = a.newDialogWindow("Check for Updates", UpdateSize)
+  a.upMode = mode
+  a.upMsg = msg
+  if a.overlay != ovUpdate:
+    a.upUi.focusId = ""
+    a.showDialog(a.upWin, UpdateSize)
+    a.overlay = ovUpdate
+
+proc closeUpdate(a: App) =
+  ## Hides the window; a check still looking is given up, an update going
+  ## on carries on (the status bar shows it).
+  if a.upJob.running and a.upJob.stage == upLatest:
+    a.upJob.stop()
+    a.upJob = nil
+  a.upUi.focusId = ""
+  if a.overlay == ovUpdate: a.overlay = ovNone
+  if a.upWin.visible:
+    a.upWin.visible = false
+    a.window.activate()
+
+proc checkForUpdates(a: App) =
+  ## Help > Check for Updates: an update going on shows how it goes.
+  if a.upJob.running and a.upJob.stage != upLatest:
+    a.showUpdate(umBusy)
+    return
+  if not a.upJob.running: a.upJob = checkForUpdate()
+  a.showUpdate(umChecking)
+
+proc upAnswer(a: App, ok: bool) =
+  ## The Check for Updates window's buttons: get the update; else cancel
+  ## (stopping one going on), close or hide.
+  if ok and a.upMode == umAsk:
+    a.upJob.download()
+    if a.upJob.running: a.showUpdate(umBusy)
+    else: a.showUpdate(umFailed, "The update couldn't be got: " & a.upJob.errorText)
+  elif not ok and a.upMode == umBusy and a.upJob.running:
+    a.upJob.stop()
+    a.upJob = nil
+    a.closeUpdate()
+    a.osd("Update cancelled")
+  else: a.closeUpdate()
+
+proc upStatus(a: App): string =
+  ## The update being got, for the status bar; "" when none is.
+  let j = a.upJob
+  if not j.running or j.stage == upLatest: return
+  case j.stage
+  of upLatest: discard
+  of upDownload:
+    result = "Downloading " & AppName & " " & j.version
+    if j.progress >= 0: result.add &" {int(j.progress)}%"
+  of upExtract: result = "Unpacking " & AppName & " " & j.version
+  of upBuild: result = "Building " & AppName & " " & j.version
+  of upInstall: result = "Installing " & AppName & " " & j.version
+
+proc pollUpdate(a: App) =
+  ## The check's answer; once the update is in place, the player restarts
+  ## into it.
+  let j = a.upJob
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  if j.running: return
+  if j.code != 0:
+    a.upJob = nil
+    if j.code == 130: return  # cancelled
+    let what = if j.stage == upLatest: "The latest release couldn't be looked up: "
+               else: "The update couldn't be installed: "
+    a.showUpdate(umFailed, what & j.errorText)
+  elif j.stage == upLatest:
+    if newer(j.version, AppVersion): a.showUpdate(umAsk)
+    else:
+      a.upJob = nil
+      if a.overlay == ovUpdate: a.showUpdate(umLatest)
+  else:
+    a.upJob = nil
+    a.osd("Restarting into " & AppName & " " & j.version & "...")
+    a.upRestart = true
+    a.window.closeRequested = true
 
 # --- online videos kept on disk ----------------------------------------------
 # A link streaming is saved as it plays, a file for each stretch read without
@@ -3985,7 +4126,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   let frame = view.sub("Video Frame")
   for (label, mode) in [("Half Size", fmHalf), ("Normal Size", fmFull), ("Double Size", fmDouble),
-                        ("Stretch To Window", fmStretch), ("Touch Window From Inside", fmTouchInside)]:
+                        ("Stretch To Window", fmStretch), ("Fit", fmFit)]:
     frame.radio(label, "", cfg.frameMode == mode, action = bindAct(proc (m: FrameMode) =
       a.cfg.frameMode = m; a.hintsKey = "", mode))
   frame.sep()
@@ -4138,6 +4279,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   # Help
   let help = root.sub("Help")
   help.item("Keyboard Shortcuts", k(kaShortcuts), action = proc () = a.showOverlay(ovShortcuts))
+  help.item("Check for Updates...", action = proc () = a.checkForUpdates())
+  help.sep()
   help.item("About " & AppName, action = proc () = a.showOverlay(ovAbout))
 
   # Right-click menu, built from the bar's nodes.
@@ -4634,7 +4777,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp, ovEmbed}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp, ovEmbed, ovUpdate}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -4672,7 +4815,7 @@ proc videoGeometry(a: App, area: Rect, xf: VideoTransform): tuple[center, size: 
     of fmFull: nat
     of fmDouble: nat * 2
     of fmStretch: area.wh
-    of fmTouchInside:
+    of fmFit:
       if a.cfg.preserveAspect and nat.x > 0 and nat.y > 0:
         nat * min(area.w / nat.x, area.h / nat.y)
       else: area.wh
@@ -5519,7 +5662,9 @@ proc status(a: App, r: Rect) =
     elif p.hasRealVideo: "film16"
     else: "music16"
   ui.icon(fileIcon, vec2(r.x + 16, r.y + r.h / 2), if p.loaded: colAccent else: colTextDim)
-  let yt = if a.ytStatus.len > 0: a.ytStatus else: a.mkvStatus
+  let yt = if a.ytStatus.len > 0: a.ytStatus
+           elif a.mkvStatus.len > 0: a.mkvStatus
+           else: a.upStatus
   let state =
     if yt.len > 0: yt & "..."
     elif p.opening: "Opening..."
@@ -6288,6 +6433,89 @@ proc renderYtdlp(a: App, shot: string) =
   if (ok or enter) and a.ytMode in {ymInstall, ymUpdate}: a.ytAnswer(true)
   elif cancel or esc or (enter and a.ytMode == ymFailed): a.ytAnswer(false)
 
+proc renderUpdate(a: App, shot: string) =
+  ## Draws the Check for Updates window: the check, an update to agree to
+  ## (with its release notes), or getting it.
+  if a.overlay != ovUpdate: return
+  let w = a.upWin
+  let ui = a.upUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeUpdate()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+  let esc = w.buttonPressed[KeyEscape]
+  if not a.beginDialogDraw(w, a.upSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.upSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = ui.size.x
+  let H = ui.size.y
+  let j = a.upJob
+  let version = if j != nil: j.version else: ""
+  let text = case a.upMode
+    of umChecking: "Looking up the latest release..."
+    of umLatest: &"You have the latest version: {AppName} {AppVersion}."
+    of umAsk:
+      &"{AppName} {version} is out (you have {AppVersion}). Get it now? " &
+        (when defined(windows): "" else: "It's built from its source, which takes a minute or two. ") &
+        "Once it's ready the player restarts into it, playing what it was."
+    of umBusy:
+      if not j.running: ""
+      else:
+        case j.stage
+        of upLatest: "Looking up the latest release..."
+        of upDownload: &"Downloading {AppName} {version}..."
+        of upExtract: &"Unpacking {AppName} {version}..."
+        of upBuild: &"Building {AppName} {version}... " & j.lastLine
+        of upInstall: &"Installing {AppName} {version}..."
+    of umFailed: a.upMsg
+  var y = 14'f32
+  for line in ui.wrapText(text, W - 32, 4):
+    ui.textIn(line, rect(16, y, W - 32, 22), colText)
+    y += 22
+  if a.upMode == umAsk and j.notes.len > 0:
+    # Its release notes, as far as they fit: markdown's marks left out.
+    y += 8
+    for para in j.notes.splitLines:
+      let l = para.strip(chars = {'#', ' ', '\t'})
+      if l.len == 0: continue
+      let room = int((H - 56 - y) / 20)
+      if room <= 0: break
+      for line in ui.wrapText(l, W - 32, room, FontSmall):
+        ui.textIn(line, rect(16, y, W - 32, 20), colTextDim, FontSmall)
+        y += 20
+  if a.upMode == umBusy and j.running:
+    let r = rect(16, H - 56, W - 32, 6)
+    ui.rect(r, colTrack)
+    if j.stage == upDownload and j.progress >= 0:
+      ui.rect(rect(r.x, r.y, r.w * clamp(j.progress / 100, 0, 1), r.h), colAccent)
+  let bw = 100'f32
+  let br = rect(W - 16 - bw, H - 44, bw, 28)
+  var ok, cancel = false
+  case a.upMode
+  of umAsk:
+    ok = ui.textButton("up-ok", br, "Update", primary = true)
+    cancel = ui.textButton("up-cancel", rect(br.x - bw - 8, br.y, bw, br.h), "Not now")
+  of umChecking: cancel = ui.textButton("up-cancel", br, "Cancel")
+  of umBusy:
+    ok = ui.textButton("up-hide", br, "Hide", primary = true)
+    cancel = ui.textButton("up-cancel", rect(br.x - bw - 8, br.y, bw, br.h), "Cancel")
+  of umLatest, umFailed: ok = ui.textButton("up-close", br, "Close", primary = true)
+  ui.drawTooltip()
+  a.upSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-update.png")
+  a.endDialogDraw(w, a.upSk, size)
+  if a.upMode == umAsk and (ok or enter): a.upAnswer(true)
+  elif cancel or (esc and a.upMode != umBusy): a.upAnswer(false)
+  elif ok or esc or enter: a.closeUpdate()
+
 proc renderCommands(a: App, shot: string) =
   ## Draws the Commands window window and carries out its buttons.
   if a.overlay != ovCommands: return
@@ -6785,6 +7013,8 @@ proc frame(a: App) =
       if ui.pressed(): a.ytWin.activate()
     of ovEmbed:
       if ui.pressed(): a.embWin.activate()
+    of ovUpdate:
+      if ui.pressed(): a.upWin.activate()
     of ovProperties: a.propertiesOverlay()
     of ovShortcuts: a.shortcutsOverlay()
     of ovAbout: a.aboutOverlay()
@@ -6870,6 +7100,7 @@ proc frame(a: App) =
   a.renderSyncProps(shot)
   a.renderYtdlp(shot)
   a.renderEmbed(shot)
+  a.renderUpdate(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -6883,6 +7114,7 @@ proc keyUi(a: App): Ui =
   of ovSync: a.syncUi
   of ovYtdlp: a.ytUi
   of ovEmbed: a.embUi
+  of ovUpdate: a.upUi
   else: a.ui
 
 proc runScriptStep(a: App, st: ScriptStep) =
@@ -7008,6 +7240,18 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "embed":  # keep | clear | install | 0: the Embed As MKV Chapters window's buttons
     if arg == "show": a.showEmbed()
     else: a.embAnswer(arg != "0", arg == "clear")
+  of "update": a.checkForUpdates()  # Help > Check for Updates
+  of "updanswer": a.upAnswer(arg == "1")  # 1 | 0: its Update or Not now/Cancel/Close
+  of "updump":
+    let p = a.player
+    stderr.writeLine "update version=", AppVersion, " mode=", a.upMode, " overlay=", a.overlay,
+      " status=", a.upStatus, " latest=", (if a.upJob != nil: a.upJob.version else: ""),
+      " msg=", a.upMsg, " playlist=", a.playlist.len, " index=", a.plIndex,
+      " selected=", a.plSelected, " path=", p.path, " time=", p.timePos.formatFloat(ffDecimal, 1),
+      " paused=", p.paused, " stopped=", p.stopped, " speed=", p.speed,
+      " aid=", p.selectedTrack("audio"), " sid=", p.selectedTrack("sub"),
+      " loop=", a.hasLoopA, "/", a.hasLoopB, "/", a.abLoop, " ", a.loopA, "-", a.loopB,
+      " fs=", a.fullscreen, " zoom=", a.xf.zoom, " size=", a.window.size
   of "embdump":
     stderr.writeLine "embed mode=", a.embMode, " overlay=", a.overlay, " msg=", a.embMsg,
       " status=", a.mkvStatus, " exe=", findMkvpropedit(a.cfg.mkvpropedit), " marks=", a.fileBookmarks.len,
@@ -7043,7 +7287,12 @@ proc main() =
   a.cfg = loadConfig()
   a.script = loadScript()
   randomize()
-  let files = commandLineParams().mapIt(if it.contains("://"): it else: it.absolutePath)
+  let params = commandLineParams()
+  let files = params.filterIt(it != ResumeArg).mapIt(
+    if it.contains("://"): it else: it.absolutePath)
+  # Restarted into an update: what it was doing comes back.
+  let (resumed, rs) = if ResumeArg in params: takeResume() else: (false, ResumeState())
+  removeOld()
   # Debug scripts must not hand their files to (or take files from) a real
   # player the user has open.
   let scripted = a.script.steps.len > 0
@@ -7090,6 +7339,14 @@ proc main() =
     if p.x + 40 >= m.pos.x and p.y + 40 >= m.pos.y and
        p.x + 40 < m.pos.x + m.size.x and p.y + 40 < m.pos.y + m.size.y:
       a.window.moveFrame(p)
+  if resumed:
+    if rs.windowW >= minSize.x and rs.windowH >= minSize.y:
+      a.window.size = ivec2(rs.windowW.int32, rs.windowH.int32)
+      a.window.moveFrame(ivec2(rs.windowX.int32, rs.windowY.int32))
+    if rs.maximized: a.window.maximized = true
+    let t = rs.transform
+    a.xf = VideoTransform(pan: vec2(t.panX, t.panY), rotation: t.rotation,
+      zoom: t.zoom, scaleX: t.scaleX, scaleY: t.scaleY)
 
   let scale = a.uiScale
   let (img, atlas) = buildAtlas(scale)
@@ -7168,7 +7425,8 @@ proc main() =
     a.focusLostAt = if a.window.focused: 0.0 else: now()
     a.dirtyUntil = now() + 0.5
 
-  if files.len > 0: a.openPaths(files)
+  if resumed: a.resumeState(rs)
+  elif files.len > 0: a.openPaths(files)
   elif c.rememberPlaylist:
     # Restored without playing; Play starts the entry that was current.
     a.playlist = c.playlist.filterIt(fileExists(it) or it.contains("://"))
@@ -7193,6 +7451,7 @@ proc main() =
     if a.syncWin != nil: a.syncWin.runeInputEnabled = true
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
     if a.embWin != nil: a.embWin.runeInputEnabled = true
+    if a.upWin != nil: a.upWin.runeInputEnabled = true
 
   proc step(): bool =
     ## One pass of the main loop after reading events; false when there was
@@ -7232,6 +7491,7 @@ proc main() =
     a.pollWebSave()
     a.pollSave()
     a.pollEmbed()
+    a.pollUpdate()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -7244,6 +7504,20 @@ proc main() =
         if t.file notin have: a.player.h.command(t.kind & "-add", t.file, "auto")
       for (prop, id) in a.reopenSel:
         a.player.h.setProp(prop, if id == 0: "no" else: $id)
+    if a.player.justLoaded and a.resuming:
+      # Restarted into an update: the file as it was left.
+      a.resuming = false
+      let r = a.resume
+      let have = a.player.externalFiles  # found by mpv itself (sub-auto...)
+      for t in r.tracks:
+        if t.file notin have: a.player.h.command(t.kind & "-add", t.file, "auto")
+      for (prop, id) in [("aid", r.aid), ("sid", r.sid), ("vid", r.vid)]:
+        a.player.h.setProp(prop, if id == 0: "no" else: $id)
+      if r.speed != 1: a.player.h.setProp("speed", r.speed)
+      if r.stopped: a.player.stop()
+      (a.loopA, a.hasLoopA, a.loopB, a.hasLoopB) = (r.loopA, r.hasLoopA, r.loopB, r.hasLoopB)
+      a.abLoop = r.abLoop and a.loopReady
+      a.applyAbLoop()
     if a.player.justLoaded:
       a.player.justLoaded = false
       if a.stopOnLoad:  # gone online at Stop
@@ -7309,7 +7583,8 @@ proc main() =
       stepping = true
       discard step()
       # Handled: the main loop mustn't handle it again once pollEvents returns.
-      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin]:
+      for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
+                a.upWin]:
         if w != nil: w.clearFrameInput()
       enableRunes()
       stepping = false)
@@ -7326,12 +7601,14 @@ proc main() =
   if a.ytCaps.running: a.ytCaps.stop()
   if a.ytSubs.running: a.ytSubs.stop()
   if a.ytList.running: a.ytList.stop()
+  if a.upJob.running: a.upJob.stop()
   a.cancelSave()
   a.recordEnd()  # mpv closes the file as it shuts down
   a.saved.save()
   a.savePosition()
   a.rememberState()
   a.cfg.save()
+  if a.upRestart: a.saveResume()
   a.instance.close()
   a.peers.close()
   for c in a.children: c.close()
@@ -7346,6 +7623,7 @@ proc main() =
   if a.osdLayer != nil:
     mpv_render_context_free(a.osdLayer.render)
     mpv_terminate_destroy(a.osdLayer.h)
+  if a.upRestart: relaunch()
 
 when isMainModule:
   main()

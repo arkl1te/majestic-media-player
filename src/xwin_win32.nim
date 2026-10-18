@@ -53,8 +53,6 @@ type Hook = ref object
   prev: WNDPROC
   aspect: float              ## of the area left after chrome; <= 0: free
   chrome, minSize: IVec2     ## client-area sizes
-  dragging: bool
-  dragOffset: IVec2          ## pointer minus outer top-left, in screen pixels
   frameless: bool            ## undecorated by setDecorated: the hook finds its edges
   cursor: HCURSOR            ## shown instead of Windy's cursor; 0: Windy's
 
@@ -95,6 +93,8 @@ const
   HtBottomLeft = 16
   HtBottomRight = 17
   ScSize = 0xF000
+  ScDragMove = 0xF012        ## SC_MOVE by the mouse, as from a title bar
+  WmStartMove = UINT(WM_APP + 0x4D4D)  ## see startWindowDrag
   WmNcHitTest = 0x0084'u32
   WmNcLButtonDown = 0x00A1'u32
   SmCxSizeFrame = 32'i32
@@ -308,6 +308,21 @@ proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.std
     result = CallWindowProcW(k.prev, h, msg, wParam, lParam)
     if modalTick != nil: modalTick()
     return
+  of WM_NCCALCSIZE:
+    # Frameless keeps its sizing border (see setDecorated) but gives it no
+    # room: the client area is the whole window, or the work area when
+    # maximized, which the border would otherwise overhang.
+    if k.frameless and wParam != 0:
+      if IsZoomed(h) != 0:
+        var mi: MONITORINFO
+        mi.cbSize = sizeof(MONITORINFO).DWORD
+        if GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), mi.addr) != 0:
+          cast[ptr RECT](lParam)[] = mi.rcWork
+      return 0
+  of WM_NCACTIVATE:
+    # Nor paint it when the window is activated or deactivated.
+    if k.frameless:
+      return CallWindowProcW(k.prev, h, msg, wParam, -1)
   of WmNcHitTest:
     let hit = k.edgeAt(int32(cast[int16](lParam and 0xFFFF)),
                        int32(cast[int16]((lParam shr 16) and 0xFFFF)))
@@ -323,26 +338,19 @@ proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.std
     if k.cursor != 0 and (lParam and 0xFFFF) == HTCLIENT:
       discard SetCursor(k.cursor)
       return 1
-  of WM_MOUSEMOVE:
-    if k.dragging:
+  of WmStartMove:
+    # Still held as far as the queue goes: the release, if any, waits behind
+    # this message and ends the loop. Like the X11 move, it never reaches the
+    # app, where a click would toggle playback.
+    if GetKeyState(VK_LBUTTON) < 0 and IsZoomed(h) == 0:
       var p: POINT
       discard GetCursorPos(p.addr)
-      discard SetWindowPos(h, 0, p.x - k.dragOffset.x, p.y - k.dragOffset.y, 0, 0,
-        SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE)
-  of WM_LBUTTONUP:
-    if k.dragging:
-      # Like the X11 move, the release ends the drag and never reaches the
-      # app: a click there would toggle playback.
-      k.dragging = false
       discard ReleaseCapture()
-      privateAccess(Window)
-      k.window.state.buttonDown.excl MouseLeft
-      return 0
-  of WM_CAPTURECHANGED:
-    if k.dragging and cast[HWND](lParam) != h:
-      k.dragging = false
-      privateAccess(Window)
-      k.window.state.buttonDown.excl MouseLeft
+      discard SendMessageW(h, WM_SYSCOMMAND, WPARAM(ScDragMove),
+        LPARAM((p.y and 0xFFFF) shl 16 or (p.x and 0xFFFF)))
+    privateAccess(Window)
+    k.window.state.buttonDown.excl MouseLeft
+    return 0
   else: discard
   CallWindowProcW(k.prev, h, msg, wParam, lParam)
 
@@ -380,17 +388,13 @@ proc clearFrameInput*(window: Window) =
   window.state.perFrame = default(typeof(window.state.perFrame))
 
 proc startWindowDrag*(window: Window) =
-  ## Moves the window with the pointer until the left button comes up. Done
-  ## here rather than by the system's modal move loop, which would stall
-  ## playback and drawing for as long as the drag lasts.
-  let k = hookFor(window.hwnd)
-  if k == nil or window.maximized: return
-  var p: POINT
-  discard GetCursorPos(p.addr)
-  let o = outerRect(window.hwnd)
-  k.dragOffset = ivec2(p.x - o.left, p.y - o.top)
-  k.dragging = true
-  discard SetCapture(window.hwnd)
+  ## Moves the window with the pointer until the left button comes up, by the
+  ## system's move loop, as a title bar drag does: window managers such as
+  ## PowerToys' FancyZones and Aero Snap only see moves made by that loop.
+  ## It starts from pollEvents, which whileModal keeps stepping the app from,
+  ## not from the frame calling this, which would stall it for the drag.
+  if hookFor(window.hwnd) == nil or window.maximized: return
+  discard PostMessageW(window.hwnd, WmStartMove, 0, 0)
 
 type WindowEdge* = enum
   weTopLeft, weTop, weTopRight, weRight, weBottomRight, weBottom, weBottomLeft, weLeft
@@ -411,13 +415,15 @@ proc startWindowResize*(window: Window, edge: WindowEdge) =
 
 proc setDecorated*(window: Window, on: bool) =
   ## Shows or hides the title bar and borders, keeping the content size.
+  ## Hidden, the sizing border stays in the style, out of sight (the hook
+  ## gives it no room): PowerToys' FancyZones, like Snap, only resizes
+  ## windows that have one, and would just move the window into a zone.
   let h = window.hwnd
   let size = window.size
-  const Frame = WS_CAPTION or WS_THICKFRAME
-  let style = GetWindowLongW(h, GWL_STYLE)
+  let style = GetWindowLongW(h, GWL_STYLE) or WS_THICKFRAME
   let k = hookFor(h)
   if k != nil: k.frameless = not on
-  discard SetWindowLongW(h, GWL_STYLE, if on: style or Frame else: style and not Frame)
+  discard SetWindowLongW(h, GWL_STYLE, if on: style or WS_CAPTION else: style and not WS_CAPTION)
   discard SetWindowPos(h, 0, 0, 0, 0, 0, SWP_FRAMECHANGED or SWP_NOMOVE or
     SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE)
   window.size = size
