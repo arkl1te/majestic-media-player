@@ -5,17 +5,22 @@ import opengl, vmath, bumpy
 import mpv
 
 when defined(windows):
-  proc wglGetProcAddress(name: cstring): pointer {.stdcall, importc, dynlib: "opengl32".}
   proc GetProcAddress(m: pointer, name: cstring): pointer {.stdcall, importc, dynlib: "kernel32".}
   proc LoadLibraryA(name: cstring): pointer {.stdcall, importc, dynlib: "kernel32".}
-  var opengl32: pointer
+  # Looked up once the program runs, not as it loads: opengl32.dll may be
+  # Mesa's by then (gpumem).
+  var
+    opengl32: pointer
+    wglGetProcAddress: proc (name: cstring): pointer {.stdcall.}
 
   proc mpvGetProcAddress(ctx: pointer, name: cstring): pointer {.cdecl.} =
     # wglGetProcAddress only knows extensions and GL > 1.1; the rest (and
     # some drivers' "failure" values 1, 2, 3, -1) mean: ask opengl32.dll.
+    if opengl32 == nil:
+      opengl32 = LoadLibraryA("opengl32.dll")
+      wglGetProcAddress = cast[typeof(wglGetProcAddress)](GetProcAddress(opengl32, "wglGetProcAddress"))
     result = wglGetProcAddress(name)
     if cast[int](result) in [-1, 0, 1, 2, 3]:
-      if opengl32 == nil: opengl32 = LoadLibraryA("opengl32.dll")
       result = GetProcAddress(opengl32, name)
 else:
   proc glXGetProcAddressARB(name: cstring): pointer {.importc, dynlib: "libGL.so.1".}

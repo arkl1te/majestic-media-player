@@ -7,7 +7,8 @@
 #   tools/windows.sh uninstall   remove the install, its shortcut and file associations
 # Requires: nim >= 2.2, git, and Visual Studio (or its Build Tools) with the
 # C++ workload; Nim finds it by itself. libmpv comes prebuilt from the pinned
-# release below, unpacked with 7-Zip.
+# release below, unpacked with 7-Zip; so does Mesa's software OpenGL (cpu\),
+# which renders on the CPU when the GPU's memory is full (Options > System).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/progress.sh
@@ -15,6 +16,9 @@ source tools/progress.sh
 BIN=majestic-media-player.exe
 LIBMPV_URL=https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261005/mpv-dev-x86_64-20261005-git-c152964208.7z
 LIBMPV_DIR=vendor/libmpv
+MESA_URL=https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
+MESA_DIR=vendor/mesa
+MESA_DLLS=(opengl32.dll libgallium_wgl.dll)
 APP_DIR="${LOCALAPPDATA:?}/Programs/Majestic Media Player"
 SHORTCUT="${APPDATA:?}/Microsoft/Windows/Start Menu/Programs/Majestic Media Player.lnk"
 
@@ -44,6 +48,24 @@ fetch_libmpv() {
   pb_finish "libmpv ready."
 }
 
+fetch_mesa() {
+  if [[ -f $MESA_DIR/opengl32.dll && $(cat "$MESA_DIR/.url" 2>/dev/null) == "$MESA_URL" ]]; then
+    return
+  fi
+  rm -rf "$MESA_DIR"
+  mkdir -p "$MESA_DIR"
+  pb_download "Mesa" "$MESA_URL" "$MESA_DIR/mesa.7z"
+  local sz d
+  sz=$(find_7z)
+  for d in "${MESA_DLLS[@]}"; do
+    (cd "$MESA_DIR" && "$sz" e -y mesa.7z "x64/$d" >/dev/null)
+    [[ -f $MESA_DIR/$d ]] || { echo "$d missing from the Mesa archive" >&2; exit 1; }
+  done
+  rm "$MESA_DIR/mesa.7z"
+  echo "$MESA_URL" > "$MESA_DIR/.url"
+  pb_finish "Mesa ready."
+}
+
 resources() {
   # The icon Explorer shows for the .exe. rc.exe ships with the Windows SDK;
   # without it the program still builds, just with the generic icon.
@@ -59,18 +81,23 @@ resources() {
 
 build() {
   fetch_libmpv
+  fetch_mesa
   local res=()
   mapfile -t res < <(resources)
   # --app:gui: no console window. MSVC via Nim's vccexe, which locates Visual
   # Studio itself.
   ./tools/build.sh nim c --cc:vcc "${res[@]}" "$@" -o:"$BIN" src/majestic.nim
   cp "$LIBMPV_DIR/libmpv-2.dll" .
+  mkdir -p cpu
+  cp "${MESA_DLLS[@]/#/$MESA_DIR/}" cpu/
 }
 
 install_app() {
   build -d:release --app:gui
   mkdir -p "$APP_DIR"
   cp "$BIN" libmpv-2.dll "$APP_DIR/"
+  mkdir -p "$APP_DIR/cpu"
+  cp cpu/* "$APP_DIR/cpu/"
   local exe
   exe=$(cygpath -w "$APP_DIR/$BIN")
   powershell -NoProfile -Command "

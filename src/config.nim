@@ -1,6 +1,6 @@
 ## Persistent settings, stored at ~/.config/majestic-media-player/config.json.
 
-import std/[os, strutils, tables, sequtils, math, algorithm]
+import std/[os, strutils, tables, sequtils, math, algorithm, times]
 import jsony, crunchy/sha256
 
 type
@@ -15,6 +15,16 @@ type
 
   OpenMode* = enum
     omSamePlayer, omNewPlayer
+
+  StreamQuality* = enum
+    ## Options > Playback > Online > Bandwidth: what yt-dlp fetches of a link.
+    sqBest, sqLimit, sqLowest, sqAudioOnly
+
+  RenderMode* = enum
+    ## Options > System > Rendering: GPU or CPU (the software renderer).
+    rdPreferGpu   ## the GPU; the CPU while it has too little memory to start on
+    rdAdaptive    ## back and forth, as the GPU's memory runs short and frees up
+    rdCpu         ## the CPU, always
 
   AfterPlayback* = enum
     apNothing, apNextInFolder, apMonitorOff, apExit, apSleep, apHibernate,
@@ -34,6 +44,9 @@ type
     lastDir*: string
     volume*: float = 100
     muted*: bool
+    equalizerOn*: bool = false     # its gains apply; they're kept and edited either way
+    equalizerGains*: seq[float]    # dB per band (player.EqFreqs); missing bands are 0
+    equalizerMinGain*: float = -12 # dB at the bottom of its sliders (the top is +12)
     compactMode*: bool = false     # no window frame and no menu bar
     showSeekBar*: bool = true
     showControls*: bool = true
@@ -83,7 +96,7 @@ type
     # Options > Playback
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
-    seekStep*: float = 5           # seconds
+    seekStep*: float = 5           # seconds (set in milliseconds in Options)
     volumeStep*: float = 5
     seekPreview*: bool = true
     snapWithShift*: bool = false   # off: snap unless Shift; on: only with Shift
@@ -93,6 +106,16 @@ type
     signInCookies*: string = "auto"  # browser yt-dlp signs in with for links that ask to:
                                      # "auto" (each installed in turn), "none", or a
                                      # --cookies-from-browser value ("brave", "firefox:...")
+    streamQuality*: StreamQuality = sqBest
+    streamMaxHeight*: int = 1080   # sqLimit: tallest video fetched, in lines
+    streamMaxFps30*: bool = false  # skip 60 fps formats
+    streamSmallAudio*: bool = false  # the lowest-bitrate audio instead of the best
+    streamOnSave*: bool = true     # File > Save and command lines download alike
+    streamLockVideo*: string = ""  # the quality menu's locks, for every link: the video
+                                   # quality ("1080p60", when offered) or "auto"; "" none
+    streamLockAudio*: string = ""  # the audio row by rank: "auto", "highest", "mid",
+                                   # "lowest" (ytdlp.AudioRanks); "" none
+    ytThumbnail*: bool = true      # a YouTube link's thumbnail while no video track shows
     # Options > Playback > Media Cache
     webDir*: string = ""           # "" = the cache folder's "streams"
     webKeepOn*: bool = true        # forget links not opened for webKeepHours
@@ -126,6 +149,7 @@ type
     sizeStep*: float = 5           # percent
     # Options > System
     loopFramesMB*: int = 768       # short loops' frames held in video memory, MB
+    renderMode*: RenderMode = rdPreferGpu
     # Remembered state
     windowX*, windowY*: int
     windowW*, windowH*: int        # 0 = never saved
@@ -218,12 +242,68 @@ proc save*(c: Config) =
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 
+# --- Open Recent, shared by every running player -----------------------------
+# Kept apart from the config, which each player saves whole (the last one to
+# save would win): every change reloads it first, and players pick up the
+# others' changes as the file changes.
+
+type RecentList = object
+  files: seq[string]
+  titles: Table[string, string]
+
+var recentStamp: Time  # the file as last read or written here
+
+proc recentPath(): string = configDir() / "recent.json"
+
+proc recentTime(): Time =
+  try: getLastModificationTime(recentPath()) except OSError: Time()
+
+proc saveRecent*(c: Config) =
+  let path = recentPath()
+  try:
+    createDir(path.parentDir)
+    writeAtomic(path, RecentList(files: c.recentFiles, titles: c.recentTitles).toJson)
+    recentStamp = recentTime()
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+proc reloadRecent*(c: var Config, force = false): bool =
+  ## Takes the list another player saved since; true when it changed. Without
+  ## the file yet, it starts from the list older versions kept in the config.
+  let t = recentTime()
+  if t == Time():
+    c.saveRecent()
+    return false
+  if t == recentStamp and not force: return false
+  recentStamp = t
+  try:
+    let r = readFile(recentPath()).fromJson(RecentList)
+    if r.files == c.recentFiles and r.titles == c.recentTitles: return false
+    (c.recentFiles, c.recentTitles) = (r.files, r.titles)
+    result = true
+  except CatchableError as e:
+    stderr.writeLine "config: ignoring unreadable ", recentPath(), ": ", e.msg
+
 proc addRecent*(c: var Config, path: string) =
+  discard c.reloadRecent(force = true)
   let i = c.recentFiles.find(path)
   if i >= 0: c.recentFiles.delete(i)
   c.recentFiles.insert(path, 0)
   if c.recentFiles.len > MaxRecent:
     c.recentFiles.setLen(MaxRecent)
+  c.saveRecent()
+
+proc removeRecent*(c: var Config, path: string) =
+  discard c.reloadRecent(force = true)
+  let i = c.recentFiles.find(path)
+  if i >= 0: c.recentFiles.delete(i)
+  c.recentTitles.del path
+  c.saveRecent()
+
+proc clearRecent*(c: var Config) =
+  c.recentFiles.setLen 0
+  c.recentTitles.clear()
+  c.saveRecent()
 
 # --- state brought back after restarting into an update ----------------------
 
@@ -478,6 +558,34 @@ proc save*(b: Bookmarks) =
   try:
     createDir(path.parentDir)
     writeAtomic(path, b.toJson)
+  except CatchableError as e:
+    stderr.writeLine "config: cannot save ", path, ": ", e.msg
+
+# --- equalizer saved for a media file ------------------------------------------
+
+type
+  EqEntry* = object
+    path*: string                 ## where the file was last seen, for people
+    on*: bool
+    gains*: seq[float]
+
+  Equalizers* = OrderedTable[string, EqEntry]  ## mediaKey -> entry, as bookmarks
+
+proc equalizersPath(): string = configDir() / "equalizers.json"
+
+proc loadEqualizers*(): Equalizers =
+  let path = equalizersPath()
+  if fileExists(path):
+    try:
+      result = readFile(path).fromJson(Equalizers)
+    except CatchableError as e:
+      stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+
+proc save*(e: Equalizers) =
+  let path = equalizersPath()
+  try:
+    createDir(path.parentDir)
+    writeAtomic(path, e.toJson)
   except CatchableError as e:
     stderr.writeLine "config: cannot save ", path, ": ", e.msg
 

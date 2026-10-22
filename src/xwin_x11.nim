@@ -304,15 +304,17 @@ proc setAspectHints*(window: Window, aspect: float, chrome: IVec2, minSize: IVec
   XSetWMNormalHints(d, window.xid, hints.addr)
   discard XFlush(d)
 
-proc setDialogFor*(window, parent: Window) =
-  ## Makes window a modal dialog of parent: the WM keeps it above parent and
-  ## treats it as part of the same app (no taskbar entry). Call before mapping.
+proc setDialogFor*(window, parent: Window, modal = true) =
+  ## Makes window a dialog of parent, modal unless asked otherwise: the WM
+  ## keeps it above parent and treats it as part of the same app (no taskbar
+  ## entry). Call before mapping.
   let d = glXGetCurrentDisplay()
   if d == nil: return
   discard XSetTransientForHint(d, window.xid, parent.xid)
   var kind = XInternAtom(d, "_NET_WM_WINDOW_TYPE_DIALOG", 0).clong
   discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_WINDOW_TYPE", 0),
     XaAtom, 32, 0, kind.addr, 1)
+  if not modal: return
   var state = XInternAtom(d, "_NET_WM_STATE_MODAL", 0).clong
   discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_STATE", 0),
     XaAtom, 32, 0, state.addr, 1)

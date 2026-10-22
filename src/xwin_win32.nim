@@ -463,9 +463,10 @@ proc setAspectHints*(window: Window, aspect: float, chrome: IVec2, minSize: IVec
   k.chrome = chrome
   k.minSize = minSize
 
-proc setDialogFor*(window, parent: Window) =
+proc setDialogFor*(window, parent: Window, modal = true) =
   ## Makes window owned by parent: kept above it, minimized with it and left
-  ## out of the taskbar. Call before showing it.
+  ## out of the taskbar. Call before showing it. Never modal here: the app
+  ## keeps its other windows from being used itself.
   discard SetWindowLongPtrW(window.hwnd, GWLP_HWNDPARENT, cast[LONG_PTR](parent.hwnd))
   window.darkTitleBar()
   let ex = GetWindowLongW(window.hwnd, GWL_EXSTYLE)

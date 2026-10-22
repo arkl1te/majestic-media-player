@@ -3,8 +3,19 @@
 import std/json
 
 when defined(windows):
+  import std/dynlib
   const libmpv = "libmpv-2.dll"
-  {.pragma: mpvImport, importc, cdecl, dynlib: libmpv.}
+  # Loaded as this module starts, not before any code runs: libmpv imports
+  # opengl32.dll, which must be Mesa's by then when rendering on the CPU
+  # (gpumem, imported first).
+  var mpvLib: LibHandle
+  proc mpvSym(name: cstring): pointer =
+    if mpvLib == nil:
+      mpvLib = loadLib(libmpv)
+      if mpvLib == nil: quit("could not load: " & libmpv)
+    result = mpvLib.symAddr(name)
+    if result == nil: quit("could not import: " & $name)
+  {.pragma: mpvImport, importc, cdecl, dynlib: mpvSym("").}
 else:
   {.passL: "-lmpv".}
   {.pragma: mpvImport, importc, cdecl.}
@@ -46,6 +57,10 @@ type
     playlistEntryId*: int64
     playlistInsertId*: int64
     playlistInsertNumEntries*: cint
+
+  MpvEventHook* = object
+    name*: cstring
+    id*: uint64
 
   MpvNodeList* = object
     num*: cint
@@ -112,6 +127,8 @@ proc mpv_observe_property*(ctx: MpvHandle, replyUserdata: uint64, name: cstring,
 proc mpv_wait_event*(ctx: MpvHandle, timeout: cdouble): ptr MpvEvent
 proc mpv_set_wakeup_callback*(ctx: MpvHandle, cb: proc (d: pointer) {.cdecl.}, d: pointer)
 proc mpv_request_log_messages*(ctx: MpvHandle, minLevel: cstring): cint
+proc mpv_hook_add*(ctx: MpvHandle, replyUserdata: uint64, name: cstring, priority: cint): cint
+proc mpv_hook_continue*(ctx: MpvHandle, id: uint64): cint
 
 proc mpv_render_context_create*(res: ptr MpvRenderContext, mpv: MpvHandle, params: ptr MpvRenderParam): cint
 proc mpv_render_context_set_update_callback*(ctx: MpvRenderContext, cb: proc (d: pointer) {.cdecl.}, d: pointer)

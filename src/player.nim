@@ -2,8 +2,8 @@
 ## as a seamless loop's standby, and a video-less third for a loop's sound)
 ## and a lightweight instance that renders seek-bar thumbnails.
 
-import std/[algorithm, atomics, json, strutils, os, tables, times]
-import mpv, videogl, spherical
+import std/[algorithm, atomics, json, sequtils, strutils, os, tables, times]
+import mpv, videogl, spherical, gpumem
 from config import AudioExtensions
 from ytdlp import YtdlSubLangs
 
@@ -74,6 +74,7 @@ type
                               ## about the web page it tried in its place
     streamError*: string      ## why a link's stream was cut short ("HTTP error
                               ## 403"): mpv then skips to the end
+    gpuOom*: bool             ## mpv told of the GPU out of memory; the app clears it
     sphere*: SphereInfo       ## 360° metadata of the open file
     justLoaded*: bool         ## set on FILE_LOADED, cleared by the app
     eofHandled*: bool
@@ -85,9 +86,19 @@ type
     jumps*: int               ## seeks, steps and stops asked for through
                               ## this module (not a loop's own jumps back)
     soundKey: string          ## a loop sound's filters and track as set
+    loopAf: string            ## a loop sound's own filters (before the equalizer's)
+    eqAf: string              ## the equalizer's filter as af has it, "" when off
+    eqSet: seq[float]         ## the gains in it
+    eqLive: seq[float]        ## the gains last sent, af or af-command
     restarts*: int            ## playback restarts (after loads and seeks)
     loadRestarts: int         ## restarts as the file was opened
+    loadedRestarts*: int      ## and once it had loaded (the next is its own)
+    keepTime*: bool           ## opening: its time and duration stay as they are
+                              ## (the same media again) until it has loaded
     expanded*: seq[string]    ## expandText results, in order
+    linkHooked: bool          ## LinkWaitHook added
+    linkHold: uint64          ## the opening held until linkHoldUntil (its
+    linkHoldUntil*: float     ## hook id, 0 for none), epoch seconds
 
   Preview* = ref object
     h*: MpvHandle
@@ -123,13 +134,22 @@ const
     "osd-bar-marker-min-size", "loop-file", "ab-loop-a", "ab-loop-b"]
     ## What the app sets at runtime, observed (into `props`) so a second
     ## player can be made to look and sound the same (seamless loops)
+  EqFreqs* = [31.0, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+    ## The equalizer's bands, Hz: a peaking filter an octave wide on each
   MirrorBase = 1000           ## observation ids of MirroredProps
   ExpandReply = 77'u64        ## reply id of expandText
   DumpReply = 1000'u64        ## dumpFrom's, plus its count
+  LinkWaitHook = 78'u64       ## reply id of the on_load hooks after yt-dlp's
+  LinkWaitMax = 30.0          ## seconds a link's opening waits at most
 
 proc onMainUpdate(d: pointer) {.cdecl.} = frameReady.store(1)
 proc onPreviewUpdate(d: pointer) {.cdecl.} = previewReady.store(1)
 proc onOsdUpdate(d: pointer) {.cdecl.} = osdReady.store(1)
+
+proc hwdecMode*(): string =
+  ## Hardware decoding unless rendering on the CPU (gpumem), which keeps
+  ## the GPU's memory out of it.
+  if cpuWanted: "no" else: "auto-safe"
 
 proc takeFrameReady*(): bool = frameReady.exchange(0) != 0
 proc takePreviewReady*(): bool = previewReady.exchange(0) != 0
@@ -157,7 +177,8 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   result.h = h
   h.setOpt("config", "no")
   h.setOpt("vo", "libmpv")
-  h.setOpt("hwdec", "auto-safe")
+  h.setOpt("hwdec", hwdecMode())
+  if cpuWanted: h.setOpt("profile", "fast")  # cheap scaling for the software renderer
   # Direct rendering has the decoder wait on the render thread (ours) for
   # frame buffers, so any blocking mpv call from the UI could deadlock.
   h.setOpt("vd-lavc-dr", "no")
@@ -200,6 +221,31 @@ proc useYtdlp*(p: Player, path: string) =
   # that, so a saved link would come back without its picture.
   p.h.setProp("script-opts", "ytdl_hook-ytdl_path=" & path & ",ytdl_hook-all_formats=no")
   p.h.command("load-script", "@ytdl_hook.lua")
+  # YouTube turns down (403) a link's formats until a few seconds after
+  # yt-dlp found them (their available_at, which yt-dlp itself sleeps
+  # for), and mpv's hook doesn't wait: these hooks, run after it, do.
+  if not p.linkHooked:
+    p.linkHooked = true
+    for name in ["on_load", "on_load_fail"]:
+      discard mpv_hook_add(p.h, LinkWaitHook, name.cstring, 15)
+
+proc releaseLink(p: Player) =
+  ## Lets a held opening go on (see useYtdlp).
+  if p.linkHold != 0:
+    discard mpv_hook_continue(p.h, p.linkHold)
+    (p.linkHold, p.linkHoldUntil) = (0'u64, 0.0)
+
+proc linkAvailableAt(p: Player): float =
+  ## When YouTube serves the formats yt-dlp just picked for the link,
+  ## epoch seconds; 0 for no wait (or no link).
+  let r = p.h.getNode("user-data/mpv/ytdl/json-subprocess-result")
+  if r.kind != JObject: return
+  try:
+    let j = parseJson(r{"stdout"}.getStr)
+    result = j{"available_at"}.getFloat
+    for f in j{"requested_formats"}.getElems:
+      result = max(result, f{"available_at"}.getFloat)
+  except CatchableError: discard
 
 proc newLoopSound*(volume: float): Player =
   ## A video-less player for an A-B loop's sound (loopSoundAt); paused,
@@ -222,6 +268,37 @@ proc newLoopSound*(volume: float): Player =
     discard mpv_request_log_messages(h, "warn")
   observe(h)
 
+proc eqFilter(gains: openArray[float]): string =
+  ## The equalizer as an mpv af entry, labelled "eq", its bands named b0-b9
+  ## for af-command.
+  result = "@eq:lavfi=["
+  for i, f in EqFreqs:
+    if i > 0: result.add ","
+    result.add "equalizer@b" & $i & "=f=" & $int(f) & ":t=o:w=1:g=" & $gains[i]
+  result.add "]"
+
+proc applyAf(p: Player) =
+  p.h.setProp("af", [p.loopAf, p.eqAf].filterIt(it.len > 0).join(","))
+
+proc setEqualizer*(p: Player, on: bool, gains: seq[float], live = false) =
+  ## The equalizer on or off with these gains (dB, one per EqFreqs). Setting
+  ## af rebuilds the filters, dropping a moment of sound, so `live` changes
+  ## (a slider on the move) only go to the running filters; a call without
+  ## it once they settle has af follow, for the next file or track.
+  if on and live and p.eqAf.len > 0:
+    if gains != p.eqLive:
+      for i, g in gains:
+        if i >= p.eqLive.len or p.eqLive[i] != g:
+          p.h.commandAsync("af-command", "eq", "g", $g, "equalizer@b" & $i)
+      p.eqLive = gains
+    return
+  # The running filters already have the gains that af is about to.
+  if on == (p.eqAf.len > 0) and (not on or gains == p.eqSet): return
+  p.eqAf = if on: eqFilter(gains) else: ""
+  p.eqSet = gains
+  p.eqLive = gains
+  p.applyAf()
+
 proc loopSoundAt*(p: Player, path, aid: string, a, b, start: float) =
   ## Has the loop sound wait, paused, at A of the loop from A to B (path's
   ## audio track `aid`): from there it plays A to B over and over, seamless
@@ -237,8 +314,9 @@ proc loopSoundAt*(p: Player, path, aid: string, a, b, start: float) =
   p.timePos = a
   if af & aid != p.soundKey:
     p.soundKey = af & aid
+    p.loopAf = af
     p.h.setProp("aid", aid)
-    p.h.setProp("af", af)
+    p.applyAf()
   if path != p.path or not p.loaded:
     p.path = path
     p.loaded = false
@@ -296,6 +374,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   let d = ev.data
   template f: float = (if d == nil: 0.0 else: cast[ptr cdouble](d)[].float)
   template b: bool = (d != nil and cast[ptr cint](d)[] != 0)
+  if p.keepTime and d == nil and id in {pTimePos, pDuration}: return
   case id
   of pPause: p.paused = b
   of pTimePos:
@@ -369,6 +448,9 @@ proc addSameNameAudio(p: Player) =
 
 proc pollEvents*(p: Player): bool =
   ## Drains the mpv event queue. Returns true if anything changed.
+  if p.linkHold != 0 and epochTime() >= p.linkHoldUntil:
+    p.releaseLink()
+    result = true
   while true:
     let ev = mpv_wait_event(p.h, 0)
     if ev.eventId == evNone: break
@@ -391,6 +473,8 @@ proc pollEvents*(p: Player): bool =
       p.loaded = true
       p.opening = false
       p.justLoaded = true
+      p.loadedRestarts = p.restarts
+      p.keepTime = false
       p.loadError = ""
       p.eofHandled = false
     of evEndFile:
@@ -400,6 +484,13 @@ proc pollEvents*(p: Player): bool =
         p.loaded = false
         p.opening = false
     of evPlaybackRestart: inc p.restarts
+    of evHook:
+      let e = cast[ptr MpvEventHook](ev.data)
+      p.releaseLink()
+      let at = p.linkAvailableAt()
+      if at > epochTime():
+        (p.linkHold, p.linkHoldUntil) = (e.id, min(at, epochTime() + LinkWaitMax))
+      else: discard mpv_hook_continue(p.h, e.id)
     of evCommandReply:
       if ev.replyUserdata == DumpReply + p.dumpId:
         p.dumping = false
@@ -417,6 +508,7 @@ proc pollEvents*(p: Player): bool =
       elif p.streamError.len == 0 and $m.level == "error" and
            ($m.prefix in ["curl", "timeline"] or "HTTP error" in $m.text):
         p.streamError = ($m.text).strip
+      if $m.level == "error" and outOfMemory($m.text): p.gpuOom = true
       if logAll: stderr.write "[mpv/", $m.prefix, "] ", $m.text
     else: discard
 
@@ -443,10 +535,12 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   p.hookError = ""
   p.streamError = ""
   p.opening = true
+  p.keepTime = false
   p.buffered.setLen 0
   p.cacheAhead = -1
   p.buffering = false
   p.setBackward(false)
+  p.releaseLink()
   var o = opts
   if start > 0:
     o = "start=" & formatFloat(start, ffDecimal, 3) & (if o.len > 0: "," & o else: "")
@@ -455,11 +549,20 @@ proc load*(p: Player, path: string, start = 0.0, threadless = false, opts = "",
   else: p.h.commandAsync("loadfile", file, "replace")
   p.h.setProp("pause", false)
 
+proc hookFormat*(p: Player): string =
+  ## The format ids yt-dlp picked for the link open ("401+251"), as mpv's
+  ## yt-dlp hook kept its answer; "" when it opened none.
+  let r = p.h.getNode("user-data/mpv/ytdl/json-subprocess-result")
+  if r.kind != JObject: return
+  try: parseJson(r{"stdout"}.getStr){"format_id"}.getStr
+  except CatchableError: ""
+
 proc reopen*(p: Player, threadless: bool) =
   ## Opens the file again where it is, paused or playing as it was, for
   ## options mpv reads only on opening one. Its added tracks are gone then.
   p.threadless = threadless
   p.h.setProp("demuxer-thread", if threadless: "no" else: "yes")
+  p.releaseLink()
   p.eofReached = false
   p.eofHandled = false
   inc p.jumps
@@ -473,6 +576,7 @@ proc externalFiles*(p: Player): seq[string] =
     if p.h.getFlag(t & "external"): result.add p.h.getStr(t & "external-filename")
 
 proc close*(p: Player) =
+  p.releaseLink()
   p.h.commandAsync("stop")
   p.path = ""
   p.source = ""
@@ -689,7 +793,8 @@ proc newPreview*(): Preview =
   result.h = h
   h.setOpt("config", "no")
   h.setOpt("vo", "libmpv")
-  h.setOpt("hwdec", "auto-safe")
+  h.setOpt("hwdec", hwdecMode())
+  if cpuWanted: h.setOpt("profile", "fast")  # cheap scaling for the software renderer
   h.setOpt("vd-lavc-dr", "no")         # see newPlayer
   h.setOpt("terminal", "no")
   h.setOpt("audio", "no")

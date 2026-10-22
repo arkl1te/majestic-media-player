@@ -3,8 +3,8 @@
 ## for a newer release, updating itself (yt-dlp -U) and installing its standalone
 ## build, which can then keep itself up to date with -U too.
 
-import std/[os, osproc, json, strutils, algorithm, sequtils]
-import runlog
+import std/[os, osproc, json, math, strutils, strformat, algorithm, sequtils]
+import runlog, config
 
 const
   YtdlSubLangs* = "all,-live_chat"
@@ -23,7 +23,11 @@ type
     ytCaptions  ## a link's automatic captions
     ytSubs      ## a link's subtitles, as files
     ytPlaylist  ## a playlist's videos, as they're found
+    ytInfo      ## videos' durations and sizes, for the playlist's columns
     ytDownload  ## a link's video, whole, to a file (File > Save)
+
+  Quality* = tuple[id, label: string]
+    ## A format a link offers, as the controls' quality menu lists it
 
   YtJob* = ref object
     task*: YtTask
@@ -40,10 +44,15 @@ type
     step*, steps*: int        ## ytDownload: of video, audio and merging them,
                               ## which it's on (steps 0: one stream, no merging)
     data: string              ## ytCaptions: what it printed
+    fmts: string              ## ytCaptions: the link's formats, as printed
     dest: string              ## ytInstall: where it goes; ytSubs: the start
                               ## of its files' paths
     subs*: seq[string]        ## ytSubs: the files it made
-    items*: seq[tuple[id, title: string]]  ## ytPlaylist: the videos found so far
+    items*: seq[tuple[id, title: string, duration: float]]
+                              ## ytPlaylist: the videos found so far (duration
+                              ## 0 when unknown)
+    infos*: seq[tuple[id: string, duration: float, width, height: int]]
+                              ## ytInfo: the videos looked up so far
 
 proc managedPath*(): string =
   ## Where the player installs yt-dlp: on PATH for most Linux setups.
@@ -84,14 +93,105 @@ proc cookieArgs(cookies: string): seq[string] =
 
 proc captions*(exe, url: string, cookies = ""): YtJob =
   ## `cookies`: the browser to sign in with (cookieBrowsers), "" for none.
+  ## Lists the link's formats too (qualities).
   start(ytCaptions, exe, @["--no-warnings", "--no-playlist"] & cookieArgs(cookies) &
-    @["-O", "MMPCAPS %(automatic_captions)j", "--", url], url)
+    @["-O", "MMPCAPS %(automatic_captions)j", "-O", "MMPFMTS %(formats.:.{format_id," &
+      "vcodec,acodec,height,fps,abr,language})j", "--", url], url)
 
 proc playlistItems*(exe, url: string, cookies = ""): YtJob =
   ## Lists a playlist's videos (url: the playlist's link, or a video's in it),
   ## each printed as soon as its page of the list comes in.
   start(ytPlaylist, exe, @["--no-warnings", "--flat-playlist", "--lazy-playlist",
-    "--yes-playlist"] & cookieArgs(cookies) & @["-O", "MMPITEM %(id)s %(title)s", "--", url], url)
+    "--yes-playlist"] & cookieArgs(cookies) & @["-O", "MMPITEM %(id)s %(duration)s %(title)s",
+    "--", url], url)
+
+proc videoInfos*(exe: string, ids: openArray[string], cookies = ""): YtJob =
+  ## Looks up YouTube videos' durations and sizes (the best video's), each
+  ## printed as soon as it's found; a playlist's listing has no sizes.
+  start(ytInfo, exe, @["--no-warnings", "--no-playlist", "--ignore-errors",
+    "--skip-download"] & cookieArgs(cookies) &
+    @["-O", "MMPINFO %(id)s %(duration)s %(width)s %(height)s", "--"] & @ids)
+
+proc formatSpec*(c: Config): string =
+  ## The -f (ytdl-format) value for Options > Online > Bandwidth. A limit no
+  ## format meets falls back to the smallest one, not the best.
+  let a = if c.streamSmallAudio: "wa" else: "ba"
+  var f = ""
+  if c.streamQuality == sqLimit: f.add &"[height<=?{c.streamMaxHeight}]"
+  if c.streamMaxFps30: f.add "[fps<=?30]"
+  case c.streamQuality
+  of sqLowest: "wv*+wa/w"
+  of sqAudioOnly: a & "/" & (if c.streamSmallAudio: "w" else: "b")
+  of sqBest, sqLimit:
+    &"bv*{f}+{a}/b{f}" & (if f.len > 0: &"/wv*+{a}/w" else: "")
+
+const AudioRanks* = ["highest", "mid", "lowest"]
+  ## Audio locks: a row of the quality menu's audio column by where it is,
+  ## the same on every link (its qualities aren't): first, middle, last.
+
+proc rankRow*(rank: string, rows: int): int =
+  ## The row an audio rank stands for among `rows`; -1 for none.
+  if rows == 0: return -1
+  case rank
+  of "highest": 0
+  of "mid": rows div 2
+  of "lowest": rows - 1
+  else: -1
+
+proc sameQuality*(lock, label: string): bool =
+  ## A locked video quality and one a link offers are alike.
+  label == lock or label.startsWith(lock & " ") or lock.startsWith(label & " ")
+
+proc lockFilters(lock: string, video: bool): seq[string] =
+  ## A locked quality as yt-dlp selectors, best first: a video label
+  ## ("1080p60") for video alone, then with sound; an audio rank (AudioRanks).
+  let parts = lock.split(' ')
+  if video:
+    let hp = parts[0].split('p')
+    let h = try: parseInt(hp[0]) except ValueError: return
+    let fps = if hp.len > 1 and hp[1].len > 0: (try: parseInt(hp[1]) except ValueError: 0) else: 0
+    let f = &"[height={h}]" &
+      (if fps > 0: &"[fps>={fps.float - 0.5}][fps<{fps.float + 0.5}]" else: "[fps<=?30]")
+    @["bv" & f, "bv*" & f]
+  else:
+    # Audio is locked by rank: yt-dlp's best and worst of those the menu
+    # lists; the middle one has no selector (found once the formats are).
+    case lock
+    of "highest": @["ba[abr>0][format_id!*=-drc]"]
+    of "lowest": @["wa[abr>0][format_id!*=-drc]"]
+    else: @[]
+
+proc pickSpec*(c: Config, video, audio: string): string =
+  ## The -f for the formats picked in the quality menu: each a format id,
+  ## "~<lock>" for a locked quality (a video label, an audio rank) looked for
+  ## by what it is,
+  ## or "" for Options > Online's choice. A video with sound of its own (no
+  ## audio apart) plays as it is. Left to Auto, audio is as Options > Online
+  ## picks it. What the link doesn't offer falls back to Options > Online's.
+  let a = if c.streamSmallAudio or c.streamQuality == sqLowest: "wa" else: "ba"
+  proc sels(x: string, video: bool): seq[string] =
+    if x.startsWith("~"): lockFilters(x[1 .. ^1], video) else: @[x]
+  var alts: seq[string]
+  if video.len > 0:
+    let auds = if audio.len > 0: sels(audio, false) else: @[]
+    for v in sels(video, true):
+      for au in auds: alts.add v & "+" & au
+      alts.add v & "+" & a
+      alts.add v
+  elif audio.len > 0:
+    var f = ""
+    if c.streamQuality == sqLimit: f.add &"[height<=?{c.streamMaxHeight}]"
+    if c.streamMaxFps30: f.add "[fps<=?30]"
+    for au in sels(audio, false):
+      case c.streamQuality
+      of sqAudioOnly: alts.add au
+      of sqLowest: alts.add [&"wv*+{au}", au]
+      of sqBest, sqLimit:
+        alts.add &"bv*{f}+{au}"
+        if f.len > 0: alts.add &"bv*+{au}"
+        alts.add au
+  alts.add formatSpec(c)
+  alts.deduplicate.join("/")
 
 proc subtitles*(exe, url, dest: string, cookies = ""): YtJob =
   ## Downloads url's subtitles (not its video) as dest.<lang>.<ext>.
@@ -102,22 +202,21 @@ proc subtitles*(exe, url, dest: string, cookies = ""): YtJob =
     "ass/srt/best", "-P", dest.parentDir, "-o", dest.extractFilename & ".%(ext)s", "--", url], url)
   result.dest = dest
 
-proc download*(exe, url, dir, name, ext: string, cookies = ""): YtJob =
-  ## Downloads url whole (as the yt-dlp hook streams it: best video and
-  ## audio) into dir as `name` (an output template), an `ext` (mkv, mp4) with
-  ## its subtitles and chapters.
+proc download*(exe, url, dir, name, ext: string, cookies = "", format = "bv*+ba/b"): YtJob =
+  ## Downloads url whole (best video and audio, or format) into dir as `name`
+  ## (an output template), an `ext` (mkv, mp4) with its subtitles and chapters.
   start(ytDownload, exe, @["--no-playlist", "--newline", "--force-overwrites",
-    "-f", "bv*+ba/b", "--merge-output-format", ext, "--remux-video", ext,
+    "-f", format, "--merge-output-format", ext, "--remux-video", ext,
     "--embed-subs", "--sub-langs", YtdlSubLangs, "--embed-chapters", "--progress-template",
     "download:MMPPROG %(progress.downloaded_bytes)s %(progress.total_bytes)s " &
     "%(progress.total_bytes_estimate)s"] & cookieArgs(cookies) &
     @["-P", dir, "-o", name, "--", url], url)
 
-proc downloadScript*(exe, url, dest: string, cookies = ""): string =
-  ## Bash lines downloading url whole (as the yt-dlp hook streams it: best
-  ## video and audio) to dest, an .mkv with its subtitles and chapters, for
-  ## a command line to run on; the script exits when it fails.
-  let args = @[exe, "--no-playlist", "--newline", "-f", "bv*+ba/b",
+proc downloadScript*(exe, url, dest: string, cookies = "", format = "bv*+ba/b"): string =
+  ## Bash lines downloading url whole (best video and audio, or format) to
+  ## dest, an .mkv with its subtitles and chapters, for a command line to run
+  ## on; the script exits when it fails.
+  let args = @[exe, "--no-playlist", "--newline", "-f", format,
     "--merge-output-format", "mkv", "--remux-video", "mkv", "--embed-subs",
     "--sub-langs", YtdlSubLangs, "--embed-chapters", "--no-part"] & cookieArgs(cookies) &
     @["-o", dest, "--", url]
@@ -192,6 +291,55 @@ proc originalCaptions*(j: YtJob): seq[tuple[url, title, lang: string]] =
     result.add (pick{"url"}.getStr, pick{"name"}.getStr(key) & " (automatic)",
       key[0 ..< key.len - 5])
 
+proc qualities*(j: YtJob): tuple[video, audio: seq[Quality]] =
+  ## ytCaptions: the link's video qualities, tallest first ("1080p60"), and
+  ## its audio ones as yt-dlp ranks them, best first ("130k aac"): its "ba"
+  ## first, its "wa" last (AudioRanks). yt-dlp lists formats worst to best,
+  ## so of those alike the one it prefers stands for them.
+  ## A link with no video apart from its sound lists its videos with sound.
+  let all = try: parseJson(j.fmts) except CatchableError: return
+  if all.kind != JArray: return
+  proc num(f: JsonNode, key: string): float =
+    let n = f{key}
+    if n == nil: 0.0 elif n.kind == JInt: n.getInt.float else: n.getFloat
+  type V = tuple[q: Quality, h, fps: float]
+  type A = tuple[q: Quality, abr: float]
+  var alone, muxed: seq[V]
+  var audio: seq[A]
+  var langs: seq[string]
+  for f in all:
+    let id = f{"format_id"}.getStr
+    if id.len == 0 or id.endsWith("-drc"): continue  # the same, compressed
+    let (vc, ac) = (f{"vcodec"}.getStr, f{"acodec"}.getStr)
+    let (h, fps, abr) = (f.num("height"), f.num("fps"), f.num("abr"))
+    if h > 0 and vc != "none":
+      let label = &"{int(h)}p" & (if fps > 30: $int(round(fps)) else: "")
+      if ac == "none": alone.add ((id, label), h, fps)
+      else: muxed.add ((id, label), h, fps)
+    elif vc == "none" and ac notin ["", "none"] and abr > 0:
+      let codec = ac.split('.')[0].toLowerAscii
+      let short =
+        case codec
+        of "mp4a": "aac"
+        of "ac-3": "ac3"
+        of "ec-3": "eac3"
+        else: codec
+      let lang = f{"language"}.getStr
+      if lang notin langs: langs.add lang
+      audio.add ((id, &"{int(round(abr))}k {short}|{lang}"), abr)
+  var videos: seq[V]
+  let found = if alone.len > 0: alone else: muxed
+  for i, v in found:
+    if found[i + 1 .. ^1].allIt(it.q.label != v.q.label): videos.add v
+  videos.sort(proc (x, y: V): int = cmp((y.h, y.fps), (x.h, x.fps)))
+  result.video = videos.mapIt(it.q)
+  audio.reverse()
+  for i, a in audio:
+    if audio[0 ..< i].anyIt(it.q.label == a.q.label): continue
+    let (label, lang) = (a.q.label.split('|')[0], a.q.label.split('|')[1])
+    # Languages tell apart dubs, when there are some.
+    result.audio.add (a.q.id, if langs.len > 1 and lang.len > 0: label & " " & lang else: label)
+
 proc version*(exe: string): YtJob = start(ytVersion, exe, ["--version"])
 
 proc latest*(): YtJob =
@@ -259,11 +407,18 @@ proc addLine(j: YtJob, line: string) =
     j.step = j.steps
     j.lines.add l
   elif l.startsWith("MMPCAPS "): j.data = l[8 .. ^1]
+  elif l.startsWith("MMPFMTS "): j.fmts = l[8 .. ^1]
   elif l.startsWith("MMPITEM "):
-    let item = l[8 .. ^1].split(' ', 1)
-    let title = if item.len > 1: item[1] else: ""
+    let item = l[8 .. ^1].split(' ', 2)
+    let title = if item.len > 2: item[2] else: ""
+    let dur = if item.len > 1: (try: item[1].parseFloat except ValueError: 0.0) else: 0.0
     # Private and deleted videos stay listed, unplayable.
-    if title notin ["[Private video]", "[Deleted video]"]: j.items.add (item[0], title)
+    if title notin ["[Private video]", "[Deleted video]"]: j.items.add (item[0], title, dur)
+  elif l.startsWith("MMPINFO "):
+    let f = l[8 .. ^1].split(' ')
+    if f.len == 4:  # NA for what's unknown (a live stream's duration, audio's size)
+      let num = proc (s: string): float = (try: s.parseFloat except ValueError: 0.0)
+      j.infos.add (f[0], num(f[1]), num(f[2]).int, num(f[3]).int)
   else: j.lines.add l
 
 proc read(j: YtJob) =
@@ -298,7 +453,7 @@ proc finish(j: YtJob) =
 proc poll*(j: YtJob): bool =
   ## Reads what it printed and notes when it exits. True when anything changed.
   if not j.running: return
-  let before = (j.lines.len, j.progress, j.items.len)
+  let before = (j.lines.len, j.progress, j.items.len, j.infos.len)
   j.read()
   let code = j.p.peekExitCode
   if code != -1:
@@ -309,7 +464,7 @@ proc poll*(j: YtJob): bool =
     j.code = code
     j.finish()
     return true
-  (j.lines.len, j.progress, j.items.len) != before
+  (j.lines.len, j.progress, j.items.len, j.infos.len) != before
 
 proc stop*(j: YtJob) =
   if not j.running: return

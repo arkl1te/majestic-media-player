@@ -11,7 +11,8 @@ import theme, ui, xwin
 
 type
   MenuKind* = enum
-    mkAction, mkCheck, mkRadio, mkSeparator, mkSub
+    mkAction, mkCheck, mkRadio, mkSeparator, mkSub,
+    mkColumn                  ## a column of a `columns` popup, its label a heading
 
   MenuNode* = ref object
     label*, shortcut*: string
@@ -20,6 +21,10 @@ type
     children*: seq[MenuNode]
     action*: proc ()
     remove*: proc ()          ## set: a cross at the row's right end runs it
+    lock*: proc ()            ## set: a lock there instead, toggled by it
+    locked*: bool             ## that lock is closed
+    columns*: bool            ## its children (mkColumn) sit side by side
+    width: float32            ## mkColumn: as laid out (popupSize)
 
   MenuMode = enum
     mmClosed, mmBar, mmContext
@@ -33,6 +38,10 @@ type
     barIndex: int             ## open top-level menu in bar mode
     path: seq[int]            ## open submenu index per popup depth
     contextPos: Vec2
+    sticky: bool              ## context menu stays open through clicks, until
+                              ## the pointer leaves it and `keep`
+    keep: Rect                ## what opened it (a button), main-window coordinates
+    above: bool               ## context menu opens above contextPos
     barRects: seq[Rect]
     levels: seq[PopupLevel]   ## last frame's popups, for input capture
     windows: seq[PopupWindow] ## one per depth, reused across opens
@@ -66,9 +75,13 @@ proc check*(parent: MenuNode, label: string, shortcut = "", checked: bool,
     checked: checked, enabled: enabled, action: action)
 
 proc radio*(parent: MenuNode, label: string, shortcut = "", checked: bool,
-            enabled = true, action: proc () = nil) =
+            enabled = true, action: proc () = nil, lock: proc () = nil, locked = false) =
   parent.children.add MenuNode(label: label, shortcut: shortcut, kind: mkRadio,
-    checked: checked, enabled: enabled, action: action)
+    checked: checked, enabled: enabled, action: action, lock: lock, locked: locked)
+
+proc column*(parent: MenuNode, label: string): MenuNode =
+  result = MenuNode(label: label, kind: mkColumn, enabled: true)
+  parent.children.add result
 
 proc sep*(parent: MenuNode) =
   parent.children.add MenuNode(kind: mkSeparator)
@@ -97,10 +110,15 @@ proc openBar*(m: MenuSystem, barIndex: int, path: seq[int] = @[]) =
   m.barIndex = barIndex
   m.path = path
 
-proc openContext*(m: MenuSystem, pos: Vec2) =
+proc openContext*(m: MenuSystem, pos: Vec2, sticky = false, keep = Rect(), above = false) =
+  ## `sticky`: picking items leaves it open; it closes once the pointer is
+  ## away from it and from `keep`. `above`: it opens upward from pos.
   m.mode = mmContext
   m.contextPos = pos
   m.path = @[]
+  m.sticky = sticky
+  m.keep = keep
+  m.above = above
 
 proc pollInput*(m: MenuSystem): bool =
   ## Call after pollEvents every loop iteration. Collects clicks on the popup
@@ -141,6 +159,12 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
     m.boundsValid = true
     let mon = monitorAt(screen)
     m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
+  if m.mode == mmContext and m.sticky and m.levels.len > 0:
+    const Near = 24'f32  # how far the pointer may stray
+    proc grown(r: Rect): Rect = rect(r.x - Near, r.y - Near, r.w + 2 * Near, r.h + 2 * Near)
+    if not m.mouse.inside(m.levels[0].rect.grown) and not m.mouse.inside(m.keep.grown):
+      m.close()
+      return
   if m.overMenu(m.mouse) or m.input.anyPressed:
     ui.captured = true
   elif ui.window.buttonPressed[MouseLeft] or ui.window.buttonPressed[MouseRight] or
@@ -160,6 +184,20 @@ const
   shortcutGap = 36'f32
 
 proc popupSize(ui: Ui, node: MenuNode): Vec2 =
+  if node.columns:
+    # Columns as narrow as their labels: a check, the label, a margin.
+    var w = 8'f32
+    var rowsN = 0
+    for col in node.children:
+      var labelW = ui.textSize(col.label).x
+      var lockW = 0'f32
+      for c in col.children:
+        labelW = max(labelW, ui.textSize(c.label).x)
+        if c.lock != nil: lockW = arrowW
+      col.width = ceil(checkW + labelW + padX + lockW)
+      w += col.width
+      rowsN = max(rowsN, col.children.len + 1)
+    return vec2(w, ceil(8 + rowsN.float32 * MenuRowHeight))
   var labelW, scW = 0'f32
   var h = 8'f32
   for c in node.children:
@@ -176,13 +214,25 @@ proc removeRect(row: Rect): Rect =
   ## The cross of a removable row, in the space submenu arrows use.
   rect(row.x + row.w - arrowW - 2, row.y + 2, arrowW, row.h - 4)
 
-iterator rows(node: MenuNode, r: Rect): (int, Rect) =
-  ## Each child's row inside a popup at r (separators get a short row).
-  var y = r.y + 4
-  for i, c in node.children:
-    let h = if c.kind == mkSeparator: MenuSeparatorHeight else: MenuRowHeight
-    yield (i, rect(r.x + 4, y, r.w - 8, h))
-    y += h
+iterator rows(node: MenuNode, r: Rect): (int, MenuNode, Rect) =
+  ## Each child's row inside a popup at r (separators get a short row); of
+  ## columns, each one's heading (the mkColumn) and then its items.
+  if node.columns:
+    var x = r.x + 4
+    var i = 0
+    for col in node.children:
+      var y = r.y + 4
+      for c in @[col] & col.children:
+        yield (i, c, rect(x, y, col.width, MenuRowHeight))
+        y += MenuRowHeight
+        inc i
+      x += col.width
+  else:
+    var y = r.y + 4
+    for i, c in node.children:
+      let h = if c.kind == mkSeparator: MenuSeparatorHeight else: MenuRowHeight
+      yield (i, c, rect(r.x + 4, y, r.w - 8, h))
+      y += h
 
 proc placePopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
                 depth: int, below: bool) =
@@ -190,7 +240,8 @@ proc placePopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
   let size = popupSize(ui, node)
   let b = m.bounds
   var pos =
-    if below: vec2(anchor.x, anchor.y + anchor.h)
+    if depth == 0 and m.mode == mmContext and m.above: vec2(anchor.x, max(b.y, anchor.y - size.y))
+    elif below: vec2(anchor.x, anchor.y + anchor.h)
     else: vec2(anchor.x + anchor.w - 2, anchor.y - 4)
   if pos.x + size.x > b.x + b.w:
     pos.x = if below: b.x + b.w - size.x else: anchor.x - size.x + 2
@@ -202,7 +253,7 @@ proc placePopup(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
   if m.path.len > depth:
     let i = m.path[depth]
     if i in 0 ..< node.children.len and node.children[i].kind == mkSub:
-      for (j, row) in rows(node, r):
+      for (j, _, row) in rows(node, r):
         if j == i:
           m.placePopup(ui, node.children[i], row, depth + 1, false)
           break
@@ -222,9 +273,8 @@ proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
   let d = m.topLevelAt(m.mouse)
   if d < 0: return
   let lv = m.levels[d]
-  for (i, row) in rows(lv.node, lv.rect):
-    let c = lv.node.children[i]
-    if c.kind == mkSeparator or not c.enabled or not m.mouse.inside(row): continue
+  for (i, c, row) in rows(lv.node, lv.rect):
+    if c.kind in {mkSeparator, mkColumn} or not c.enabled or not m.mouse.inside(row): continue
     if c.kind == mkSub:
       if not (m.path.len > d and m.path[d] == i):
         m.path.setLen d
@@ -238,6 +288,8 @@ proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
       if released:
         if c.remove != nil and m.mouse.inside(removeRect(row)):
           m.pendingRemove = c.remove
+        elif c.lock != nil and m.mouse.inside(removeRect(row)):
+          m.pendingRemove = c.lock  # the menu stays open, as removing does
         elif c.action != nil:
           m.pendingAction = c.action
 
@@ -248,10 +300,14 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
   let top = m.topLevelAt(m.mouse) == depth
   ui.rect(r, colPopup)
   ui.border(r, colBorder)
-  for (i, row) in rows(lv.node, r):
-    let c = lv.node.children[i]
+  for (i, c, row) in rows(lv.node, r):
     if c.kind == mkSeparator:
       ui.rect(rect(row.x + 4, row.y + row.h / 2, row.w - 8, 1), colBorder)
+      continue
+    if c.kind == mkColumn:
+      ui.textIn(c.label, rect(row.x + checkW, row.y, row.w, row.h), colTextDim)
+      if row.x > r.x + 4:  # a line between columns
+        ui.rect(rect(row.x, r.y + 6, 1, r.h - 12), colBorder)
       continue
     let hov = c.enabled and top and mouse.inside(row)
     let isOpenSub = c.kind == mkSub and m.path.len > depth and m.path[depth] == i
@@ -271,6 +327,12 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
       let xHov = top and mouse.inside(xr)
       if xHov: ui.rect(xr, colPressed)
       ui.icon("close16", xr.xy + xr.wh / 2, if xHov: colText else: colTextDim)
+    if c.lock != nil and c.enabled:
+      let xr = removeRect(row)
+      let xHov = top and mouse.inside(xr)
+      if xHov: ui.rect(xr, colPressed)
+      ui.icon(if c.locked: "lock16" else: "unlock16", xr.xy + xr.wh / 2,
+        if c.locked: colAccent elif xHov: colText else: colTextDim)
     if c.kind == mkSub:
       ui.icon("arrow16", vec2(row.x + row.w - arrowW / 2, row.y + row.h / 2), fg)
 
@@ -324,7 +386,7 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   if m.pendingAction != nil:
     let a = m.pendingAction
     m.pendingAction = nil
-    m.close()
+    if not (m.mode == mmContext and m.sticky): m.close()
     a()
 
 proc renderPopups*(m: MenuSystem, ui: Ui,

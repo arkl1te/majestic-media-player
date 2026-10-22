@@ -4,3 +4,4 @@
 /libmpv-2.dll
 *.pdb
 *.ilk
+/cpu/

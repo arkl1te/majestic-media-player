@@ -38,6 +38,7 @@ jobs:
           [[ $GITHUB_REF == refs/tags/* ]] || name+="-${GITHUB_SHA::7}"
           mkdir "$name"
           cp majestic-media-player.exe libmpv-2.dll "$name/"
+          cp -r cpu "$name/"  # Mesa's software OpenGL (Options > System > Rendering)
           7z a "$name.zip" "$name" >/dev/null
           echo "name=$name" >> "$GITHUB_OUTPUT"
 

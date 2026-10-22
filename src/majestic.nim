@@ -1,11 +1,12 @@
 ## Majestic Media Player — an mpv-based video player with a Silky UI.
 
+import gpumem  # first: it picks the GL library before anything loads one
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
   random, tables, sets, streams, json]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap,
-  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater
+  rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 
 const
@@ -25,6 +26,10 @@ const
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
   UpdateSize = ivec2(500, 260)
+  EqualizerSize = ivec2(520, 336)
+  EqMaxGain = 12.0          ## dB at the top of the equalizer's sliders
+  EqMinGainLimit = -60.0    ## the lowest its bottom can be set to
+  EqSettle = 0.4            ## seconds after an equalizer change it's set for good
   PlaylistRowH = 26'f32
   PlaylistHeaderH = 24'f32  ## column headers
   PlaylistGripW = 5'f32     ## draggable left edge of the playlist
@@ -52,7 +57,7 @@ type
     emAsk, emInstall, emBusy, emFailed  ## what the Embed As MKV Chapters window asks or shows
 
   ContextMenu = enum
-    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog  ## where the right-click menu was opened
+    cmVideo, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistColumns, cmRepeat, cmRunLog, cmQuality  ## where the right-click menu was opened
 
   PlaylistSort = enum
     psName, psDuration, psDimensions, psSize
@@ -223,12 +228,22 @@ type
     embClear: bool            ## clear the file's bookmarks once it's done
     embMode: EmbedMode
     upJob: UpJob              ## Check for Updates at work: the check, then getting the release
+    thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
+    thumbTex: GLuint          ## it, uploaded
+    thumbTexId: string        ## the video id thumbTex holds
     upMode: UpdateMode
     upMsg: string             ## the Check for Updates window's text when it failed
     upWin: Window             ## the Check for Updates window, created on first use
     upSk: Silky
     upUi: Ui
     upRestart: bool           ## restarting into the update: the state is saved for it
+    rdRestart: string         ## restarting onto the other renderer, "cpu" or "gpu" (gpumem),
+                              ## the state saved for it as for an update
+    rdForNow: bool            ## on the CPU until the GPU has the memory again
+    rdSince: float            ## since when the GPU's memory has been past the line (watchVram)
+    rdCheckAt: float          ## when it's looked at next
+    rdStart: float            ## when this run started rendering
+    rdNote: string            ## what's said of the renderer once the file is open
     resume: ResumeState       ## the state from before restarting into an update,
     resuming: bool            ## brought back as its file opens
     embMsg: string            ## its text while installing or failed
@@ -279,6 +294,17 @@ type
     followPrevT: float        ## slave: following's last target time
     followWrapped: bool       ## slave: the master looped, our file must jump back
     followSettleAt: float     ## slave: drift is played off from then on (after a loop)
+    eqWin: Window             ## the Equalizer window, created on first use; shown
+    eqSk: Silky               ## alongside the player, not over it
+    eqUi: Ui
+    eqPos: IVec2              ## where it was when last hidden, outer top-left
+    equalizers: Equalizers    ## equalizers saved for media files
+    eqUnsaved: string         ## the file whose saved equalizer changed, key
+    eqChangedAt: float        ## when the equalizer last changed
+    eqDragging: bool          ## a drag across its sliders, at this band and gain
+    eqDragAt: (int, float)
+    eqTipBand: int            ## a band moved by key or wheel: its value shown
+    eqTipUntil: float         ## until then
     syncDlg: SyncDialog       ## Synchronize > Properties, its window created on first use
     syncWin: Window
     syncSk: Silky
@@ -294,6 +320,10 @@ type
     ytCookieTried: seq[string]  ## the browsers tried on the link being opened
     streamArgs: tuple[url: string, start: float, opts: string]
     streamPos: float          ## where the link's stream last played, to go on from
+    stallAt: float            ## when the stream started waiting for data without
+                              ## getting any (0: it isn't), and how much it had then
+    stallAhead: float
+    dropTries: int            ## the dropped stream reopened this many times
                               ## the link last streamed, to try again with
     stopOnLoad: bool          ## Stop, once the link loads (going online stopped)
     saved: SaveIndex          ## links kept on disk as they streamed (websave)
@@ -310,11 +340,32 @@ type
     ytHooked: string          ## the yt-dlp mpv opens links with, "" until there is one
     ytCaps: YtJob             ## the open link's automatic captions being looked up
     ytCaptions: Table[string, seq[tuple[url, title, lang: string]]]  ## and found, by link
+    ytQualities: Table[string, tuple[video, audio: seq[Quality]]]  ## a link's formats, found alike
+    ytPick: Table[string, tuple[video, audio: string]]  ## formats picked in the quality
+                              ## menu, by link ("": as Options > Online picks)
+    qualityRect: Rect         ## the controls' quality button, as last drawn
+    playFormat: Table[string, string]  ## format ids playing, by link (its stream's,
+                              ## or its saved part's); "" unknown
+    ytAuto: Table[string, string]  ## format ids Options > Online's choice came to, by link
+    ytAutoParts: Table[string, tuple[video, audio: string]]  ## its video and audio
+                              ## apart, each as it last played (autoParts)
+    qualitySwitch: bool       ## the link opens again in another quality
+    holding: bool             ## the frame before it stays up until the new one's first
+    heldTarget: VideoTarget   ## that frame
+    heldCorners: array[4, Vec2]  ## where it was drawn
+    heldPath: string
+    heldSince: float
+    heldFresh: bool           ## a frame of the new stream came since it opened
+    videoCorners: array[4, Vec2]  ## where the video was last drawn
     ytList: YtJob             ## a YouTube playlist's videos being listed (listYoutube)
     ytListUsed: int           ## the ones in the playlist so far
     ytListLast: string        ## the entry the next ones go after; "" while they go
                               ## before the link's own video (or none plays yet)
     ytListed: HashSet[string] ## links whose playlists were listed
+    ytInfo: YtJob             ## YouTube videos' durations and sizes being looked
+                              ## up for the playlist's columns (infoNext)
+    ytInfoLinks: seq[string]  ## the links it's looking up
+    ytInfoTried: HashSet[string]  ## links looked up, found or not
     linkTitles: Table[string, string]  ## links' titles, for the playlist's rows
     ytMode: YtMode
     ytMsg: string             ## the yt-dlp window's text while busy or failed
@@ -807,11 +858,15 @@ proc rememberState(a: App) =
   else:
     (a.cfg.playlist, a.cfg.playlistIndex) = (newSeq[string](), -1)
     a.cfg.playlistTitles.clear()
-  var titles: Table[string, string]
-  for r in a.cfg.recentFiles:
-    let t = a.linkTitles.getOrDefault(r, a.cfg.recentTitles.getOrDefault(r))
-    if t.len > 0: titles[r] = t
-  a.cfg.recentTitles = titles
+  discard a.cfg.reloadRecent()  # another player's changes
+  proc titles(a: App): Table[string, string] =
+    for r in a.cfg.recentFiles:
+      let t = a.linkTitles.getOrDefault(r, a.cfg.recentTitles.getOrDefault(r))
+      if t.len > 0: result[r] = t
+  if a.titles != a.cfg.recentTitles:
+    discard a.cfg.reloadRecent(force = true)  # on top of the latest list
+    a.cfg.recentTitles = a.titles
+    a.cfg.saveRecent()
 
 proc autosave(a: App) =
   ## Saves the remembered state as it changes rather than only on exit, so
@@ -873,9 +928,91 @@ proc ytdlRaw(a: App, url: string): string =
   if cookies.len > 0: raw.add "cookies-from-browser=" & quoted(cookies)
   "ytdl-raw-options=" & quoted(raw.join(","))
 
+proc qualitiesOf(a: App, url: string): tuple[known: bool, video, audio: seq[Quality]] =
+  ## The qualities a link offers: as found this time, else as saved with it.
+  if url in a.ytQualities:
+    let q = a.ytQualities[url]
+    return (true, q.video, q.audio)
+  let s = a.saved.getOrDefault(url)
+  if s.videoQ.len > 0 or s.audioQ.len > 0: (true, s.videoQ, s.audioQ)
+  else: (false, newSeq[Quality](), newSeq[Quality]())
+
+proc wants(a: App, url: string): tuple[video, audio: string] =
+  ## What the link streams in, video and audio, each: a format id; "~<lock>"
+  ## for a locked quality while its formats aren't known; "" for Auto. The
+  ## quality menu's picks come first ("auto": Auto), then its locks: video by
+  ## label, audio by rank (AudioRanks).
+  let pick = a.ytPick.getOrDefault(url)
+  let q = a.qualitiesOf(url)
+  proc one(p, lock: string, list: seq[Quality], video: bool): string =
+    if p == "auto": return ""
+    if p.len > 0: return p
+    if lock.len == 0 or lock == "auto": return ""
+    if not video and lock notin AudioRanks: return ""  # an older exact lock
+    if not q.known: return "~" & lock
+    if video:
+      for x in list:
+        if sameQuality(lock, x.label): return x.id
+      ""  # not offered: Auto
+    else:
+      let row = rankRow(lock, list.len)
+      if row >= 0: list[row].id else: ""
+  (one(pick.video, a.cfg.streamLockVideo, q.video, true),
+   one(pick.audio, a.cfg.streamLockAudio, q.audio, false))
+
+proc picked(a: App, url: string): bool =
+  ## The link doesn't stream in Auto, Auto (a pick or a lock).
+  let w = a.wants(url)
+  w.video.len > 0 or w.audio.len > 0
+
+proc autoParts(a: App, url: string): tuple[video, audio: string] =
+  ## Auto's video and audio format ids for the link, as each last played; "" unknown.
+  result = a.ytAutoParts.getOrDefault(url)
+  let s = a.saved.getOrDefault(url)
+  if result.video.len == 0: result.video = s.autoVideo
+  if result.audio.len == 0: result.audio = s.autoAudio
+  let full = s.auto.split('+')
+  if full.len == 2:
+    if result.video.len == 0: result.video = full[0]
+    if result.audio.len == 0: result.audio = full[1]
+
+proc linkFormat(a: App, url: string): string =
+  ## The format ids the link's stream comes in, as picked or locked (Auto's
+  ## as it last came to); "" while unknown.
+  let w = a.wants(url)
+  if not a.picked(url): return a.ytAuto.getOrDefault(url, a.saved.getOrDefault(url).auto)
+  if w.video.startsWith("~") or w.audio.startsWith("~"): return ""
+  if w.video.len == 0 and a.cfg.streamQuality == sqAudioOnly: return w.audio
+  let auto = a.autoParts(url)
+  let v = if w.video.len > 0: w.video else: auto.video
+  let au = if w.audio.len > 0: w.audio else: auto.audio
+  if v.len > 0 and au.len > 0: v & "+" & au else: ""
+
+proc streamFormat(a: App, url: string): string =
+  ## yt-dlp's -f for a link: the quality menu's picks and locks, else Options > Online's.
+  let w = a.wants(url)
+  pickSpec(a.cfg, w.video, w.audio)
+
+proc savedIn(a: App, url: string): Saved =
+  ## What's saved of the link in the format it streams in (linkFormat).
+  let f = a.linkFormat(url)
+  result = a.saved.getOrDefault(url).inFormat(f)
+  if f.len == 0 and a.picked(url): result.segs.setLen 0  # not knowing which
+
 proc withRaw(a: App, url, opts: string): string =
-  let raw = a.ytdlRaw(url)
+  ## opts, the yt-dlp hook's options and the format picked (streamFormat).
+  let raw = "ytdl-format=" & quoted(a.streamFormat(url)) &
+    (let r = a.ytdlRaw(url); if r.len > 0: "," & r else: "")
   if raw.len == 0: opts elif opts.len == 0: raw else: opts & "," & raw
+
+proc savedFile(a: App, url: string): string =
+  ## The media cache's file holding all of the link, in the quality saves
+  ## download (saveFormat); "" when none does.
+  if a.cfg.streamOnSave: a.savedIn(url).wholeFile else: a.saved.getOrDefault(url).wholeFile
+
+proc saveFormat(a: App, url: string): string =
+  ## yt-dlp's -f for File > Save and command lines: as the link streams, or the best.
+  if a.cfg.streamOnSave: a.streamFormat(url) else: "bv*+ba/b"
 
 proc streamLink(a: App, url: string, start: float, opts: string) =
   ## Streams a link (mpv's yt-dlp hook), noting how, to try again should it fail.
@@ -884,11 +1021,14 @@ proc streamLink(a: App, url: string, start: float, opts: string) =
   a.streamPos = start
   a.player.load(url, start, false, a.withRaw(url, opts))
 
-proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float]) =
-  ## Plays a link's saved `part` from `start`, the stream to go on past it.
+proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float],
+               extra: seq[string] = @[]) =
+  ## Plays a link's saved `part` (savedIn) from `start`, the stream to go on
+  ## past it; `extra`: more per-file options.
   a.saved[url].used = epochTime()
-  let s = a.saved[url]
-  var opts: seq[string]
+  let s = a.savedIn(url)
+  a.playFormat[url] = a.linkFormat(url)
+  var opts = extra
   if s.chapters.len > 0 and fileExists(s.chapters): opts.add "chapters-file=" & quoted(s.chapters)
   if s.subs.len > 0: opts.add "sub-files=" & quoted(s.subs.join($PathSep))
   if s.title.len > 0: opts.add "force-media-title=" & quoted(s.title)
@@ -981,11 +1121,13 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.ytError = ""
   a.ytRetry = ""
   a.ytTries = 0
+  a.dropTries = 0
   a.ytCookieTried.setLen 0
   a.stopOnLoad = false
   a.handoffOff()
   # A link played before: from disk, when saved where it starts.
-  let s = a.saved.getOrDefault(path)
+  a.qualitySwitch = false
+  let s = a.savedIn(path)
   let at = if a.resumedAt > 0 or not path.isWebLink: a.resumedAt else: path.linkStart
   let part = s.chainAt(at)
   if path.isWebLink and part.stop > part.start and
@@ -1313,6 +1455,43 @@ proc probeNext(a: App, visible: Slice[int]) =
     return
   if a.prober == nil: a.prober = newProber()
   if a.prober != nil: a.prober.start(next)
+
+proc infoNext(a: App, visible: Slice[int]) =
+  ## Starts looking up the durations and sizes of the YouTube videos the
+  ## playlist columns lack (a playlist's listing has durations only), a few
+  ## at a time, visible rows first.
+  const Batch = 8
+  if a.ytInfo.running: return
+  let wantSize = a.cfg.playlistShowDimensions
+  var links: seq[string]
+  let need = proc (p: string): bool =
+    if p in a.ytInfoTried or p in links or p.youtubeId.len == 0: return false
+    let m = a.mediaInfo.getOrDefault(p)
+    m.duration <= 0 or (wantSize and m.width == 0)
+  for i in visible:
+    if links.len < Batch and need(a.playlist[i]): links.add a.playlist[i]
+  for p in a.playlist:
+    if links.len < Batch and need(p): links.add p
+  if links.len == 0: return
+  let exe = findYtdlp(a.cfg.ytdlp)
+  if exe.len == 0: return
+  for p in links: a.ytInfoTried.incl p
+  a.ytInfoLinks = links
+  a.ytInfo = videoInfos(exe, links, a.ytCookies.getOrDefault(links[0]))
+
+proc pollYtInfo(a: App) =
+  ## Collects the durations and sizes found so far and redraws to show them.
+  let j = a.ytInfo
+  if j == nil or not j.poll(): return
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+  for (id, dur, w, h) in j.infos:
+    for p in a.ytInfoLinks:
+      if p.youtubeId != id: continue
+      var m = a.mediaInfo.mgetOrPut(p, MediaInfo()).addr
+      if dur > 0: m.duration = dur
+      if w > 0 and h > 0: (m.width, m.height) = (w, h)
+  j.infos.setLen 0
+  if not j.running: a.ytInfo = nil
 
 proc pollProbe(a: App) =
   ## Collects a finished background probe and redraws to show it.
@@ -1689,6 +1868,88 @@ proc moveBookmark(a: App, path: string, t, to: float): bool =
         break)
   a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)  # the seek bar shows it now
   moved
+
+proc eqMinGain(a: App): float = clamp(a.cfg.equalizerMinGain, EqMinGainLimit, -1)
+
+proc bandGains(a: App, gains: seq[float]): seq[float] =
+  ## One gain per equalizer band, in the sliders' range.
+  result = newSeq[float](EqFreqs.len)
+  for i in 0 ..< min(gains.len, result.len): result[i] = clamp(gains[i], a.eqMinGain, EqMaxGain)
+
+proc eqKey(a: App): string =
+  ## The current file's key among the saved equalizers: its mediaKey once
+  ## known, the entry last seen at its path until then; "" without a file.
+  let path = a.player.path
+  if path.len == 0: return ""
+  if path == a.bmPath: return a.bmKey
+  for k, e in a.equalizers:
+    if e.path == path: return k
+
+proc eqSaved(a: App): bool =
+  ## The current file has an equalizer saved for it.
+  let k = a.eqKey
+  k.len > 0 and k in a.equalizers
+
+proc equalizer(a: App): tuple[on: bool, gains: seq[float]] =
+  ## The equalizer heard: the one saved for the current file, else the
+  ## settings'.
+  let k = a.eqKey
+  if k.len > 0 and k in a.equalizers: (a.equalizers[k].on, a.bandGains(a.equalizers[k].gains))
+  else: (a.cfg.equalizerOn, a.bandGains(a.cfg.equalizerGains))
+
+proc changeEqualizer(a: App, on: bool, gains: seq[float]) =
+  ## Changes the equalizer heard; the file's saved one is written out once
+  ## the change settles (syncEqualizer).
+  a.eqChangedAt = now()
+  let k = a.eqKey
+  if k.len > 0 and k in a.equalizers:
+    a.equalizers[k].on = on
+    a.equalizers[k].gains = a.bandGains(gains)
+    a.eqUnsaved = k
+  else:
+    (a.cfg.equalizerOn, a.cfg.equalizerGains) = (on, a.bandGains(gains))
+
+proc saveEqualizer(a: App) =
+  ## The file's changed equalizer written out, on the file's latest
+  ## contents, so other players' entries aren't overwritten.
+  let k = a.eqUnsaved
+  a.eqUnsaved = ""
+  if k notin a.equalizers: return
+  let e = a.equalizers[k]
+  a.equalizers = loadEqualizers()
+  a.equalizers[k] = e
+  a.equalizers.save()
+
+proc rememberEqualizer(a: App, on: bool) =
+  ## Saves the equalizer heard for the current file, which has it from then
+  ## on (turned on or off as it is now), or forgets the file's: the
+  ## settings take it as it is, so nothing changes to the ear.
+  let path = a.player.path
+  if path.len == 0: return
+  let (eqOn, gains) = a.equalizer
+  # Saving doesn't wait for the background key.
+  if path != a.bmPath: a.keyKnown(path, mediaKey(path))
+  let k = a.bmKey
+  a.eqUnsaved = ""
+  a.equalizers = loadEqualizers()
+  if on:
+    a.equalizers[k] = EqEntry(path: path, on: eqOn, gains: gains)
+    a.osd("Equalizer saved for this media")
+  else:
+    a.equalizers.del(k)
+    (a.cfg.equalizerOn, a.cfg.equalizerGains) = (eqOn, gains)
+    a.osd("Equalizer no longer saved for this media")
+  a.equalizers.save()
+
+proc syncEqualizer(a: App) =
+  ## The equalizer heard, onto the players. A slider on the move, or moved
+  ## a moment ago, only goes to their running filters (Player.setEqualizer).
+  let (on, gains) = a.equalizer
+  let live = now() - a.eqChangedAt < EqSettle or
+    a.eqUi != nil and a.eqUi.activeId.startsWith("eq-band")
+  for p in [a.player, a.standby, a.lsound]:
+    if p != nil: p.setEqualizer(on, gains, live)
+  if not live and a.eqUnsaved.len > 0: a.saveEqualizer()
 
 proc snapToFrame(a: App, path: string, t: float): float =
   ## Time t on the nearest frame of the current file's video track, when
@@ -2206,7 +2467,7 @@ proc pingPong(a: App) =
     # mpv plays backward a keyframe's span at a time, decoding all of it
     # before showing its last frame: hardware decoders take several times
     # as long to hand over a span's frames.
-    p.h.setProp("hwdec", if on: "no" else: "auto-safe")
+    p.h.setProp("hwdec", if on: "no" else: hwdecMode())
     if not a.isSlave:  # following sets its loops itself
       a.applyLoop()
       a.applyAbLoop()
@@ -2718,7 +2979,7 @@ proc startSave(a: App, dest: string) =
   let src = a.saveSrc
   var d = dest
   if src.isWebLink:
-    let whole = a.saved.getOrDefault(src).wholeFile
+    let whole = a.savedFile(src)
     if whole.len > 0:  # the media cache holds all of it
       if d.splitFile.ext.len == 0: d.add whole.splitFile.ext
       a.saveJob = copying(whole, d)
@@ -2726,7 +2987,8 @@ proc startSave(a: App, dest: string) =
       a.osd("Saving links needs yt-dlp")
       return
     else:
-      a.saveJob = downloading(findYtdlp(a.cfg.ytdlp), src, d, a.ytCookies.getOrDefault(src))
+      a.saveJob = downloading(findYtdlp(a.cfg.ytdlp), src, d, a.ytCookies.getOrDefault(src),
+        a.saveFormat(src))
   else:
     if d.splitFile.ext.len == 0: d.add src.splitFile.ext
     a.saveJob = copying(src, d)
@@ -2967,13 +3229,17 @@ proc syncSettings(a: App) =
   a.updateTitle()
 
 proc recordEnd(a: App)
+proc switchQuality(a: App, url: string)
 proc pruneSaved(a: App)
 
 proc hookYtdlp(a: App)
 
+proc rendererChanged(a: App, before: RenderMode)
+
 proc closeOptions(a: App, ok: bool) =
   if ok:
     a.cfg.save()
+    a.rendererChanged(a.cfgBefore.renderMode)
     # Another folder for links: its own index, the current one left as is.
     let dir = a.cfg.webDir.expandPath
     if (if dir.len > 0: dir else: defaultSaveDir()) != saveDir():
@@ -2985,8 +3251,12 @@ proc closeOptions(a: App, ok: bool) =
     a.hookYtdlp()  # another yt-dlp chosen: mpv opens links with it
   else:
     let swatches = a.cfg.colorSwatches  # saved colors stay, like the recent files
+    let (recents, titles) = (a.cfg.recentFiles, a.cfg.recentTitles)
+    let eq = (a.cfg.equalizerOn, a.cfg.equalizerGains)  # its own window's, not Options'
     a.cfg = a.cfgBefore  # undo the live edits
     a.cfg.colorSwatches = swatches
+    (a.cfg.recentFiles, a.cfg.recentTitles) = (recents, titles)
+    (a.cfg.equalizerOn, a.cfg.equalizerGains) = eq
   a.optUi.focusId = ""
   a.overlay = ovNone
   a.syncSettings()
@@ -2994,7 +3264,7 @@ proc closeOptions(a: App, ok: bool) =
     a.optWin.visible = false
     a.window.activate()
 
-proc newDialogWindow(a: App, title: string, size: IVec2): (Window, Silky, Ui) =
+proc newDialogWindow(a: App, title: string, size: IVec2, modal = true): (Window, Silky, Ui) =
   ## A hidden dialog window over the main one, with its own Silky and Ui.
   let w = newWindow(title, size, style = Decorated, visible = false,
     vsync = false)
@@ -3002,7 +3272,7 @@ proc newDialogWindow(a: App, title: string, size: IVec2): (Window, Silky, Ui) =
   # main one instead (same visual), sharing the atlas texture and shaders.
   makeContextCurrent(a.window)
   w.icon = appIcon()
-  w.setDialogFor(a.window)
+  w.setDialogFor(a.window, modal)
   let sk = newSilky(w, a.atlasImg, a.atlas)
   sk.uiScale = a.sk.uiScale
   sk.atlasScale = a.sk.atlasScale
@@ -3047,7 +3317,7 @@ proc applyUiScale(a: App) =
   if s == a.sk.uiScale: return
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk]:
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk, a.eqSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
@@ -3055,7 +3325,7 @@ proc applyUiScale(a: App) =
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
                     (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize),
-                    (a.upWin, UpdateSize)]:
+                    (a.upWin, UpdateSize), (a.eqWin, EqualizerSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
   if a.pickWin != nil and a.pickWin.visible:
     let (sw, sh) = a.pickDlg.size
@@ -3259,6 +3529,23 @@ proc closeSyncProps(a: App) =
     a.syncWin.visible = false
     a.window.activate()
 
+proc toggleEqualizer(a: App) =
+  ## Shows the Equalizer window, or hides it. Not a dialog the player waits
+  ## on: both stay in use. It opens over the player the first time, where it
+  ## was left after that.
+  if a.eqWin != nil and a.eqWin.visible:
+    a.eqPos = a.eqWin.framePos
+    a.eqUi.focusId = ""
+    a.eqWin.visible = false
+    a.window.activate()
+  elif a.eqWin == nil:
+    (a.eqWin, a.eqSk, a.eqUi) = a.newDialogWindow("Equalizer", EqualizerSize, modal = false)
+    a.showDialog(a.eqWin, EqualizerSize)
+  else:
+    a.eqWin.placeDialog(a.eqPos, a.px(EqualizerSize))
+    a.eqWin.visible = true
+    a.eqWin.activate()
+
 proc latestCommandLine(a: App): CommandLine =
   ## The command line created last (edits keep their place), else a new one.
   if a.commands.len > 0: a.commands[^1] else: CommandLine()
@@ -3340,7 +3627,7 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
   # file on disk, the saved one when all of it is, else one downloaded first.
   var fetch, fetchErr = ""
   if path.isWebLink and c.parts.anyIt(it.card and it.kind == ckReference and it.content == "file"):
-    let local = a.saved.getOrDefault(path).wholeFile
+    let local = a.savedFile(path)
     if local.len > 0: path = local
     elif findYtdlp(a.cfg.ytdlp).len == 0: fetchErr = "Opening links needs yt-dlp"
     else:
@@ -3349,7 +3636,8 @@ proc execute(a: App, c: CommandLine, picks = initTable[string, string]()) =
       fetch = "trap " & quoteShellPosix("rm -rf " & quoteShellPosix(tmp)) & " EXIT\n" &
         "mkdir -p " & quoteShellPosix(tmp) & " || exit\n" &
         "echo " & quoteShellPosix("Downloading " & path) & "\n" &
-        downloadScript(findYtdlp(a.cfg.ytdlp), path, file, a.ytCookies.getOrDefault(path))
+        downloadScript(findYtdlp(a.cfg.ytdlp), path, file, a.ytCookies.getOrDefault(path),
+          a.saveFormat(path))
       path = file
   var (script, err) = c.parts.compose(path, picks)
   if fetchErr.len > 0: err = fetchErr
@@ -3477,7 +3765,7 @@ proc ytStatus(a: App): string =
   of ytInstall:
     result = "Installing yt-dlp"
     if j.progress >= 0: result.add &" {int(j.progress)}%"
-  of ytCaptions, ytSubs, ytPlaylist, ytDownload: discard  # their own slots, quietly
+  of ytCaptions, ytSubs, ytPlaylist, ytInfo, ytDownload: discard  # their own slots, quietly
 
 proc ytCurrentLink(a: App): string =
   if a.plIndex in 0 ..< a.playlist.len: a.playlist[a.plIndex] else: ""
@@ -3546,7 +3834,12 @@ proc closeYtdlp(a: App) =
     a.window.activate()
   if declined: a.ytGiveUp()
 
-const StreamTries = 2  ## a link's stream is tried again at once this many times
+const
+  StreamTries = 2     ## a link's stream is tried again at once this many times
+  StallTimeout = 20.0 ## a stream waiting this long for data without any is dropped
+  DropDelays = [0.0, 2, 4, 8, 15, 15, 15, 15, 15, 15]
+    ## a dropped stream is reopened after each of these in turn (seconds),
+    ## the network maybe still coming back
 
 proc ytSignIn(a: App, url: string): bool =
   ## The link asked to sign in (or the browser yt-dlp signed in with didn't
@@ -3591,6 +3884,17 @@ proc ytFailed(a: App, url: string) =
     (a.ytCurrent, a.ytLatest) = ("", "")
     a.ytJob = version(exe)
 
+proc reconnect(a: App, url: string) =
+  ## The link's stream dropped (the system slept, the network went away): it
+  ## opens again where it was, waiting longer each time for the network.
+  if a.dropTries >= DropDelays.len:
+    a.dropTries = 0
+    a.ytFailed(url)
+    return
+  a.osd("Connection lost, reconnecting...", OsdError)
+  a.ytOpen(url, DropDelays[a.dropTries])
+  inc a.dropTries
+
 proc ytInstall(a: App, msg: string) =
   a.ytJob = install()
   a.showYtdlp(ymBusy, msg)
@@ -3618,9 +3922,10 @@ proc pollYtList(a: App) =
   let link = j.url
   let id = link.youtubeId
   while a.ytListUsed < j.items.len:
-    let (vid, title) = j.items[a.ytListUsed]
+    let (vid, title, dur) = j.items[a.ytListUsed]
     inc a.ytListUsed
     let url = "https://www.youtube.com/watch?v=" & vid
+    if dur > 0: a.mediaInfo.mgetOrPut(url, MediaInfo()).duration = dur
     let at = a.playlist.find(if a.ytListLast.len > 0: a.ytListLast else: link)
     if at < 0 or a.playlistLocked:  # gone from the playlist meanwhile
       j.stop()
@@ -3652,28 +3957,68 @@ proc pollYtList(a: App) =
 proc pollYtdlp(a: App) =
   let p = a.player
   a.pollYtList()
+  a.pollYtInfo()
   if a.ytRetry.len > 0 and now() >= a.ytRetryAt:
     let url = a.ytRetry
     a.ytRetry = ""
     a.ytOpen(url)
   if a.ytWatch and not p.opening and (p.loaded or p.loadError.len > 0):
     a.ytWatch = false
-    if p.loadError.len > 0: a.ytFailed(p.path)
+    if p.loadError.len > 0:
+      if a.dropTries > 0: a.reconnect(p.path) else: a.ytFailed(p.path)
   # A stream YouTube turned down (403) once open: mpv skips to the end, which
   # is a failed link, not the video over (no After playback). It goes on
-  # from where it last played.
+  # from where it last played. So does one whose connection dropped (the
+  # system slept, the network went away): mpv takes that for the stream's
+  # end, well before the video's, or waits on it for data that never comes.
   if p.loaded and p.source.len == 0 and p.path.isWebLink and p.path == a.streamArgs.url:
-    if not p.eofReached: a.streamPos = p.timePos
-    elif not p.eofHandled and p.streamError.len > 0:
+    if not p.eofReached:
+      a.streamPos = p.timePos
+      # Played on fine since it was opened: tries count from here.
+      if p.timePos > a.streamArgs.start + 30: a.ytTries = 0
+      if p.timePos > a.streamArgs.start + 5: a.dropTries = 0
+    let cutShort = p.eofReached and p.duration > 0 and p.timePos < p.duration - 5
+    var stalled = false
+    if (p.buffering or p.seeking) and not p.paused:
+      if a.stallAt == 0 or p.cacheAhead > a.stallAhead + 0.5:
+        (a.stallAt, a.stallAhead) = (now(), p.cacheAhead)
+      stalled = now() - a.stallAt > StallTimeout
+    else: a.stallAt = 0
+    if stalled or p.eofReached and not p.eofHandled and (p.streamError.len > 0 or cutShort):
       p.eofHandled = true
-      p.loadError = p.streamError
+      a.stallAt = 0
+      p.loadError =
+        if p.streamError.len > 0: p.streamError
+        elif stalled: "no data for " & $int(StallTimeout) & " s"
+        else: "the connection dropped"
       a.streamArgs.start = a.streamPos
-      a.ytFailed(p.path)
+      if p.streamError.len > 0: a.ytFailed(p.path) else: a.reconnect(p.path)
   # A link opened (streamed or from disk): its automatic captions join.
   let link = a.ytCurrentLink
   if p.justLoaded and link.isWebLink:
     let mt = p.h.getStr("media-title")
     if mt.len > 0 and mt != link: a.linkTitles[link] = mt
+  # The formats its stream came in (a saved part's are noted as it opens).
+  if p.justLoaded and link.isWebLink and p.path == link and p.source.len == 0:
+    let f = p.hookFormat
+    a.playFormat[link] = f
+    let w = a.wants(link)
+    if f.len > 0 and not a.picked(link):
+      a.ytAuto[link] = f
+      if link in a.saved and a.saved[link].auto != f:
+        a.saved[link].setAuto(f)
+        a.saved.save()
+    # Auto's video or audio, whichever played in Auto (yt-dlp picks each
+    # alike whatever the other is).
+    let parts = f.split('+')
+    if parts.len == 2 and (w.video.len == 0 or w.audio.len == 0):
+      var ap = a.autoParts(link)
+      if w.video.len == 0: ap.video = parts[0]
+      if w.audio.len == 0: ap.audio = parts[1]
+      a.ytAutoParts[link] = ap
+      if link in a.saved and (a.saved[link].autoVideo, a.saved[link].autoAudio) != ap:
+        (a.saved[link].autoVideo, a.saved[link].autoAudio) = ap
+        a.saved.save()
   if p.justLoaded and not a.reopening and link.isWebLink and findYtdlp(a.cfg.ytdlp).len > 0:
     if link in a.ytCaptions: a.addCaptions(link)
     elif not a.ytCaps.running:
@@ -3683,6 +4028,16 @@ proc pollYtdlp(a: App) =
     a.ytCaps = nil
     if j.code == 0:
       a.ytCaptions[j.url] = j.originalCaptions
+      a.ytQualities[j.url] = j.qualities
+      if j.url in a.saved:
+        (a.saved[j.url].videoQ, a.saved[j.url].audioQ) = j.qualities
+        a.saved.save()
+      # A lock it opened without knowing them (the middle audio row) now
+      # knows what it stands for: in it, once (the formats are found once).
+      let f = a.linkFormat(j.url)
+      if p.path == j.url and p.loaded and a.picked(j.url) and f.len > 0 and
+         a.playFormat.getOrDefault(j.url).len > 0 and f != a.playFormat[j.url]:
+        a.switchQuality(j.url)
       if link == j.url and p.loaded: a.addCaptions(link)
   let j = a.ytJob
   if j == nil or not j.poll(): return
@@ -3690,7 +4045,7 @@ proc pollYtdlp(a: App) =
   if j.running: return
   a.ytJob = nil
   case j.task
-  of ytCaptions, ytSubs, ytPlaylist, ytDownload: discard
+  of ytCaptions, ytSubs, ytPlaylist, ytInfo, ytDownload: discard
   of ytVersion:
     a.ytCurrent = j.versionText
     a.ytJob = latest()
@@ -3804,6 +4159,77 @@ proc pollUpdate(a: App) =
     a.upRestart = true
     a.window.closeRequested = true
 
+# --- Rendering: GPU or CPU ----------------------------------------------------
+# Options > System > Rendering. The renderer is picked as the program starts
+# (gpumem); going over to the other is a restart, the state brought back as
+# after an update.
+
+const
+  VramSettle = 3.0      ## seconds the GPU's memory stays past the line before a switch
+  VramDwell = 30.0      ## Adaptive: seconds on a renderer before leaving it
+
+proc restartRenderer(a: App, cpu: bool) =
+  ## Restarts onto the CPU or the GPU, unless something going on would be
+  ## lost or cut short: then it's looked at again shortly.
+  if a.overlay != ovNone or a.menus.isOpen or pointerButtonsDown() or
+     a.saveJob.running or a.upJob.running or a.embProc != nil or a.upRestart:
+    return
+  a.rdRestart = if cpu: "cpu" else: "gpu"
+  a.window.closeRequested = true
+
+proc watchVram(a: App) =
+  ## Prefer GPU: back to the GPU once it has the memory. Adaptive: that,
+  ## and over to the CPU when the GPU runs out (or mpv says it did).
+  ## Always CPU, chosen while on the GPU: over to the CPU.
+  let t = now()
+  # Said once the file it restarted with plays, its tracks brought back
+  # (mpv's OSD drops what comes before), or straight away when there's none.
+  let p = a.player
+  if a.rdNote.len > 0 and not a.resuming and
+     (p.loaded and p.restarts > p.loadedRestarts or not p.loaded and not p.opening and t - a.rdStart > 1):
+    a.osd(a.rdNote, 4)
+    a.rdNote = ""
+  let oom = p.gpuOom
+  p.gpuOom = false
+  if a.rdRestart.len > 0 or t < a.rdCheckAt and not oom: return
+  a.rdCheckAt = t + 1
+  let mode = a.cfg.renderMode
+  if mode == rdCpu:
+    if not cpuWanted: a.restartRenderer(true)
+    return
+  if not cpuWanted and mode != rdAdaptive:
+    a.rdSince = 0
+    return
+  let free = freeVram()
+  let past =
+    if cpuWanted: a.rdForNow and free >= ReturnVram
+    else: oom or free >= 0 and free < LowVram
+  if not past:
+    a.rdSince = 0
+    return
+  if a.rdSince == 0: a.rdSince = t
+  if not oom and t - a.rdSince < VramSettle: return
+  if mode == rdAdaptive and t - a.rdStart < VramDwell: return
+  a.restartRenderer(not cpuWanted)
+
+proc rendererChanged(a: App, before: RenderMode) =
+  ## Options > System > Rendering, changed: from Always CPU, the GPU comes
+  ## back once it has the memory; to it, the CPU at once (watchVram).
+  let mode = a.cfg.renderMode
+  if mode == before: return
+  a.rdForNow = cpuWanted and mode != rdCpu
+  a.rdStart = 0  # no waiting on Adaptive's dwell: the user asked
+  a.rdCheckAt = 0
+
+proc rendererNote(): string =
+  ## What the start says of the renderer, when it's not the usual.
+  if restartedOnto() == "gpu": "GPU memory is free again: rendering on the GPU"
+  elif not cpuWanted: ""
+  elif not softwareGl: "Software rendering unavailable: decoding on the CPU only"
+  elif restartedOnto() == "cpu": "GPU out of memory: rendering on the CPU"
+  elif startedLow: "GPU memory is full: rendering on the CPU until it frees up"
+  else: ""
+
 # --- online videos kept on disk ----------------------------------------------
 # A link streaming is saved as it plays, a file for each stretch read without
 # a jump (websave). Opened again where some of it was saved, that part plays
@@ -3831,23 +4257,68 @@ proc handoffOff(a: App) =
   a.sbHandoff = false
   a.standbyOff()
 
+proc trackOpts(a: App, url: string): seq[string] =
+  ## The tracks chosen now, for the link opening again (from disk or its stream).
+  let p = a.player
+  let aid = p.selectedTrack("audio")
+  result.add "aid=" & (if aid == 0: "no" else: $aid)
+  if a.saved.getOrDefault(url).subsDone:  # numbered alike only then
+    let sid = p.selectedTrack("sub")
+    result.add "sid=" & (if sid == 0: "no" else: $sid)
+
 proc goOnline(a: App, t: float, stopped = false) =
   ## From a link's saved part to its stream at t, the same tracks chosen
   ## (`stopped`: there, stopped).
   let p = a.player
   a.handoffOff()
   let url = p.path
-  var opts = a.streamOpts(url)
-  let aid = p.selectedTrack("audio")
-  opts.add "aid=" & (if aid == 0: "no" else: $aid)
-  if a.saved.getOrDefault(url).subsDone:  # numbered alike only then
-    let sid = p.selectedTrack("sub")
-    opts.add "sid=" & (if sid == 0: "no" else: $sid)
+  var opts = a.streamOpts(url) & a.trackOpts(url)
   if t <= 0: opts.add "start=0"  # not the link's own (t=...)
   if stopped: opts.add "pause=yes"
   a.stopOnLoad = stopped
   a.ytTries = 0
+  a.dropTries = 0
   a.streamLink(url, t, opts.join(","))
+
+proc holdFrame(a: App)
+
+proc switchQuality(a: App, url: string) =
+  ## The link playing goes on in the quality it wants now (wants) from where
+  ## it is, from what's saved of it in that quality when there is some
+  ## there, else its stream. Nothing reopens when it plays in it already.
+  let p = a.player
+  if p.path != url or not p.loaded: return
+  let f = a.linkFormat(url)
+  if f.len > 0 and f == a.playFormat.getOrDefault(url): return
+  let t = p.posNow
+  let dur = p.duration
+  let stopped = p.stopped
+  var opts = a.trackOpts(url)
+  if stopped or p.paused: opts.add "pause=yes"
+  a.recordEnd()  # what it saved so far, in the quality it was in
+  a.handoffOff()
+  if not stopped: a.holdFrame()
+  a.qualitySwitch = true
+  a.ytTries = 0
+  a.dropTries = 0
+  let s = a.savedIn(url)
+  let part = s.chainAt(t)
+  if part.stop > part.start and (s.complete or part.stop - t >= SavedMin):
+    a.playSaved(url, t, part, opts)
+  else:
+    if t <= 0: opts.add "start=0"  # not the link's own (t=...)
+    a.streamLink(url, t, (a.streamOpts(url) & opts).join(","))
+  a.stopOnLoad = stopped
+  # The time and the seek bar stay up meanwhile, as the frame does.
+  p.duration = max(p.duration, dur)
+  p.keepTime = true
+
+proc pickQuality(a: App, url: string, video, audio: string) =
+  ## The quality menu's pick ("auto": Auto, whatever is locked): the link
+  ## goes on in it.
+  if a.ytPick.getOrDefault(url) == (video, audio): return
+  a.ytPick[url] = (video, audio)
+  a.switchQuality(url)
 
 proc webHandoff(a: App) =
   ## While a link's saved part plays: the standby opens the stream a little
@@ -3928,20 +4399,30 @@ proc recordStep(a: App) =
   if cur[1] < 0: return
   for r in p.buffered:
     if r[0] > cur[1]: return
-  # Worth it once it reaches past what's saved there.
-  let c = a.saved.getOrDefault(link).chainAt(cur[0])
+  # In the quality it streams in, noted with it; not knowing which, a pick
+  # isn't saved (it would stand for Auto).
+  let format = a.playFormat.getOrDefault(link)
+  if format.len == 0 and a.picked(link): return
+  # Worth it once it reaches past what's saved there in that quality.
+  let c = a.saved.getOrDefault(link).inFormat(
+    if format.len > 0: format else: a.saved.getOrDefault(link).auto).chainAt(cur[0])
   let have = if c.stop > c.start: c.stop else: cur[0]
   if cur[1] >= have + RecordMin:
     let r = cur
     try: createDir(saveDir())
     except OSError: return
-    a.rec = Seg(file: newSegFile(link), start: max(r[0], 0), stop: max(r[0], 0))
+    a.rec = Seg(file: newSegFile(link), start: max(r[0], 0), stop: max(r[0], 0), format: format)
     a.recUrl = link
     a.recRanges = p.buffered.len
     a.recWritten = a.rec.start
     p.dumpFrom(r[0], a.rec.file)
     a.entry(link).duration = p.duration
     a.entry(link).used = epochTime()
+    if link in a.ytAuto and a.entry(link).auto != a.ytAuto[link]: a.entry(link).setAuto(a.ytAuto[link])
+    if link in a.ytAutoParts:
+      (a.entry(link).autoVideo, a.entry(link).autoAudio) = a.ytAutoParts[link]
+    if link in a.ytQualities:
+      (a.entry(link).videoQ, a.entry(link).audioQ) = a.ytQualities[link]
     let title = p.h.getStr("media-title")
     if title.len > 0 and title != link: a.entry(link).title = title
     if a.entry(link).chapters.len == 0 and p.chapters.len > 0:
@@ -4048,15 +4529,14 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let recent = file.sub("Open Recent", enabled = a.cfg.recentFiles.len > 0 and not locked)
   let openOne = proc (path: string) = a.openPaths(@[path])
   let removeOne = proc (path: string) =
-    let i = a.cfg.recentFiles.find(path)
-    if i >= 0: a.cfg.recentFiles.delete(i)
+    a.cfg.removeRecent(path)
     if a.cfg.recentFiles.len == 0: a.menus.close()
   for r in a.cfg.recentFiles:
     recent.item(a.recentName(r), action = bindAct(openOne, r),
       remove = bindAct(removeOne, r))
   if a.cfg.recentFiles.len > 0:
     recent.sep()
-    recent.item("Clear List", action = proc () = a.cfg.recentFiles.setLen 0)
+    recent.item("Clear List", action = proc () = a.cfg.clearRecent())
   file.item("Open Directory...", enabled = not locked, action = proc () =
     a.ask(dkOpenDir, "opendir", "Open Directory"))
   file.item("Open From Clipboard", k(kaOpenClipboard), enabled = not locked,
@@ -4315,6 +4795,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
+  if a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0:
+    # Not at Options > Online's Lowest Quality, which downloads no thumbnails.
+    ctx.check("Show Thumbnail", checked = a.cfg.ytThumbnail,
+      enabled = a.cfg.streamQuality != sqLowest, action = proc () =
+        a.cfg.ytThumbnail = not a.cfg.ytThumbnail
+        a.cfg.save())
+    ctx.sep()
   if p.isSpherical:
     ctx.check("Ctrl+Drag to Look",
       checked = a.cfg.sphereDragMovesWindow, action = proc () =
@@ -4325,7 +4812,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   ctx.sep()
   ctx.children.add [playPause.relabeled("Play/Pause"), stop, rep]
   ctx.sep()
-  ctx.children.add [fullScreen, frame, grab]
+  ctx.children.add fullScreen
   ctx.sep()
   ctx.children.add nav
   ctx.sep()
@@ -4388,6 +4875,67 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.bookmarksAsChapters = not a.cfg.bookmarksAsChapters
       a.cfg.save())
     (root, sb)
+  of cmQuality:
+    # Video qualities on the left, audio on the right; "Auto" is Options >
+    # Online's. A lock has every link open alike: in that video quality when
+    # offered, in the audio row that far down (first, middle, last).
+    let q = newMenuRoot()
+    q.columns = true
+    let url = a.player.path
+    let w = a.wants(url)
+    let found = a.qualitiesOf(url)
+    let looking = not found.known and a.ytCaps.running and a.ytCaps.url == url
+    let pickVideo = proc (id: string) =
+      a.pickQuality(url, id, a.ytPick.getOrDefault(url).audio)
+    let pickAudio = proc (id: string) =
+      a.pickQuality(url, a.ytPick.getOrDefault(url).video, id)
+    # Locking picks it for this link too; unlocking keeps this link as it is.
+    let lockVideo = proc (x: Quality) =  # x.label: what's locked
+      if a.cfg.streamLockVideo == x.label:
+        let cur = a.wants(url).video
+        if not cur.startsWith("~"):
+          a.ytPick.mgetOrPut(url, ("", "")).video = if cur.len > 0: cur else: "auto"
+        a.cfg.streamLockVideo = ""
+      else:
+        pickVideo(x.id)
+        a.cfg.streamLockVideo = x.label
+      a.cfg.save()
+    let rows = found.audio.len
+    let lockAudio = proc (x: Quality) =  # x.label: "auto" or a rank
+      let lk = a.cfg.streamLockAudio
+      if lk == x.label or lk in AudioRanks and rankRow(lk, rows) == rankRow(x.label, rows):
+        let cur = a.wants(url).audio
+        if not cur.startsWith("~"):
+          a.ytPick.mgetOrPut(url, ("", "")).audio = if cur.len > 0: cur else: "auto"
+        a.cfg.streamLockAudio = ""
+      else:
+        pickAudio(x.id)
+        a.cfg.streamLockAudio = x.label
+      a.cfg.save()
+    let vc = q.column("Video")
+    vc.radio("Auto", checked = w.video.len == 0, action = bindAct(pickVideo, "auto"),
+      lock = bindAct(lockVideo, ("auto", "auto")), locked = a.cfg.streamLockVideo == "auto")
+    for x in found.video:
+      vc.radio(x.label, checked = w.video == x.id, action = bindAct(pickVideo, x.id),
+        lock = bindAct(lockVideo, x), locked = a.cfg.streamLockVideo == x.label)
+    if looking: vc.item("...", enabled = false)
+    let ac = q.column("Audio")
+    ac.radio("Auto", checked = w.audio.len == 0, action = bindAct(pickAudio, "auto"),
+      lock = bindAct(lockAudio, ("auto", "auto")), locked = a.cfg.streamLockAudio == "auto")
+    for i, x in found.audio:
+      # Only the rows a rank stands for take a lock, so it sits where it means.
+      var rank = ""
+      for r in ["highest", "lowest", "mid"]:  # two rows: the second is the lowest
+        if rankRow(r, rows) == i and rank.len == 0: rank = r
+      if rank.len > 0:
+        let lk = a.cfg.streamLockAudio
+        ac.radio(x.label, checked = w.audio == x.id, action = bindAct(pickAudio, x.id),
+          lock = bindAct(lockAudio, (x.id, rank)),
+          locked = lk in AudioRanks and rankRow(lk, rows) == i)
+      else:
+        ac.radio(x.label, checked = w.audio == x.id, action = bindAct(pickAudio, x.id))
+    if looking: ac.item("...", enabled = false)
+    (root, q)
   of cmRunLog:
     let rl = newMenuRoot()
     # The selected text, or the whole log when nothing is selected.
@@ -5191,6 +5739,94 @@ proc drawSphere(a: App, area: Rect, fb: IVec2, flags: uint64) =
   a.quad.drawSphere(p.target.tex, area, fb.vec2, v, fresh)
   glDisable(GL_SCISSOR_TEST)
 
+proc holdFrame(a: App) =
+  ## The frame shown stays up while the link opens again in another quality,
+  ## until the new stream shows its own (drawVideo).
+  let p = a.player
+  if a.holding:  # picked again meanwhile: the first frame still
+    a.heldSince = now()
+    a.heldFresh = false
+    return
+  if not p.hasVideo or p.stopped or p.isSpherical or p.target.tex == 0: return
+  a.heldTarget = p.target
+  p.target = VideoTarget()
+  a.heldCorners = a.videoCorners
+  a.heldPath = p.path
+  a.heldSince = now()
+  a.heldFresh = false
+  a.holding = true
+
+proc drawHeld(a: App, area: Rect, fb: IVec2, flags: uint64): bool =
+  ## While holding: the held frame where it was, true; false once the new
+  ## stream has a frame to show (or it failed, or something else opened).
+  let p = a.player
+  let fresh = (flags and MpvRenderUpdateFrame) != 0
+  if fresh and not p.opening: a.heldFresh = true
+  let ready = not p.opening and p.loaded and p.hasVideo and
+    p.restarts > p.loadedRestarts and a.heldFresh
+  if ready or p.path != a.heldPath or p.stopped or p.loadError.len > 0 or
+     now() - a.heldSince > 30:
+    a.heldTarget.free()
+    a.holding = false
+    return false
+  if fresh:  # consumed, so mpv keeps its pipeline moving
+    p.target.ensureSize(16, 16)
+    p.render.render(p.target)
+  a.renderOsdLayer(area)
+  glEnable(GL_SCISSOR_TEST)
+  glScissor(GLint(area.x), GLint(fb.y.float32 - area.y - area.h), GLsizei(area.w), GLsizei(area.h))
+  a.quad.draw(a.heldTarget.tex, a.heldCorners, fb.vec2)
+  a.drawOsdLayer(area, fb)
+  glDisable(GL_SCISSOR_TEST)
+  true
+
+proc wantedThumb(a: App): string =
+  ## The YouTube video id whose thumbnail the frame shows, "" for none: while
+  ## a link plays without a video track, unless turned off or at Options >
+  ## Online's Lowest Quality (nothing downloaded beyond the streams).
+  let p = a.player
+  if not a.cfg.ytThumbnail or a.cfg.streamQuality == sqLowest: return
+  if not p.loaded or p.stopped or p.hasVideo or a.holding: return
+  if a.plIndex notin 0 ..< a.playlist.len: return
+  a.playlist[a.plIndex].youtubeId
+
+proc thumbShown(a: App): bool =
+  let id = a.wantedThumb
+  id.len > 0 and a.thumb != nil and a.thumb.id == id and a.thumb.image != nil
+
+proc pollThumbnail(a: App) =
+  let id = a.wantedThumb
+  if id.len == 0:
+    if a.thumb.running:  # turned off meanwhile: no more downloading
+      a.thumb.cancel()
+      a.thumb = nil
+    return
+  if a.thumb == nil or a.thumb.id != id:
+    a.thumb.cancel()
+    a.thumb = fetchThumbnail(id)
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  elif a.thumb.poll():
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc drawThumbnail(a: App, area: Rect, fb: IVec2) =
+  ## The thumbnail, fit in the frame.
+  if not a.thumbShown: return
+  let img = a.thumb.image
+  if a.thumbTexId != a.thumb.id:
+    if a.thumbTex == 0: glGenTextures(1, a.thumbTex.addr)
+    glBindTexture(GL_TEXTURE_2D, a.thumbTex)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8.GLint, img.width.GLsizei, img.height.GLsizei, 0,
+      GL_RGBA, GL_UNSIGNED_BYTE, img.data[0].addr)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR.GLint)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR.GLint)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE.GLint)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE.GLint)
+    glBindTexture(GL_TEXTURE_2D, 0)
+    a.thumbTexId = a.thumb.id
+  let sz = vec2(img.width.float32, img.height.float32)
+  let size = (sz * min(area.w / sz.x, area.h / sz.y)).floor
+  a.quad.draw(a.thumbTex, rectCorners((area.xy + (area.wh - size) / 2).floor, size), fb.vec2)
+
 proc drawVideo(a: App, area: Rect, fb: IVec2) =
   ## GL pass beneath the UI: black frame area and the transformed video.
   let flags = if a.renderNow: MpvRenderUpdateFrame else: 0'u64
@@ -5205,11 +5841,13 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
   glClearColor(0, 0, 0, 1)
   glClear(GL_COLOR_BUFFER_BIT)
   glDisable(GL_SCISSOR_TEST)
+  if a.holding and a.drawHeld(area, fb, flags): return
   if not a.player.hasVideo or a.player.stopped:
     # Still consume frames so mpv keeps its pipeline moving.
     if (flags and MpvRenderUpdateFrame) != 0:
       a.player.target.ensureSize(16, 16)
       a.player.render.render(a.player.target)
+    a.drawThumbnail(area, fb)
     return
   if a.player.isSpherical:
     a.drawSphere(area, fb, flags)
@@ -5244,7 +5882,8 @@ proc drawVideo(a: App, area: Rect, fb: IVec2) =
                 a.lfFrames[a.lfShow].target.w == tw and a.lfFrames[a.lfShow].target.h == th:
               a.lfFrames[a.lfShow].target.tex
             else: a.player.target.tex
-  a.quad.draw(tex, transformedCorners(center + shift, quadSize, a.xf.rotation), fb.vec2)
+  a.videoCorners = transformedCorners(center + shift, quadSize, a.xf.rotation)
+  a.quad.draw(tex, a.videoCorners, fb.vec2)
   a.drawOsdLayer(area, fb)
   glDisable(GL_SCISSOR_TEST)
 
@@ -5460,9 +6099,11 @@ proc controlsVolumeW(a: App): float32 =
 
 proc controlsTier(a: App, w: float32): int =
   ## How much a controls bar w wide drops as the window narrows: 0 keeps
-  ## everything, 1 hides the status bar's key hints, 2 the Repeat button,
-  ## 3 the rate buttons, 4 previous/next.
-  let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep, CtlSepW + CtlStep]
+  ## everything, 1 hides the status bar's key hints, 2 the Repeat and
+  ## Equalizer buttons (and a link's quality one), 3 the rate buttons, 4
+  ## previous/next.
+  let quality = if a.player.path.isWebLink: CtlStep else: 0
+  let need = [6 + 3 * CtlStep, CtlSepW + 2 * CtlStep, 2 * CtlStep, CtlSepW + 2 * CtlStep + quality]
   var full = a.controlsVolumeW + 10
   for n in need: full += n
   if w >= full + CtlHintsMargin: return 0
@@ -5485,10 +6126,13 @@ proc controls(a: App, r: Rect) =
   let bh = r.h - 8
   var x = r.x + 6
   let y = r.y + 4
-  template btn(id, iconName, tipText: string, enabled: bool, toggled: bool, body: untyped) =
-    if ui.iconButton(id, rect(x, y, bw, bh), iconName & "20", tipText, enabled, toggled):
+  template btn(id, iconName, tipText: string, enabled: bool, toggled: bool,
+               toggledCol: ColorRGBX, body: untyped) =
+    if ui.iconButton(id, rect(x, y, bw, bh), iconName & "20", tipText, enabled, toggled, toggledCol):
       body
     x += CtlStep
+  template btn(id, iconName, tipText: string, enabled: bool, toggled: bool, body: untyped) =
+    btn(id, iconName, tipText, enabled, toggled, colAccent, body)
   template divider() =
     ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
     x += CtlSepW
@@ -5514,6 +6158,19 @@ proc controls(a: App, r: Rect) =
     if ui.hover(loopR) and ui.released(MouseRight):
       a.ctxMenu = cmRepeat
       a.menus.openContext(ui.mouse)
+    # Lit while its window is open, blue while it's on.
+    let eqOn = a.equalizer.on
+    btn("equalizer", "equalizer", "Equalizer", true, eqOn or a.eqWin != nil and a.eqWin.visible,
+        if eqOn: colEqualizer else: colAccent):
+      a.toggleEqualizer()
+    # A link's video and audio quality, picked from what it offers.
+    if p.path.isWebLink:
+      let gearR = rect(x, y, bw, bh)
+      a.qualityRect = gearR
+      let shown = a.menus.contextOpen and a.ctxMenu == cmQuality
+      btn("quality", "gear", "Quality", p.loaded, shown):
+        a.ctxMenu = cmQuality
+        a.menus.openContext(gearR.xy, sticky = true, keep = gearR, above = true)
 
   # Volume on the right, never over the buttons.
   let vx = max(r.x + r.w - a.controlsVolumeW, x + 4)
@@ -5756,6 +6413,14 @@ proc status(a: App, r: Rect) =
   let tw = ui.textSize(timeText, FontSmall).x
   let timeRect = rect(ix - iw / 2 - tw - 14, r.y, tw + 4, r.h)
   ui.textIn(timeText, timeRect, colText, FontSmall)
+  if cpuWanted:
+    # Rendering on the CPU (gpumem): said beside the time.
+    let cw = ui.textSize("CPU", FontSmall).x
+    let cr = rect(timeRect.x - cw - 14, r.y, cw + 4, r.h)
+    ui.textIn("CPU", cr, colTextDim, FontSmall)
+    ui.tip(cr, if not softwareGl: "Decoding on the CPU (no software renderer installed)"
+               elif a.rdForNow: "Rendering on the CPU until the GPU's memory frees up"
+               else: "Rendering on the CPU (Options > System > Rendering)")
   if ui.hover(timeRect) and ui.released():
     a.cfg.showRemaining = not a.cfg.showRemaining
     a.cfg.save()
@@ -5907,6 +6572,7 @@ proc playlistPanel(a: App, r: Rect) =
       a.playIndex(i)
   ui.sk.popClipRect()
   a.probeNext(first .. last)
+  a.infoNext(first .. last)
 
 proc runLogPanel(a: App, r: Rect) =
   ## The Run menu's command lines and what they printed, newest at the bottom.
@@ -6094,6 +6760,7 @@ proc dropFiles(a: App, dropped: seq[string]) =
     a.openPaths(paths)
 
 proc idleScreen(a: App, area: Rect) =
+  if a.holding or a.thumbShown: return  # a frame is up (another quality opening)
   let ui = a.ui
   let c = area.xy + area.wh / 2
   if a.player.loaded and not a.player.hasVideo and not a.player.stopped:
@@ -6367,6 +7034,132 @@ proc renderEmbed(a: App, shot: string) =
   a.endDialogDraw(w, a.embSk, size)
   if (ok or clear or enter) and a.embMode in {emAsk, emInstall}: a.embAnswer(true, clear)
   elif cancel or esc or (enter and a.embMode == emFailed): a.embAnswer(false)
+
+proc renderEqualizer(a: App, shot: string) =
+  ## Draws the Equalizer window: its changes are heard as they are made,
+  ## on or off (on only has the gains apply). Escape hides it, like its
+  ## close button.
+  let w = a.eqWin
+  if w == nil or not w.visible: return
+  let ui = a.eqUi
+  if w.closeRequested or w.buttonPressed[KeyEscape]:
+    w.closeRequested = false
+    a.toggleEqualizer()
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  if not a.beginDialogDraw(w, a.eqSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.eqSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = ui.size.x
+  let H = ui.size.y
+  let was = a.equalizer
+  var (on, gains) = was
+  discard ui.checkbox("eq-on", vec2(16, 12), "Enable Equalizer", on)
+  var saved = a.eqSaved
+  let saveX = 16 + 24 + ui.textSize("Enable Equalizer").x + 18
+  let saveChanged = ui.checkbox("eq-save", vec2(saveX, 12), "Save for this media", saved,
+    enabled = a.player.path.len > 0)
+  ui.tip(rect(saveX, 12, 24 + ui.textSize("Save for this media").x, 22),
+    "Reopening this media file brings these settings back")
+  let normR = rect(W - 184, 10, 86, 26)
+  if ui.textButton("eq-norm", normR, "Normalize"):
+    # The highest band goes to 0 dB, the others with it by as much, so none
+    # is above 0; what passes the bottom of the range stops there.
+    let top = max(gains)
+    for g in gains.mitems: g = clamp(g - top, a.eqMinGain, EqMaxGain)
+  ui.tip(normR, "Move the highest band to 0 dB, and the others by as much")
+  if ui.textButton("eq-reset", rect(W - 90, 10, 74, 26), "Reset"):
+    gains = newSeq[float](EqFreqs.len)
+  ui.rect(rect(0, 46, W, 1), colBorder)
+  # The bands: their gains above, sliders, frequencies below; the dB scale
+  # on the left.
+  const ScaleW = 52'f32
+  let lo = a.eqMinGain
+  let (top, bottom) = (84'f32, H - 76)
+  let x0 = 16 + ScaleW + 8
+  let colW = (W - 16 - x0) / EqFreqs.len.float32
+  let zeroY = top + (bottom - top) * float32(EqMaxGain / (EqMaxGain - lo))
+  for (label, y) in [(&"+{EqMaxGain:g} dB", top), ("0 dB", zeroY), (&"{lo:g} dB", bottom)]:
+    ui.textIn(label, rect(8, y - 10, ScaleW, 20), colTextDim, FontSmall, h = RightAlign)
+  ui.rect(rect(16 + ScaleW, zeroY, W - 32 - ScaleW, 1), colBorder)
+  # The arrow keys move the slider under the pointer, else the one with
+  # keyboard focus.
+  let pointed = ui.mouse.x >= x0 and ui.mouse.x < x0 + colW * EqFreqs.len.float32 and
+    ui.mouse.y >= top - 8 and ui.mouse.y <= bottom + 8
+  if pointed and ui.focusId.len == 0 and
+     [KeyUp, KeyDown, KeyLeft, KeyRight, KeyHome, KeyEnd].anyIt(w.buttonPressed[it]):
+    ui.navId = &"eq-band{int(floor((ui.mouse.x - x0) / colW))}"
+  # Dragging from a slider across the others sets each one passed to the
+  # pointer's height, as if drawn: the bands skipped by a fast move in
+  # between, along the line from where it was. Near 0 it lands on 0, as
+  # the sliders do, unless Shift is held.
+  if ui.activeId.startsWith("eq-band") and ui.down():
+    let j = clamp(int(floor((ui.mouse.x - x0) / colW)), 0, EqFreqs.high)
+    var v = round(EqMaxGain - clamp((ui.mouse.y - top) / (bottom - top), 0, 1) * (EqMaxGain - lo))
+    if not w.shiftDown and abs(ui.mouse.y - zeroY) <= 5: v = 0
+    let (pj, pv) = if a.eqDragging: a.eqDragAt else: (j, v)
+    for k in min(pj, j) .. max(pj, j):
+      let t = if j == pj: 1.0 else: (k - pj) / (j - pj)
+      gains[k] = round(pv + (v - pv) * t)
+    (a.eqDragging, a.eqDragAt) = (true, (j, v))
+    ui.activeId = &"eq-band{j}"
+  else:
+    a.eqDragging = false
+  # A line per dB, fewer when they would crowd.
+  var ticks = 1.0
+  for t in [1.0, 2, 3, 6, 12]:
+    ticks = t
+    if (bottom - top) * float32(t / (EqMaxGain - lo)) >= 5: break
+  proc dB(g: float): string = (if g == 0: "0" else: &"{g:+g}") & " dB"
+  for i, f in EqFreqs:
+    let x = x0 + colW * i.float32
+    let g = gains[i]
+    ui.textIn(if g == 0: "0" else: &"{g:+g}", rect(x, 56, colW, 20),
+      if g == 0: colTextDim else: colText, FontSmall, h = CenterAlign)
+    let id = &"eq-band{i}"
+    let sr = rect(x, top, colW, bottom - top)
+    if ui.vSlider(id, sr, gains[i], lo, EqMaxGain, 1, origin = 0,
+                  fill = if on: colAccent else: colTextDisabled, ticks = ticks, snapTo = 0) and
+       ui.activeId != id:
+      (a.eqTipBand, a.eqTipUntil) = (i, now() + 1.0)
+    if not (a.eqTipBand == i and now() < a.eqTipUntil):
+      ui.tip(sr, dB(gains[i]))
+    let name = if f >= 1000: &"{f / 1000:g}K" else: &"{f:g}"
+    ui.textIn(name, rect(x, bottom + 12, colW, 20), colTextDim, FontSmall, h = CenterAlign)
+  # The bottom of the sliders' range.
+  ui.rect(rect(0, H - 46, W, 1), colBorder)
+  let minW = ui.textSize("Minimum").x
+  ui.textIn("Minimum", rect(16, H - 36, minW + 2, 26), colText)
+  var minGain = lo
+  if ui.numberField("eq-min", rect(16 + minW + 10, H - 36, 120, 26), minGain, 1, EqMinGainLimit, -1):
+    a.cfg.equalizerMinGain = minGain
+  ui.textIn("dB", rect(16 + minW + 138, H - 36, 30, 26), colTextDim)
+  discard ui.tabNavigate()
+  ui.drawTooltip()
+  # A band moved by key or wheel: its value by its cap for a moment.
+  if now() < a.eqTipUntil:
+    let i = a.eqTipBand
+    let text = dB(gains[i])
+    let sz = ui.textSize(text, FontSmall) + vec2(14, 8)
+    let ky = top + (bottom - top) * float32((EqMaxGain - gains[i]) / (EqMaxGain - lo))
+    var p = vec2(x0 + colW * (i.float32 + 0.5) + 14, ky - sz.y / 2)
+    if p.x + sz.x > W - 4: p.x = x0 + colW * (i.float32 + 0.5) - 14 - sz.x
+    ui.sk.pushLayer(PopupsLayer)
+    ui.rect(rect(p, sz), colPopup)
+    ui.border(rect(p, sz), colBorder)
+    ui.text(text, p + vec2(7, 4), colText, FontSmall)
+    ui.sk.popLayer()
+  a.eqSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-equalizer.png")
+  a.endDialogDraw(w, a.eqSk, size)
+  if saveChanged: a.rememberEqualizer(saved)
+  elif (on, gains) != was: a.changeEqualizer(on, gains)
 
 proc renderSyncProps(a: App, shot: string) =
   ## Draws Synchronize > Properties; its changes apply as they are made.
@@ -6895,7 +7688,8 @@ proc frame(a: App) =
   let revealZone = H - bottomH - 48
   let mouseIn = ui.fakeMouse.x >= 0 or w.mouseInside
   let bottomVisible = not fs or ui.mouse.y >= revealZone and mouseIn or
-    a.seekDragging or ui.activeId == "volume"
+    a.seekDragging or ui.activeId == "volume" or
+    a.menus.contextOpen and a.ctxMenu == cmQuality  # over its gear button
   let bottomRect = rect(0, H - bottomH, W, bottomH)
   let plRect =
     if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
@@ -7131,6 +7925,7 @@ proc frame(a: App) =
   a.renderYtdlp(shot)
   a.renderEmbed(shot)
   a.renderUpdate(shot)
+  a.renderEqualizer(shot)
 
 # --- setup & main loop --------------------------------------------------------
 
@@ -7198,6 +7993,16 @@ proc runScriptStep(a: App, st: ScriptStep) =
       of "about": ovAbout
       else: ovNone)
   of "commands": a.showCommands()
+  of "equalizer": a.toggleEqualizer()  # the Equalizer window, shown or hidden
+  of "eq":  # on | off | save | unsave | band gain: as the Equalizer window's controls do
+    var (on, gains) = a.equalizer
+    case arg
+    of "on", "off": a.changeEqualizer(arg == "on", gains)
+    of "save", "unsave": a.rememberEqualizer(arg == "save")
+    else:
+      gains[parseInt(st.args[0])] = parseFloat(st.args[1])
+      a.changeEqualizer(on, gains)
+  of "eqdump": stderr.writeLine "eq ", a.equalizer, " saved=", a.eqSaved, " af=", a.player.h.getStr("af")
   of "cmdcard":  # name [value|reference [content]]: a card at the caret
     let kind = if st.args.len > 1 and st.args[1] == "reference": ckReference else: ckValue
     a.cmdDlg.addCard(st.args[0], kind, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "")
@@ -7286,6 +8091,34 @@ proc runScriptStep(a: App, st: ScriptStep) =
     stderr.writeLine "embed mode=", a.embMode, " overlay=", a.overlay, " msg=", a.embMsg,
       " status=", a.mkvStatus, " exe=", findMkvpropedit(a.cfg.mkvpropedit), " marks=", a.fileBookmarks.len,
       " chapters=", a.player.chapters.len, " running=", a.embProc != nil
+  of "quality":  # the quality button's menu, as clicking it opens it
+    a.ctxMenu = cmQuality
+    a.menus.openContext(a.qualityRect.xy, sticky = true, keep = a.qualityRect, above = true)
+  of "qpick":  # video audio: the quality menu's picks, format ids ("-": Auto)
+    let f = st.args.mapIt(if it == "-": "" else: it)
+    a.pickQuality(a.player.path, f[0], f[1])
+  of "qlock":  # Video|Audio label: clicks the lock of the quality menu's item
+    let was = a.ctxMenu
+    a.ctxMenu = cmQuality
+    let (_, qm) = a.buildMenu()
+    a.ctxMenu = was
+    let label = st.args[1 .. ^1].join(" ")
+    for col in qm.children:
+      if col.label == st.args[0]:
+        for it in col.children:
+          if it.label == label and it.lock != nil: it.lock()
+  of "qdump":
+    stderr.writeLine "quality open=", a.menus.contextOpen and a.ctxMenu == cmQuality,
+      " pick=", a.ytPick.getOrDefault(a.player.path),
+      " found=", a.ytQualities.getOrDefault(a.player.path),
+      " format=", a.player.h.getStr("ytdl-format"), " h=", a.player.videoH,
+      " acodec=", a.player.h.getStr("audio-codec-name"),
+      " pos=", a.player.timePos, " paused=", a.player.paused,
+      " button=", a.qualityRect, " menu=", a.menus.contextRect,
+      " playing=", a.playFormat.getOrDefault(a.player.path), " auto=", a.ytAuto.getOrDefault(a.player.path),
+      " wants=", a.wants(a.player.path), " locks=", (a.cfg.streamLockVideo, a.cfg.streamLockAudio),
+      " holding=", a.holding, " opening=", a.player.opening, " source=", a.player.source.len > 0,
+      " segs=", $a.saved.getOrDefault(a.player.path).segs.mapIt(&"{it.start:.0f}..{it.stop:.0f}:{it.format}")
   of "ytdump":
     stderr.writeLine "ytdlp status=", a.ytStatus, " mode=", a.ytMode, " overlay=", a.overlay,
       " opening=", a.player.opening, " loaded=", a.player.loaded, " path=", a.player.path,
@@ -7315,10 +8148,11 @@ proc main() =
   let a = App(plIndex: -1, plSelected: -1, optionsDlg: newOptionsDialog(),
     cmdDlg: newCmdDialog(), pickDlg: newPickDialog())
   a.cfg = loadConfig()
+  discard a.cfg.reloadRecent()
   a.script = loadScript()
   randomize()
   let params = commandLineParams()
-  let files = params.filterIt(it != ResumeArg).mapIt(
+  let files = params.stripRenderArgs.filterIt(it != ResumeArg).mapIt(
     if it.contains("://"): it else: it.absolutePath)
   # Restarted into an update: what it was doing comes back.
   let (resumed, rs) = if ResumeArg in params: takeResume() else: (false, ResumeState())
@@ -7335,6 +8169,7 @@ proc main() =
   a.positions = loadPositions()
   a.subScales = loadSubScales()
   a.bookmarks = loadBookmarks()
+  a.equalizers = loadEqualizers()
   if a.cfg.seedPresets(): a.cfg.save()
   a.commands = loadCommandLines()
   if a.cfg.rememberTransform:
@@ -7354,13 +8189,27 @@ proc main() =
   # Ties the window to majestic-media-player.desktop (taskbar icon, audio
   # stream matching), whatever the binary is called.
   when defined(linux): x11ClassName = "majestic-media-player"
-  a.window = newWindow(AppName, startSize, vsync = false)
+  try:
+    a.window = newWindow(AppName, startSize, vsync = false)
+    makeContextCurrent(a.window)
+    loadExtensions()
+    if glGetString(GL_VERSION) == nil: raise newException(ValueError, "no OpenGL context")
+  except CatchableError as e:
+    # The GPU couldn't open the window (its memory full, say): the CPU can.
+    if cpuWanted: raise
+    stderr.writeLine "GPU rendering failed (", e.msg, "): starting on the CPU"
+    if resumed: rs.save()  # taken: for the restart to take
+    a.instance.close()
+    a.peers.close()
+    try:
+      startProcess(getAppFilename(), args = params.stripRenderArgs & (RenderArg & "cpu"),
+        options = {poParentStreams, poDaemon}).close()
+    except OSError as e: stderr.writeLine "cannot restart: ", e.msg
+    return
   a.window.icon = appIcon()
   a.window.initMainWindow()
   if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
-  makeContextCurrent(a.window)
-  loadExtensions()
   a.window.disableVsync()
   if c.rememberWindowPos and c.windowW > 0:
     # Only onto a monitor that still exists.
@@ -7455,6 +8304,9 @@ proc main() =
     a.focusLostAt = if a.window.focused: 0.0 else: now()
     a.dirtyUntil = now() + 0.5
 
+  a.rdForNow = startedLow
+  a.rdStart = now()
+  a.rdNote = rendererNote()
   if resumed: a.resumeState(rs)
   elif files.len > 0: a.openPaths(files)
   elif c.rememberPlaylist:
@@ -7482,6 +8334,7 @@ proc main() =
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
     if a.embWin != nil: a.embWin.runeInputEnabled = true
     if a.upWin != nil: a.upWin.runeInputEnabled = true
+    if a.eqWin != nil: a.eqWin.runeInputEnabled = true
 
   proc step(): bool =
     ## One pass of the main loop after reading events; false when there was
@@ -7514,6 +8367,7 @@ proc main() =
     a.loopFrames()
     a.pollProbe()
     a.pollMediaKey()
+    a.syncEqualizer()
     a.preview.pollEvents()
     a.pollDialog()
     a.pollJobs()
@@ -7522,6 +8376,8 @@ proc main() =
     a.pollSave()
     a.pollEmbed()
     a.pollUpdate()
+    a.pollThumbnail()
+    a.watchVram()
     for st in a.script.due: a.runScriptStep(st)
     if a.script.next < a.script.steps.len: a.dirtyUntil = now() + 0.5
 
@@ -7548,6 +8404,13 @@ proc main() =
       (a.loopA, a.hasLoopA, a.loopB, a.hasLoopB) = (r.loopA, r.hasLoopA, r.loopB, r.hasLoopB)
       a.abLoop = r.abLoop and a.loopReady
       a.applyAbLoop()
+    if a.player.justLoaded and a.qualitySwitch:
+      # The same link in another quality: as it was, window and all.
+      a.player.justLoaded = false
+      a.qualitySwitch = false
+      if a.stopOnLoad:
+        a.stopOnLoad = false
+        a.player.stop()
     if a.player.justLoaded:
       a.player.justLoaded = false
       if a.stopOnLoad:  # gone online at Stop
@@ -7614,7 +8477,7 @@ proc main() =
       discard step()
       # Handled: the main loop mustn't handle it again once pollEvents returns.
       for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
-                a.upWin]:
+                a.upWin, a.eqWin]:
         if w != nil: w.clearFrameInput()
       enableRunes()
       stepping = false)
@@ -7631,14 +8494,16 @@ proc main() =
   if a.ytCaps.running: a.ytCaps.stop()
   if a.ytSubs.running: a.ytSubs.stop()
   if a.ytList.running: a.ytList.stop()
+  if a.ytInfo.running: a.ytInfo.stop()
   if a.upJob.running: a.upJob.stop()
   a.cancelSave()
   a.recordEnd()  # mpv closes the file as it shuts down
+  if a.eqUnsaved.len > 0: a.saveEqualizer()
   a.saved.save()
   a.savePosition()
   a.rememberState()
   a.cfg.save()
-  if a.upRestart: a.saveResume()
+  if a.upRestart or a.rdRestart.len > 0: a.saveResume()
   a.instance.close()
   a.peers.close()
   for c in a.children: c.close()
@@ -7654,6 +8519,7 @@ proc main() =
     mpv_render_context_free(a.osdLayer.render)
     mpv_terminate_destroy(a.osdLayer.h)
   if a.upRestart: relaunch()
+  elif a.rdRestart.len > 0: relaunch(RenderArg & a.rdRestart)
 
 when isMainModule:
   main()

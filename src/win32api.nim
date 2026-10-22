@@ -66,10 +66,21 @@ proc DragQueryFileW*(hDrop: HANDLE, iFile: UINT, file: ptr WCHAR, cch: UINT): UI
 proc DragQueryPoint*(hDrop: HANDLE, pt: ptr POINT): BOOL {.stdcall, dynlib: "shell32", importc.}
 proc DragFinish*(hDrop: HANDLE) {.stdcall, dynlib: "shell32", importc.}
 
-proc glCurrentContext*(): HGLRC {.stdcall, dynlib: "opengl32", importc: "wglGetCurrentContext".}
-proc glMakeCurrent*(hdc: HDC, hglrc: HGLRC): BOOL {.stdcall, dynlib: "opengl32", importc: "wglMakeCurrent".}
-proc glCurrentDc*(): HDC {.stdcall, dynlib: "opengl32", importc: "wglGetCurrentDC".}
-proc glProcAddress*(name: cstring): pointer {.stdcall, dynlib: "opengl32", importc: "wglGetProcAddress".}
+# opengl32.dll's, looked up once the program runs, not as it loads: it may
+# be Mesa's by then (gpumem).
+proc wglProc(name: cstring): pointer =
+  var lib {.global.}: HMODULE
+  if lib == 0: lib = LoadLibraryA("opengl32.dll")
+  GetProcAddress(lib, name)
+
+proc glCurrentContext*(): HGLRC =
+  cast[proc (): HGLRC {.stdcall.}](wglProc("wglGetCurrentContext"))()
+proc glMakeCurrent*(hdc: HDC, hglrc: HGLRC): BOOL =
+  cast[proc (hdc: HDC, hglrc: HGLRC): BOOL {.stdcall.}](wglProc("wglMakeCurrent"))(hdc, hglrc)
+proc glCurrentDc*(): HDC =
+  cast[proc (): HDC {.stdcall.}](wglProc("wglGetCurrentDC"))()
+proc glProcAddress*(name: cstring): pointer =
+  cast[proc (name: cstring): pointer {.stdcall.}](wglProc("wglGetProcAddress"))(name)
 
 proc toWide*(s: string): seq[uint16] =
   ## UTF-8 to a NUL-terminated UTF-16 buffer.

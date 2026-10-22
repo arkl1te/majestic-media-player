@@ -200,6 +200,10 @@ proc install(j: UpJob) =
         return
       for f in walkFiles(dir / "*.dll"):
         replaceFile(f, exe.parentDir / f.extractFilename)
+      if dirExists(dir / "cpu"):  # Mesa's software OpenGL (gpumem)
+        createDir(exe.parentDir / "cpu")
+        for f in walkFiles(dir / "cpu" / "*.dll"):
+          replaceFile(f, exe.parentDir / "cpu" / f.extractFilename)
       replaceFile(dir / "majestic-media-player.exe", exe)
       removeDir(workDir() / "release")
       j.code = 0
@@ -266,18 +270,20 @@ proc lastLine*(j: UpJob): string =
 proc removeOld*() =
   ## What an update moved aside on Windows, no longer running.
   when defined(windows):
-    for f in walkFiles(exePath.parentDir / "*.old"):
-      try: removeFile(f)
-      except OSError: discard
+    for pattern in ["*.old", "cpu" / "*.old"]:
+      for f in walkFiles(exePath.parentDir / pattern):
+        try: removeFile(f)
+        except OSError: discard
 
-proc relaunch*() =
-  ## Starts the (updated) program anew, to bring back the state saved for it.
+proc relaunch*(extra: varargs[string]) =
+  ## Starts the (updated) program anew, to bring back the state saved for it
+  ## (`extra`: more arguments).
   # A debug script runs once; MMP_RESUME_SCRIPT is the restarted one's.
   if existsEnv("MMP_RESUME_SCRIPT"): putEnv("MMP_SCRIPT", getEnv("MMP_RESUME_SCRIPT"))
   else: delEnv("MMP_SCRIPT")
   delEnv("MMP_RESUME_SCRIPT")
   try:
-    let p = startProcess(exePath, args = [ResumeArg], options = {poParentStreams, poDaemon})
+    let p = startProcess(exePath, args = @[ResumeArg] & @extra, options = {poParentStreams, poDaemon})
     p.close()
   except OSError as e:
     stderr.writeLine "cannot restart: ", e.msg

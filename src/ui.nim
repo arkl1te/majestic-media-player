@@ -295,7 +295,7 @@ proc drawTooltip*(ui: Ui) =
 # --- widgets ---------------------------------------------------------------
 
 proc iconButton*(ui: Ui, id: string, r: Rect, iconName: string, tooltip = "",
-                 enabled = true, toggled = false): bool =
+                 enabled = true, toggled = false, toggledCol = colAccent): bool =
   let hov = enabled and ui.hover(r)
   if hov and ui.pressed():
     ui.pressId = id
@@ -305,7 +305,7 @@ proc iconButton*(ui: Ui, id: string, r: Rect, iconName: string, tooltip = "",
   elif hov: ui.rect(r, colHover)
   let col =
     if not enabled: colTextDisabled
-    elif toggled: colAccent
+    elif toggled: toggledCol
     elif hov: colWhite
     else: colText
   ui.icon(iconName, r.xy + r.wh / 2, col)
@@ -335,22 +335,23 @@ proc textButton*(ui: Ui, id: string, r: Rect, label: string, primary = false): b
     ui.enterUsed = true
     result = true
 
-proc checkbox*(ui: Ui, id: string, pos: Vec2, label: string, value: var bool): bool =
+proc checkbox*(ui: Ui, id: string, pos: Vec2, label: string, value: var bool,
+               enabled = true): bool =
   let box = rect(pos.x, pos.y + 3, 16, 16)
   let r = rect(pos.x, pos.y, 22 + ui.textSize(label).x, 22)
-  let hov = ui.hover(r)
-  let focused = ui.tabStop(id, r)
+  let hov = enabled and ui.hover(r)
+  let focused = enabled and ui.tabStop(id, r)
   if hov and ui.pressed():
     ui.pressId = id
     ui.navId = id
     ui.consumeClick()
   if focused: ui.focusRing(r)
-  ui.rect(box, if value: colAccent else: colPanelRaised)
+  ui.rect(box, if value and enabled: colAccent else: colPanelRaised)
   ui.border(box, if hov: colAccent else: colBorder)
-  if value: ui.icon("check16", box.xy + box.wh / 2, colOnAccent)
-  ui.textIn(label, rect(pos.x + 24, pos.y, r.w, 22), colText)
+  if value: ui.icon("check16", box.xy + box.wh / 2, if enabled: colOnAccent else: colTextDisabled)
+  ui.textIn(label, rect(pos.x + 24, pos.y, r.w, 22), if enabled: colText else: colTextDisabled)
   if (hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == id) or
-     ui.navKey(id, KeySpace):
+     (enabled and ui.navKey(id, KeySpace)):
     value = not value
     result = true
 
@@ -407,6 +408,52 @@ proc slider*(ui: Ui, id: string, r: Rect, value: var float, lo, hi, step: float)
   ui.rect(rect(r.x, cy - 2, r.w * frac, 4), colAccent)
   ui.icon("knob16", vec2(r.x + r.w * frac, cy),
     if hov or ui.activeId == id: colWhite else: colText)
+  if focused: ui.focusRing(r)
+
+proc vSlider*(ui: Ui, id: string, r: Rect, value: var float, lo, hi, step: float,
+              origin = lo, fill = colAccent, ticks = 0.0, snapTo = NaN): bool =
+  ## Vertical slider, hi at the top, its track filled from `origin` to the
+  ## knob; otherwise as slider (Up/Down while it has keyboard focus). Lines
+  ## mark every `ticks` (0: none), a longer one `origin`; a drag near
+  ## `snapTo` lands on it unless Shift is held.
+  const SnapPx = 5'f32
+  let hov = ui.hover(r)
+  let focused = ui.tabStop(id, r)
+  if hov and ui.pressed():
+    ui.activeId = id
+    ui.navId = id
+    ui.consumeClick()
+  proc yOf(x: float): float32 = r.y + r.h * (1 - clamp((x - lo) / (hi - lo), 0, 1).float32)
+  var v = value
+  if ui.activeId == id and ui.down():
+    v = hi - clamp((ui.mouse.y - r.y) / r.h, 0, 1) * (hi - lo)
+    if not math.isNaN(snapTo) and not ui.window.shiftDown and abs(ui.mouse.y - yOf(snapTo)) <= SnapPx:
+      v = snapTo
+  if hov and ui.scroll() != 0:
+    v += (if ui.scroll() < 0: step else: -step)
+    ui.scrollConsumed = true
+  if ui.navKey(id, KeyUp) or ui.navKey(id, KeyRight): v += step
+  if ui.navKey(id, KeyDown) or ui.navKey(id, KeyLeft): v -= step
+  if ui.navKey(id, KeyHome): v = lo
+  if ui.navKey(id, KeyEnd): v = hi
+  v = clamp(round((v - lo) / step) * step + lo, lo, hi)
+  if v != value:
+    value = v
+    result = true
+  let cx = r.x + r.w / 2
+  if ticks > 0:
+    var t = ceil(lo / ticks) * ticks
+    while t <= hi + 1e-9:
+      let ty = yOf(t).round
+      let (len, col) = if t == origin: (7'f32, colTextDim) else: (4'f32, colBorder)
+      ui.rect(rect(cx - 4 - len, ty, len, 1), col)
+      ui.rect(rect(cx + 4, ty, len, 1), col)
+      t += ticks
+  let (ky, oy) = (yOf(value), yOf(origin))
+  ui.rect(rect(cx - 2, r.y, 4, r.h), colTrack)
+  ui.rect(rect(cx - 2, min(ky, oy), 4, abs(ky - oy)), fill)
+  # A fader's cap.
+  ui.rect(rect(cx - 9, ky - 3, 18, 6), if hov or ui.activeId == id: colWhite else: colText)
   if focused: ui.focusRing(r)
 
 proc radioButton*(ui: Ui, id: string, pos: Vec2, label: string, selected: bool,

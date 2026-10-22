@@ -58,7 +58,7 @@ proc copying*(src, dest: string): SaveJob =
   elif not open(result.fout, result.part, fmWrite):
     result.fail("cannot write " & dest.extractFilename)
 
-proc downloading*(exe, url, dest: string, cookies = ""): SaveJob =
+proc downloading*(exe, url, dest: string, cookies = "", format = "bv*+ba/b"): SaveJob =
   ## Downloads url with yt-dlp; dest's extension (.mp4, else .mkv) picks the
   ## container, and dest becomes the file it makes.
   let ext = if dest.splitFile.ext.toLowerAscii == ".mp4": "mp4" else: "mkv"
@@ -68,7 +68,7 @@ proc downloading*(exe, url, dest: string, cookies = ""): SaveJob =
   except OSError as e:
     result.fail(e.msg)
     return
-  result.dl = download(exe, url, dir, name.replace("%", "%%") & ".%(ext)s", ext, cookies)
+  result.dl = download(exe, url, dir, name.replace("%", "%%") & ".%(ext)s", ext, cookies, format)
 
 proc running*(j: SaveJob): bool = j != nil and not j.done
 

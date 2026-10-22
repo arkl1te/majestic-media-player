@@ -27,6 +27,7 @@ let
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")
   colLoop* = c("#4dd2ff")
+  colEqualizer* = c("#4f9dff")  ## the controls' equalizer button while it's on
   colError* = c("#ff6b6b")
   colCardValue* = c("#9d8cff", 0.28)
   colCardRef* = c("#ffc857", 0.24)

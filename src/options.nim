@@ -4,7 +4,7 @@
 
 import std/[os, strutils, strformat, math, tables, times]
 import silky, vmath, bumpy, chroma, pixie
-import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist
+import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist, gpumem
 
 type
   OptionsPage* = enum
@@ -692,7 +692,9 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Next/previous chapter also stops at bookmarks.")
   ui.group(p, "Steps")
   ui.numberRow(p, "o-rate", "Playback rate", c.rateStep, 0.05, 0.05, 2, 2)
-  ui.numberRow(p, "o-jump", "Jump (seconds)", c.seekStep, 1, 1, 600)
+  var jumpMs = c.seekStep * 1000
+  ui.numberRow(p, "o-jump", "Jump (milliseconds)", jumpMs, 100, 1, 600_000)
+  c.seekStep = round(jumpMs) / 1000
   ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
 
 proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
@@ -700,6 +702,30 @@ proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.textRow(p, "o-cookies", "Sign in with", c.signInCookies, "auto")
   ui.hint(p, "Browser whose cookies yt-dlp uses when a video asks to sign in (age-restricted).")
   ui.hint(p, "auto tries each installed browser; none turns it off; or brave, chrome, firefox...")
+
+  ui.group(p, "Bandwidth")
+  ui.radioRow(p, "o-sqbest", "Best quality (highest resolution, frame rate and audio)",
+    c.streamQuality, sqBest)
+  ui.radioRow(p, "o-sqlimit", "Limit resolution to:", c.streamQuality, sqLimit)
+  # The heights to pick from, on a line of their own under it; picking one
+  # picks the limit too.
+  var x = p.x + 32
+  for h in [2160, 1440, 1080, 720, 480, 360, 240]:
+    let label = $h & "p"
+    if ui.radioButton(&"o-sqh{h}", vec2(x, p.y + 2), label,
+                      c.streamQuality == sqLimit and c.streamMaxHeight == h):
+      c.streamQuality = sqLimit
+      c.streamMaxHeight = h
+    x += 24 + ui.textSize(label).x + 14
+  p.y += Row
+  ui.radioRow(p, "o-sqlow", "Lowest quality (uses the least data)", c.streamQuality, sqLowest)
+  ui.radioRow(p, "o-sqaudio", "Audio only (no video is downloaded)", c.streamQuality, sqAudioOnly)
+  p.gap
+  ui.checkRow(p, "o-sqfps", "Limit frame rate to 30 fps", c.streamMaxFps30)
+  ui.checkRow(p, "o-sqaudiosmall", "Lower-bitrate audio", c.streamSmallAudio)
+  ui.checkRow(p, "o-sqsave", "Also when saving links (File > Save, command lines)", c.streamOnSave)
+  ui.hint(p, "Applies to links opened from now on; cached media plays as it was cached.")
+  ui.hint(p, "When nothing fits a limit, the smallest version available is fetched instead.")
 
 proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
   let web = d.web
@@ -1265,6 +1291,19 @@ proc miscPage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-size", "Resize (percent)", c.sizeStep, 1, 1, 50)
 
 proc systemPage(ui: Ui, c: var Config, p: var Pane) =
+  ui.group(p, "Rendering")
+  ui.radioRow(p, "o-rdgpu", "Prefer GPU", c.renderMode, rdPreferGpu)
+  ui.hint(p, "Starts on the GPU; on the CPU while the GPU's memory is full, until it frees up.")
+  ui.radioRow(p, "o-rdadapt", "Adaptive", c.renderMode, rdAdaptive)
+  ui.hint(p, "Switches back and forth as the GPU's memory runs out and frees up.")
+  ui.radioRow(p, "o-rdcpu", "Always CPU", c.renderMode, rdCpu)
+  ui.hint(p, "Never uses the GPU, at the cost of several CPU cores while playing.")
+  p.gap
+  ui.hint(p, if softwareGl: "Rendering on the CPU now."
+             elif cpuWanted: "Decoding on the CPU now (no software renderer installed)."
+             else: "Rendering on the GPU now.")
+  ui.hint(p, "Switching restarts the player, picking up where it was.")
+  p.gap
   ui.group(p, "Memory")
   var mb = c.loopFramesMB.float
   ui.numberRow(p, "o-lfmem", "Loop frames (MB)", mb, 64, 64, LoopFramesMaxMB.float)

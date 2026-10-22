@@ -3,7 +3,7 @@
 ## with its subtitles and chapters. Opened again where some of it was saved,
 ## a link plays that from disk, the stream going on where it ends.
 
-import std/[os, strutils, strformat, tables, times, hashes, algorithm]
+import std/[os, strutils, strformat, tables, times, hashes, algorithm, sequtils]
 import jsony
 when not defined(windows): import std/posix
 
@@ -13,6 +13,8 @@ type
     ## and it holds the link up to `stop`.
     file*: string
     start*, stop*: float
+    format*: string           ## yt-dlp's format ids it holds ("401+251"); "": saved
+                              ## before formats were noted, as `auto` then was
 
   Saved* = object
     title*: string
@@ -22,6 +24,10 @@ type
     subsDone*: bool           ## looked for (there may be none)
     chapters*: string         ## its chapters, ffmetadata
     used*: float              ## last opened, epoch seconds
+    auto*: string             ## the format ids Options > Online's choice came to
+    autoVideo*, autoAudio*: string  ## Auto's video and audio, as each last played
+    videoQ*, audioQ*: seq[tuple[id, label: string]]  ## the qualities it offers
+                              ## (the quality menu's), for locks
 
   SaveIndex* = Table[string, Saved]
 
@@ -121,11 +127,27 @@ proc timeline*(s: Saved, start, stop: float): string =
     result.add &"%{g.file.len}%{g.file},{max(at - g.start, 0):.6f},{upTo - at:.6f};"
     at = upTo
 
+proc formatOf(s: Saved, g: Seg): string = (if g.format.len > 0: g.format else: s.auto)
+
+proc inFormat*(s: Saved, format: string): Saved =
+  ## s with only its files of the stream in `format` (format ids).
+  result = s
+  result.segs = s.segs.filterIt(s.formatOf(it) == format)
+
+proc setAuto*(s: var Saved, format: string) =
+  ## Notes what Options > Online's choice came to; files saved before formats
+  ## were noted keep standing for the one it came to then.
+  if s.auto.len > 0:
+    for g in s.segs.mitems:
+      if g.format.len == 0: g.format = s.auto
+  s.auto = format
+
 proc addSeg*(s: var Saved, g: Seg) =
-  ## Adds a file of the stream; those it holds all of go.
+  ## Adds a file of the stream; those in its format it holds all of go.
   var keep: seq[Seg]
   for o in s.segs:
-    if o.file != g.file and o.start >= g.start - 0.05 and o.stop <= g.stop: removeQuietly(o.file)
+    if o.file != g.file and s.formatOf(o) == s.formatOf(g) and
+       o.start >= g.start - 0.05 and o.stop <= g.stop: removeQuietly(o.file)
     elif o.file != g.file: keep.add o
   keep.add g
   s.segs = keep
