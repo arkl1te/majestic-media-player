@@ -1,5 +1,5 @@
 ## A YouTube video's thumbnail, shown in the video frame while no video track
-## is (the right-click menu's "Show Thumbnail"): fetched with curl into the
+## is (the right-click menu's "Show Thumbnail When Video Is Off"): fetched with curl into the
 ## cache folder once per video, then read from there.
 
 import std/[os, osproc]

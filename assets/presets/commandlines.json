@@ -469,5 +469,65 @@
     "reveal": false
    }
   ]
+ },
+ {
+  "title": "Measure length",
+  "parts": [
+   {
+    "text": "t1=",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "start",
+    "kind": "reference",
+    "content": "timestamp",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
+   },
+   {
+    "text": ";t2=",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
+   },
+   {
+    "text": "",
+    "card": true,
+    "name": "end",
+    "kind": "reference",
+    "content": "timestamp",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
+   },
+   {
+    "text": ";ms(){ IFS=: read -r h m s <<<\"$1\"; echo $(( (10#$h*3600 + 10#$m*60 + 10#${s%.*})*1000 + 10#${s#*.} )); };d=$(( $(ms \"$t2\") - $(ms \"$t1\") ));((d<0))&&d=$((-d));printf 'Length: %02d:%02d:%02d.%03d (%d.%03d seconds)\\n' $((d/3600000)) $((d/60000%60)) $((d/1000%60)) $((d%1000)) $((d/1000)) $((d%1000))",
+    "card": false,
+    "name": "",
+    "kind": "value",
+    "content": "",
+    "rect": 0,
+    "dim": "none",
+    "path": false,
+    "reveal": false
+   }
+  ]
  }
 ]

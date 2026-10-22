@@ -877,12 +877,14 @@ type
     paNone, paRun, paCancel, paDraw, paBrowse
 
   TimeChoice* = object
-    ## An entry of a timestamp row's list: a time, or a separator.
+    ## An entry of a timestamp row's list: a time, a separator, or a note
+    ## (gray text, not chosen).
     label*: string
     time*: float              ## seconds, < 0 when unknown
     which*: string            ## "start", "current", "end", "loopA" or "loopB";
                               ## "" for a bookmark or chapter
-    sep*: bool
+    chapter*: bool            ## a chapter, not a bookmark
+    sep*, note*: bool
 
   PickDialog* = ref object
     ## Shown when a command line with value or timestamp cards runs: one row
@@ -893,6 +895,8 @@ type
     cmd*: CommandLine
     rows*: seq[CmdPart]       ## the cards asked about
     picks*: seq[int]          ## timestamp rows: the index of the time chosen
+    chosen*: seq[TimeChoice]  ## timestamp rows: the time chosen, found again
+                              ## in the list as bookmarks come and go
     texts*: seq[string]       ## value rows: the value to run with
     crossed*: seq[bool]       ## rectangle rows: a drawn rectangle leaves them alone
     drawing*: int             ## rectangle being drawn over the video, else 0
@@ -906,29 +910,65 @@ const
   PickTop = 44'f32
   PickRowH = 36'f32
   PickLabelW = 150'f32
+  NoteH = 40'f32              ## the list's two-line note
 
 proc timeChoices*(pos, duration, loopA, loopB: float,
     marks, chapters: seq[Bookmark]): seq[TimeChoice] =
   ## What a timestamp row picks from: the start, the current time and the
   ## end, then the A-B loop marks (< 0 when not set), then the bookmarks,
-  ## then the chapters (named), each group after a separator.
+  ## then the chapters (named), each group after a separator. Without
+  ## bookmarks, a note says how to add some.
   result = @[TimeChoice(label: "Start", which: "start"),
     TimeChoice(label: "Current time", time: pos, which: "current"),
     TimeChoice(label: "End", time: (if duration > 0: duration else: -1), which: "end"),
     TimeChoice(sep: true),
     TimeChoice(label: "Loop A", time: loopA, which: "loopA"),
-    TimeChoice(label: "Loop B", time: loopB, which: "loopB")]
-  for group in [marks, chapters]:
-    if group.len > 0: result.add TimeChoice(sep: true)
-    for i, b in group: result.add TimeChoice(label: b.label(i), time: b.time)
+    TimeChoice(label: "Loop B", time: loopB, which: "loopB"),
+    TimeChoice(sep: true)]
+  if marks.len == 0:
+    result.add TimeChoice(note: true, label: "No bookmarks found.\n" &
+      "Right-click the seek bar to get started.")
+  for i, b in marks: result.add TimeChoice(label: b.label(i), time: b.time)
+  if chapters.len > 0: result.add TimeChoice(sep: true)
+  for i, b in chapters: result.add TimeChoice(label: b.label(i), time: b.time, chapter: true)
+
+proc pickable(ch: TimeChoice): bool = not ch.sep and not ch.note
 
 proc stepChoice(choices: seq[TimeChoice], k, dir: int): int =
-  ## The next entry from k in direction dir, skipping separators; k at the end.
+  ## The next entry from k in direction dir, skipping separators and notes;
+  ## k at the end.
   result = k
   var j = k + dir
   while j >= 0 and j < choices.len:
-    if not choices[j].sep: return j
+    if choices[j].pickable: return j
     j += dir
+
+proc locate(choices: seq[TimeChoice], c: TimeChoice): int =
+  ## Where c is in choices, which may have changed since it was chosen: the
+  ## same entry, else a bookmark or chapter at its time (a bookmark made a
+  ## chapter), else the nearest one (moved or removed), else the current time.
+  var other, nearest, current = -1
+  var best = Inf
+  for k, ch in choices:
+    if not ch.pickable: continue
+    if ch.which.len > 0:
+      if ch.which == c.which: return k
+      if ch.which == "current": current = k
+    elif c.which.len == 0:
+      let dt = abs(ch.time - c.time)
+      if dt < 0.0005:
+        if ch.chapter == c.chapter: return k
+        other = k
+      # Off its group counts as farther than anything in it.
+      let far = dt + (if ch.chapter == c.chapter: 0.0 else: 1e9)
+      if far < best: (best, nearest) = (far, k)
+  if other >= 0: other elif nearest >= 0: nearest elif current >= 0: current else: 0
+
+proc choose*(d: PickDialog, i: int, choices: seq[TimeChoice], k: int) =
+  ## Row i picks choices[k].
+  if k < 0 or k >= choices.len or not choices[k].pickable: return
+  d.picks[i] = k
+  d.chosen[i] = choices[k]
 
 proc newPickDialog*(): PickDialog = PickDialog(openRow: -1)
 
@@ -944,6 +984,7 @@ proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
   d.cmd = c
   d.rows = c.parts.runCards
   d.picks = newSeq[int](d.rows.len)
+  d.chosen = newSeq[TimeChoice](d.rows.len)
   d.texts = newSeq[string](d.rows.len)
   d.crossed = newSeq[bool](d.rows.len)
   d.drawing = 0
@@ -955,15 +996,16 @@ proc start*(d: PickDialog, c: CommandLine, choices: seq[TimeChoice],
         else:
           var first = 1
           for k, ch in choices:
-            if not ch.sep and ch.which.len == 0: first = k; break
+            if ch.pickable and ch.which.len == 0: first = k; break
           first
       if row.name in last:
         let v = last[row.name]
         for k, ch in choices:
-          if not ch.sep and (if v.which.len > 0: ch.which == v.which
+          if ch.pickable and (if v.which.len > 0: ch.which == v.which
                              else: ch.which.len == 0 and abs(ch.time - v.time) < 0.0005):
             d.picks[i] = k
             break
+      d.chosen[i] = choices[d.picks[i]]
       prev = d.picks[i]
     else:
       d.texts[i] = if row.name in last: last[row.name].value else: row.content
@@ -979,7 +1021,8 @@ proc size*(d: PickDialog): tuple[w, h: int32] =
 proc choiceText(ch: TimeChoice): (string, string) =
   (ch.label, if ch.time < 0: "unknown" else: fmtTime(ch.time, millis = true))
 
-proc entryH(ch: TimeChoice): float32 = (if ch.sep: MenuSeparatorHeight else: RowH)
+proc entryH(ch: TimeChoice): float32 =
+  if ch.sep: MenuSeparatorHeight elif ch.note: NoteH else: RowH
 
 proc entryY(choices: seq[TimeChoice], k: int): float32 =
   ## Top of entry k in the list, from the list's top.
@@ -1004,8 +1047,11 @@ proc centerOn(d: PickDialog, r: Rect, i: int, choices: seq[TimeChoice]) =
   d.listScroll = choices.entryY(d.picks[i]) + RowH / 2 - (lr.h - 2) / 2
 
 proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction =
-  ## choices is what timestamp rows pick from (timeChoices).
+  ## choices is what timestamp rows pick from (timeChoices), at this frame:
+  ## each row keeps its time as the list changes.
   let w = ui.window
+  for i, row in d.rows:
+    if row.isTimestamp: d.picks[i] = choices.locate(d.chosen[i])
   let noField = ui.focusId.len == 0  # else Escape belongs to the value field
   let contentH = choices.entryY(choices.len)
   var escUsed = false
@@ -1070,7 +1116,6 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
     if not row.isTimestamp:
       discard ui.textField(id, dr, d.texts[i], "empty")
       continue
-    d.picks[i] = clamp(d.picks[i], 0, choices.high)
     let hov = ui.hover(dr)
     let focused = ui.tabStop(id, dr)
     if hov and ui.pressed():
@@ -1080,8 +1125,8 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
       # Start with the chosen time in view.
       if d.openRow >= 0: d.centerOn(r, i, choices)
     if focused and ui.focusId.len == 0 and d.openRow < 0:
-      if w.buttonPressed[KeyUp]: d.picks[i] = choices.stepChoice(d.picks[i], -1)
-      if w.buttonPressed[KeyDown]: d.picks[i] = choices.stepChoice(d.picks[i], 1)
+      if w.buttonPressed[KeyUp]: d.choose(i, choices, choices.stepChoice(d.picks[i], -1))
+      if w.buttonPressed[KeyDown]: d.choose(i, choices, choices.stepChoice(d.picks[i], 1))
       if w.buttonPressed[KeySpace]:
         d.openRow = i
         d.centerOn(r, i, choices)
@@ -1130,6 +1175,12 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
       if ch.sep:
         ui.rect(rect(rr.x + 8, rr.y + rr.h / 2, rr.w - 16, 1), colBorder)
         continue
+      if ch.note:
+        let lines = ch.label.splitLines
+        for j, line in lines:
+          ui.textIn(ui.ellipsize(line, rr.w - 16, FontSmall),
+            rect(rr.x + 8, rr.y + 4 + j.float32 * 16, rr.w - 16, 16), colTextDim, FontSmall)
+        continue
       let hov = ui.hover(rr)
       let sel = k == d.picks[open]
       if sel: ui.rect(rr, colAccent)
@@ -1142,7 +1193,7 @@ proc draw*(d: PickDialog, ui: Ui, r: Rect, choices: seq[TimeChoice]): PickAction
         if sel: colOnAccent else: colTextDim, FontSmall)
       if hov and ui.pressed():
         ui.consumeClick()
-        d.picks[open] = k
+        d.choose(open, choices, k)
         d.openRow = -1
     ui.sk.popClipRect()
     ui.hitClip = outerClip

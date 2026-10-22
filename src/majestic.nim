@@ -44,7 +44,7 @@ const
 
 type
   Overlay = enum
-    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovPick, ovSync,
+    ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovSync,
     ovYtdlp, ovEmbed, ovUpdate
 
   YtMode = enum
@@ -1225,7 +1225,11 @@ proc copyToClipboard(a: App) =
       a.window.setClipboardFile(path.absolutePath)
       a.osd("Copied " & path.extractFilename)
       return
-  if path.contains("://") or not onWayland():
+  if path.contains("://"):
+    setClipboardString(path)
+    a.osd("Copied URL")
+    return
+  if not onWayland():
     setClipboardString(path)
   else:
     try:
@@ -3102,6 +3106,11 @@ proc savePlaylist(a: App, path: string) =
 
 proc askExternal(a: App)  # Run menu, below
 
+proc pickOpen(a: App): bool =
+  ## The Run window is up. It doesn't hold the main window: the times it
+  ## offers follow the seek bar as the player is used.
+  a.pickWin != nil and a.pickWin.visible
+
 proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   if paths.len == 0: return
   case purpose
@@ -3115,7 +3124,7 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   of "bmimport": a.importBookmarks(paths[0])
   of "pickpath":  # Run window, a path row's folder button
     let d = a.pickDlg
-    if a.overlay == ovPick and d.browseRow >= 0 and d.browseRow < d.texts.len:
+    if a.pickOpen and d.browseRow >= 0 and d.browseRow < d.texts.len:
       d.texts[d.browseRow] = paths[0]
       a.pickWin.activate()
   of "extfile":
@@ -3685,13 +3694,12 @@ proc askExternal(a: App) =
   a.pickDlg.start(c, a.timeChoices, c.lastValues)
   let (sw, sh) = a.pickDlg.size
   if a.pickWin == nil:
-    (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh))
+    (a.pickWin, a.pickSk, a.pickUi) = a.newDialogWindow("Run", ivec2(sw, sh), modal = false)
   a.pickWin.title = c.title
   a.pickUi.focusId = ""
   a.pickUi.navId = "pk-0"
   a.pickUi.navVisible = false
   a.showDialog(a.pickWin, ivec2(sw, sh))
-  a.overlay = ovPick
 
 proc runCommandLine(a: App, c: CommandLine) =
   ## Runs c, first asking for its external files, timestamps and values when
@@ -3704,7 +3712,6 @@ proc runCommandLine(a: App, c: CommandLine) =
 proc closePick(a: App) =
   a.rectEdit = nil
   a.pickDlg.drawing = 0
-  a.overlay = ovNone
   if a.pickWin.visible:
     a.pickWin.visible = false
     a.window.activate()
@@ -3802,7 +3809,6 @@ proc closeDialogs(a: App) =
   of ovOptions: a.closeOptions(false)
   of ovRename: a.closeRename()
   of ovCommands: a.closeCommands()
-  of ovPick: a.closePick()
   of ovSync: a.closeSyncProps()
   of ovYtdlp:
     a.ytUi.focusId = ""
@@ -4171,7 +4177,7 @@ const
 proc restartRenderer(a: App, cpu: bool) =
   ## Restarts onto the CPU or the GPU, unless something going on would be
   ## lost or cut short: then it's looked at again shortly.
-  if a.overlay != ovNone or a.menus.isOpen or pointerButtonsDown() or
+  if a.overlay != ovNone or a.pickOpen or a.menus.isOpen or pointerButtonsDown() or
      a.saveJob.running or a.upJob.running or a.embProc != nil or a.upRestart:
     return
   a.rdRestart = if cpu: "cpu" else: "gpu"
@@ -4795,9 +4801,17 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
-  if a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0:
+  # Items about the opened link, in one group.
+  let isYoutube = a.plIndex in 0 ..< a.playlist.len and a.playlist[a.plIndex].youtubeId.len > 0
+  if loaded and a.player.path.contains("://"):
+    ctx.item("Copy URL", k(kaCopyClipboard), action = proc () = a.copyToClipboard())
+    if isYoutube:
+      ctx.item("Copy with Timestamp", k(kaCopyTimeLink), action = proc () = a.copyTimeLink())
+    else:
+      ctx.sep()
+  if isYoutube:
     # Not at Options > Online's Lowest Quality, which downloads no thumbnails.
-    ctx.check("Show Thumbnail", checked = a.cfg.ytThumbnail,
+    ctx.check("Show Thumbnail When Video Is Off", checked = a.cfg.ytThumbnail,
       enabled = a.cfg.streamQuality != sqLowest, action = proc () =
         a.cfg.ytThumbnail = not a.cfg.ytThumbnail
         a.cfg.save())
@@ -5355,7 +5369,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovPick, ovSync, ovYtdlp, ovEmbed, ovUpdate}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovUpdate}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.fullscreen: a.setFullscreen(false)
@@ -5633,7 +5647,7 @@ proc endRectDraw(a: App, keep: bool, refocus = true) =
   a.rectEdit = nil
   a.pickDlg.drawing = 0
   a.dirtyUntil = now() + 0.5
-  if refocus and a.overlay == ovPick: a.pickWin.activate()
+  if refocus and a.pickOpen: a.pickWin.activate()
 
 proc movePickAside(a: App) =
   ## Takes the Run window off the video: beside the main window, when its
@@ -7401,7 +7415,7 @@ proc browsePickPath(a: App, i: int) =
 proc renderPick(a: App, shot: string) =
   ## Draws the Run window; Run executes the command line with the times and
   ## values chosen.
-  if a.overlay != ovPick: return
+  if not a.pickOpen: return
   let w = a.pickWin
   let ui = a.pickUi
   if w.closeRequested:
@@ -7695,8 +7709,9 @@ proc frame(a: App) =
     if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
     else: rect(W - plW, top, plW, H - top - bottomH)
 
-  # Input capture order: overlays > menus > everything else.
-  if a.overlay != ovNone:
+  # Input capture order: overlays and a Run window rectangle being drawn >
+  # menus > everything else.
+  if a.overlay != ovNone or a.rectEdit != nil:
     ui.captured = true
   else:
     a.menus.captureInput(ui)
@@ -7829,8 +7844,6 @@ proc frame(a: App) =
       if ui.pressed(): a.renWin.activate()
     of ovCommands:
       if ui.pressed(): a.cmdWin.activate()
-    of ovPick:
-      if ui.pressed() and a.rectEdit == nil: a.pickWin.activate()
     of ovSync:
       if ui.pressed(): a.syncWin.activate()
     of ovYtdlp:
@@ -7935,12 +7948,11 @@ proc keyUi(a: App): Ui =
   of ovOptions: a.optUi
   of ovRename: a.renUi
   of ovCommands: a.cmdUi
-  of ovPick: a.pickUi
   of ovSync: a.syncUi
   of ovYtdlp: a.ytUi
   of ovEmbed: a.embUi
   of ovUpdate: a.upUi
-  else: a.ui
+  else: (if a.pickOpen: a.pickUi else: a.ui)
 
 proc runScriptStep(a: App, st: ScriptStep) =
   let arg = st.args.join(" ")
@@ -8016,7 +8028,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "run": a.runMenuPath(@["Run", arg])
   of "runstop": (for e in a.runLog: e.stop())  # the run log's Stop button
   of "pick":  # row index: choose a time (0-based, separators count) in the Run window
-    a.pickDlg.picks[parseInt(st.args[0])] = parseInt(st.args[1])
+    a.pickDlg.choose(parseInt(st.args[0]), a.timeChoices, parseInt(st.args[1]))
   of "pickrun": a.pickDlg.runRequested = true
   of "picktext":  # row text: a value for this run
     a.pickDlg.texts[parseInt(st.args[0])] = st.args[1 .. ^1].join(" ")
