@@ -986,13 +986,13 @@ proc fitWindowToVideo(a: App) =
   var size = ivec2(int32(v.x + chrome.x), int32(v.y + chrome.y))
   size.x = max(size.x, a.minWindow.x)
   size.y = max(size.y, a.minWindow.y)
-  a.window.size = size
+  a.window.setClientSize(size)
 
 proc resizeKeepingVideo(a: App, delta: IVec2) =
   ## Grows/shrinks the window by delta when chrome is toggled, so the video
   ## frame keeps its size. delta is in UI units.
   if a.fullscreen or a.window.maximized: return
-  a.window.size = a.window.size + a.px(delta)
+  a.window.setClientSize(a.window.size + a.px(delta))
 
 proc setFullscreen(a: App, on: bool) =
   if on == a.fullscreen: return
@@ -1023,7 +1023,7 @@ proc setCompact(a: App, on: bool) =
   var size = a.window.size - ivec2(0, d)
   size.x = max(size.x, a.minWindow.x)
   size.y = max(size.y, a.minWindow.y)
-  a.window.size = size
+  a.window.setClientSize(size)
   let moved = content + ivec2(0, d)
   a.window.moveFrame(if on: moved else: moved - a.frameInset)
 
@@ -13490,7 +13490,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " playlist=", $a.playlist.mapIt(it.extractFilename), " index=", a.plIndex,
       " path=", a.player.path.extractFilename, " t=", a.player.timePos,
       " paused=", a.player.paused, " stopped=", a.player.stopped, " speed=", a.player.speed
-  of "size": a.window.size = ivec2(parseInt(st.args[0]).int32, parseInt(st.args[1]).int32)
+  of "size": a.window.setClientSize(ivec2(parseInt(st.args[0]).int32, parseInt(st.args[1]).int32))
   of "shot": a.shotPath = arg
   of "quit": a.window.closeRequested = true
   of "uiscale": a.cfg.uiScale = parseFloat(arg)  # percent, as Options sets it
@@ -13701,7 +13701,7 @@ proc main() =
       a.window.moveFrame(p)
   if resumed:
     if rs.windowW >= minSize.x and rs.windowH >= minSize.y:
-      a.window.size = ivec2(rs.windowW.int32, rs.windowH.int32)
+      a.window.setClientSize(ivec2(rs.windowW.int32, rs.windowH.int32))
       a.window.moveFrame(ivec2(rs.windowX.int32, rs.windowY.int32))
     if rs.maximized: a.window.maximized = true
     let t = rs.transform

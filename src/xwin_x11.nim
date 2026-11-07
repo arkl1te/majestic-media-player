@@ -241,6 +241,10 @@ proc startWindowResize*(window: Window, edge: WindowEdge) =
   privateAccess(Window)
   window.state.buttonDown.excl MouseLeft
 
+proc setClientSize*(window: Window, size: IVec2) =
+  ## Resizes the window so its content is size (the WM frame is its own).
+  window.size = size
+
 proc setDecorated*(window: Window, on: bool) =
   ## Shows or hides the WM's title bar and borders (_MOTIF_WM_HINTS
   ## decorations), keeping the window mapped and its content size.

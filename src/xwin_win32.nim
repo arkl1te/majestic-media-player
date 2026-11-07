@@ -428,6 +428,17 @@ proc startWindowResize*(window: Window, edge: WindowEdge) =
   privateAccess(Window)
   window.state.buttonDown.excl MouseLeft
 
+proc setClientSize*(window: Window, size: IVec2) =
+  ## Resizes the window so its client area is size. Windy's size= adds the
+  ## border its style asks for, which a frameless window keeps but gives no
+  ## room (see setDecorated): there it would grow the window by that border
+  ## on every call. This adds the frame the window really has instead.
+  if window.fullscreen: return
+  let h = window.hwnd
+  let f = frameSize(h)
+  discard SetWindowPos(h, 0, 0, 0, size.x + f.x, size.y + f.y,
+    SWP_NOACTIVATE or SWP_NOZORDER or SWP_NOMOVE)
+
 proc setDecorated*(window: Window, on: bool) =
   ## Shows or hides the title bar and borders, keeping the content size.
   ## Hidden, the sizing border stays in the style, out of sight (the hook
@@ -441,7 +452,7 @@ proc setDecorated*(window: Window, on: bool) =
   discard SetWindowLongW(h, GWL_STYLE, if on: style or WS_CAPTION else: style and not WS_CAPTION)
   discard SetWindowPos(h, 0, 0, 0, 0, 0, SWP_FRAMECHANGED or SWP_NOMOVE or
     SWP_NOSIZE or SWP_NOZORDER or SWP_NOACTIVATE)
-  window.size = size
+  window.setClientSize(size)
 
 proc activate*(window: Window) =
   ## Raises and focuses the window. Windows only lets the foreground process
