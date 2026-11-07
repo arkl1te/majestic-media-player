@@ -32,7 +32,7 @@ Majestic's aim is to be the video player I wish I had.
 - **A very, VERY resizable compact mode.**
 - **Zoom, pan and rotate** the video (Ctrl+mouse).
 - **A-B loops, ping-pong playback and an equalizer.**
-- **Play/Pause, Previous and Next in the taskbar's window preview**, on Windows and KDE Plasma.
+- **Play/Pause, Previous and Next in the taskbar's window preview**, on Windows and KDE Plasma (on macOS: the media keys and Now Playing).
 
 Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every shortcut. Try right-clicking everything, too!
 
@@ -67,6 +67,20 @@ cd majestic-media-player
 ```
 
 Majestic shows up in the Start menu.
+
+### macOS from source
+
+Install the Xcode command line tools (`xcode-select --install`), [Nim](https://nim-lang.org) 2.2+ and [Homebrew](https://brew.sh). Then:
+
+```sh
+git clone https://github.com/arkl1te/majestic-media-player.git
+cd majestic-media-player
+./install.sh
+```
+
+It installs mpv with Homebrew if it's missing, builds **Majestic Media Player.app** and puts it in `~/Applications` (`./install.sh --system` for `/Applications`), with the `majestic-media-player` command linked into `~/.local/bin` (`/usr/local/bin`). Then open it from Launchpad or Finder, or right-click a video → Open With. `make app` only builds the bundle, `make run` tries the bare binary from the checkout.
+
+On macOS shortcuts use Cmd where they say Ctrl elsewhere, the media keys and Control Center's Now Playing drive playback, Options > Formats sets the default app per type, and the visualizer hears the player through a Core Audio tap (macOS 14.2+). The screen color picker isn't available there.
 
 To update a source install, `git pull` and run `./install.sh` again. `./install.sh --uninstall` removes it.
 
