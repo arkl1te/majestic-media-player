@@ -4,7 +4,7 @@
 
 import std/[os, strutils, sequtils, strformat, math, tables, times]
 import silky, vmath, bumpy, chroma, pixie
-import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist, gpumem
+import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist, gpumem, library
 
 type
   OptionsPage* = enum
@@ -20,6 +20,7 @@ type
     opReplayGain = "ReplayGain"
     opSubtitles = "Subtitles"
     opSubStyle = "Default"
+    opLibraries = "Libraries"
     opMisc = "Miscellaneous"
     opSystem = "System"
 
@@ -30,7 +31,18 @@ type
     ## Paths page buttons the caller carries out (file dialogs, file manager).
     prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
     prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp,
-    prBrowseSoundFont
+    prBrowseSoundFont,
+    prLibAddFolder, prLibAddFiles, prLibChange, prLibCustom, prLibContext
+
+  ItemMove* = enum
+    ## Options > Libraries: where a folder or file of the list goes.
+    imTop, imUp, imDown, imBottom
+
+  PathInfo* = tuple
+    ## What the caller knows of a library path: whether it was found, and
+    ## whether it's a file.
+    state: RootState
+    isFile: bool
 
   WebInfo* = object
     ## Playback > Media Cache: the cached links, filled in by the caller.
@@ -80,6 +92,15 @@ type
     fontTop: int                ## its first visible row
     fontAt: Rect                ## the Font field and its arrow, where the list hangs
     find: string                ## the search bar above both columns; "" when not searching
+    libSel*: int                ## Libraries: the library selected
+    libItem*: int               ## its folder or file selected, -1 when none
+    libScroll, libItemScroll: float32
+    libRenaming: bool           ## the selected library's name is being typed
+    libRenameText: string
+    libRenameNote: string       ## why the typed name can't be used
+    libReveal: bool             ## scroll the selected folder or file into view
+    ctxPos*: Vec2               ## where a context menu was asked for (prLibContext)
+    pathInfo*: proc (path: string): PathInfo  ## set by the caller
     findScroll: float32         ## the search results' scroll
 
   Pane = object
@@ -93,11 +114,12 @@ type
     shown: bool                 ## whether the last row was
     jump: bool                  ## a result was clicked: open jumpTo, leaving the search
     jumpTo: OptionsPage
+    hits: array[OptionsPage, int]  ## while searching: the rows each page matched
 
 const
   Tree = [(opPlayer, 0), (opInterface, 1), (opFormats, 1), (opPaths, 1), (opKeys, 1), (opPlayback, 0),
           (opOnline, 1), (opWeb, 1), (opAudioFiles, 1), (opReplayGain, 1), (opSubtitles, 0),
-          (opSubStyle, 1), (opMisc, 0), (opSystem, 0)]
+          (opSubStyle, 1), (opLibraries, 0), (opMisc, 0), (opSystem, 0)]
   Parents = {opPlayer, opPlayback, opSubtitles}
   TreeWidth = 180'f32
   TreeRow = 22'f32
@@ -193,13 +215,16 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
     differs(subOutlineColor) or differs(subOutlineOpacity) or differs(subOutlineSize) or
     differs(subShadowColor) or differs(subShadowOffset) or differs(subShadowOpacity) or
     differs(subSize) or differs(subSpacing) or differs(subStyleAss)
+  of opLibraries: differs(libraries)
   of opMisc: differs(panStep) or differs(rotateStep) or differs(sizeStep)
   of opSystem: differs(loopFramesMB) or differs(renderMode)
 
-proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool, changed, clashing: set[OptionsPage]) =
-  ## While searching the tree is greyed out; clicking a page leaves the
-  ## search for it. Pages with unsaved changes get a *, those with clashing
-  ## keys are yellow; a collapsed node stands for its children.
+proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool, changed, clashing: set[OptionsPage],
+              hits: array[OptionsPage, int]) =
+  ## While searching the tree is greyed out but for the pages the results
+  ## come from, tinted with their count; clicking a page leaves the search
+  ## for it. Pages with unsaved changes get a *, those with clashing keys are
+  ## yellow; a collapsed node stands for its children.
   let dim = d.find.strip.len > 0
   ui.rect(r, colBackground)
   ui.border(r, colBorder)
@@ -254,12 +279,25 @@ proc drawTree(d: OptionsDialog, ui: Ui, r: Rect, keys: bool, changed, clashing: 
     let rowR = rect(lx, y, r.x + r.w - lx - 4, TreeRow)
     let sel = d.page == p and not dim
     let hov = ui.hover(rowR)
-    if sel: ui.rect(label, colAccent)
+    # Search results from p, or from the children a collapsed p hides.
+    var found = hits[p]
+    if p in Parents and p notin d.expanded:
+      for (q, _) in Tree:
+        if q != p and q.parentOf == p: found += hits[q]
+    let hit = dim and found > 0
+    if hit:
+      let tag = $found
+      let tw = ui.textSize(tag, FontSmall).x
+      let band = rect(label.x, label.y, rowR.x + rowR.w - label.x, label.h)
+      ui.rect(band, if hov: colAccentDim else: colFindHit)
+      ui.textIn(tag, rect(band.x + band.w - tw - 6, band.y, tw, band.h), colAccent, FontSmall)
+      if hov: ui.tip(rowR, &"{found} result(s) from {p}. Click to open it.")
+    elif sel: ui.rect(label, colAccent)
     elif hov: ui.rect(label, colHover)
     if sel and focused: ui.focusRing(rect(label.x + 2, label.y + 2, label.w - 4, label.h - 4))
     ui.textIn(name, rect(label.x + 5, label.y, label.w, label.h),
       if sel: colOnAccent elif marked(clashing): colWarning
-      elif dim: colTextDisabled else: colText)
+      elif hit: colText elif dim: colTextDisabled else: colText)
     if hov and ui.pressed():
       ui.consumeClick()
       if dim:
@@ -308,6 +346,7 @@ proc show(ui: Ui, p: var Pane, texts: varargs[string]): bool =
   if p.find.len == 0: return true
   let hay = ($p.page & " " & p.title & " " & texts.join(" ")).toLowerAscii
   p.shown = p.find.allIt(it in hay)
+  if p.shown: inc p.hits[p.page]
   if not p.shown or p.header: return p.shown
   p.header = true
   if p.started: p.y += 6 + 7
@@ -934,11 +973,14 @@ proc audioFilesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
   ui.hint(p, "Song.jpg for song.mp3: shown over the cover inside the file and the folder picture.")
   if ui.show(p, "Folder pictures", c.coverNames):
     ui.textIn("Folder pictures", rect(p.x + 8, p.y, LabelW, 26), colText)
-    discard ui.textArea("o-covernames", rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 96),
+    discard ui.textArea("o-covernames", rect(p.x + 8 + LabelW, p.y, max(120'f32, p.w - LabelW - 8), 144),
       c.coverNames, "e.g. folder")
-    p.y += 96 + 4
-  ui.hint(p, "Without a cover inside it, a picture in its folder with one of these names, one per line.")
-  ui.hint(p, "Earlier lines win; letter case and the extension (.jpg, .png...) don't matter.")
+    p.y += 144 + 4
+  ui.hint(p, "Without a cover inside it, the picture found by the first line that finds one, top to bottom.")
+  ui.hint(p, "* and ? are wildcards, / goes into a folder and ../ up one: art/*front*.*, ../folder.*")
+  ui.hint(p, "Fields and functions: %album%, %artist%, %filename%, %directoryname%, $substr(%filename%,1,4),")
+  ui.hint(p, "$left, $right, $lower, $upper, $replace, $if2, [...] (left out without its fields).")
+  ui.hint(p, "Letter case doesn't matter; a line without an extension takes any picture's (folder).")
   ui.group(p, "Tracker chart")
   ui.checkRow(p, "o-trackerchart", "Show the tracker chart (MOD, XM, IT, MIDI...)", c.showTrackerChart)
   ui.hint(p, "Each channel's notes, scrolling as they play. Modules need libopenmpt.")
@@ -1546,6 +1588,383 @@ proc subStylePage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
       c.resetSubStyle()
     p.y += 34
 
+# --- Libraries --------------------------------------------------------------------
+
+const
+  LibListW = 200'f32            ## the libraries' column
+  LibRowH = 24'f32
+  LibKinds = [(lkAudio, "Audio"), (lkVideo, "Video"), (lkAll, "All media"), (lkCustom, "Custom...")]
+
+proc libIndex(d: OptionsDialog, c: Config): int =
+  ## The selected library, -1 with none.
+  if c.libraries.len == 0: -1 else: clamp(d.libSel, 0, c.libraries.high)
+
+proc selectedLibrary*(d: OptionsDialog, c: Config): int = d.libIndex(c)
+
+proc startLibRename*(d: OptionsDialog, ui: Ui, c: Config) =
+  ## Starts typing the selected library's name in its row.
+  let i = d.libIndex(c)
+  if i < 0: return
+  d.libSel = i
+  d.libRenaming = true
+  d.libRenameText = c.libraries[i].name
+  d.libRenameNote = ""
+  ui.focusId = "o-lib-rename"
+  ui.focusFresh = true
+
+proc endLibRename(d: OptionsDialog, ui: Ui, c: var Config, keep: bool) =
+  ## Takes the typed name (unless it can't be used: typing goes on), or
+  ## leaves the old one.
+  let i = d.libIndex(c)
+  if keep and i >= 0:
+    let why = validLibraryName(c.libraries, d.libRenameText, i)
+    if why.len > 0:
+      d.libRenameNote = why
+      ui.focusId = "o-lib-rename"
+      return
+    if c.libraryShown == c.libraries[i].name: c.libraryShown = d.libRenameText.strip  # the panel keeps it
+    c.librarySearch = renamedInSearch(c.librarySearch, c.libraries[i].name, d.libRenameText.strip)
+    c.libraries[i].name = d.libRenameText.strip
+  d.libRenaming = false
+  d.libRenameNote = ""
+  if ui.focusId == "o-lib-rename": ui.focusId = ""
+  ui.navId = "o-lib-list"
+
+proc createLibrary*(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## Adds a library, "New library" for now, and starts typing its name.
+  var name = "New library"
+  var n = 2
+  while validLibraryName(c.libraries, name).len > 0:
+    name = "New library " & $n
+    inc n
+  c.libraries.add Library(name: name, kind: lkAll)
+  d.libSel = c.libraries.high
+  d.libItem = -1
+  d.libItemScroll = 0
+  d.libScroll = max(0'f32, c.libraries.len.float32 * LibRowH)  # clamped when drawn: the end
+  d.startLibRename(ui, c)
+
+proc removeLibrary*(d: OptionsDialog, ui: Ui, c: var Config) =
+  let i = d.libIndex(c)
+  if i < 0: return
+  c.libraries.delete(i)
+  d.libSel = min(i, c.libraries.high)
+  d.libItem = -1
+  d.libRenaming = false
+  if ui.focusId == "o-lib-rename": ui.focusId = ""
+
+proc showLibrary*(d: OptionsDialog, c: Config, name: string) =
+  ## Selects the library of that name (the Library panel's Edit).
+  for i, l in c.libraries:
+    if l.name == name:
+      (d.libSel, d.libItem, d.libItemScroll, d.libRenaming) = (i, -1, 0'f32, false)
+
+proc libMoveItem*(d: OptionsDialog, c: var Config, m: ItemMove) =
+  ## Moves the selected folder or file up, down, to the top or the bottom.
+  let i = d.libIndex(c)
+  if i < 0: return
+  let j = d.libItem
+  if j notin 0 .. c.libraries[i].paths.high: return
+  let to = case m
+    of imTop: 0
+    of imUp: max(0, j - 1)
+    of imDown: min(c.libraries[i].paths.high, j + 1)
+    of imBottom: c.libraries[i].paths.high
+  if to == j: return
+  let p = c.libraries[i].paths[j]
+  c.libraries[i].paths.delete(j)
+  c.libraries[i].paths.insert(p, to)
+  d.libItem = to
+  d.libReveal = true
+
+proc libRemoveItem*(d: OptionsDialog, c: var Config) =
+  let i = d.libIndex(c)
+  if i < 0 or d.libItem notin 0 .. c.libraries[i].paths.high: return
+  c.libraries[i].paths.delete(d.libItem)
+  d.libItem = min(d.libItem, c.libraries[i].paths.high)
+
+proc libAddPaths*(d: OptionsDialog, c: var Config, paths: seq[string]) =
+  ## Adds folders or files to the selected library; one it lists already
+  ## is selected instead.
+  let i = d.libIndex(c)
+  if i < 0: return
+  for p in paths:
+    let n = p.normPath
+    if n.len == 0: continue
+    let at = c.libraries[i].paths.mapIt(it.normPath).find(n)
+    if at >= 0: d.libItem = at
+    else:
+      c.libraries[i].paths.add n
+      d.libItem = c.libraries[i].paths.high
+  d.libReveal = true
+
+proc libChangeItem*(d: OptionsDialog, c: var Config, path: string) =
+  ## The selected folder or file becomes path (Change...).
+  let i = d.libIndex(c)
+  if i < 0 or d.libItem notin 0 .. c.libraries[i].paths.high: return
+  let n = path.normPath
+  if n.len > 0: c.libraries[i].paths[d.libItem] = n
+
+proc libItemPath*(d: OptionsDialog, c: Config): string =
+  ## The selected folder or file, "" with none.
+  let i = d.libIndex(c)
+  if i >= 0 and d.libItem in 0 .. c.libraries[i].paths.high: c.libraries[i].paths[d.libItem] else: ""
+
+proc libItemInfo*(d: OptionsDialog, path: string): PathInfo =
+  if d.pathInfo != nil: d.pathInfo(path) else: (rsUnknown, false)
+
+proc librariesResults(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
+  ## Libraries while searching: the matching libraries; a click selects one.
+  ui.group(p, "Libraries")
+  for i, l in c.libraries:
+    let what = &"{l.paths.len} folder(s) and file(s), " & (case l.kind
+      of lkAudio: "audio"
+      of lkVideo: "video"
+      of lkAll: "all media"
+      of lkCustom: &"{l.exts.len} type(s)")
+    if ui.show(p, l.name, l.paths.join(" ")) and ui.resultRow(p, l.name, what):
+      (d.libSel, d.libItem, d.libRenaming) = (i, -1, false)
+
+proc libListKeys(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## The libraries' list with the keyboard: Up/Down select, Insert creates,
+  ## Delete removes, F2 renames.
+  let w = ui.window
+  let i = d.libIndex(c)
+  if w.buttonPressed[KeyUp] and i > 0: (d.libSel, d.libItem) = (i - 1, -1)
+  elif w.buttonPressed[KeyDown] and i < c.libraries.high: (d.libSel, d.libItem) = (i + 1, -1)
+  elif w.buttonPressed[KeyHome] and c.libraries.len > 0: (d.libSel, d.libItem) = (0, -1)
+  elif w.buttonPressed[KeyEnd] and c.libraries.len > 0: (d.libSel, d.libItem) = (c.libraries.high, -1)
+  elif w.buttonPressed[KeyInsert]: d.createLibrary(ui, c)
+  elif w.buttonPressed[KeyDelete]: d.removeLibrary(ui, c)
+  elif w.buttonPressed[KeyF2]: d.startLibRename(ui, c)
+  else: return
+  ui.navVisible = true
+
+proc libItemKeys(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## The folders and files with the keyboard: Up/Down select, F2 or Enter
+  ## changes, Delete removes, Ctrl+Shift+Up/Down/Home/End move.
+  let w = ui.window
+  let i = d.libIndex(c)
+  if i < 0: return
+  let n = c.libraries[i].paths.len
+  let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
+  let alt = w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]
+  let moving = ctrl and w.shiftDown and not alt
+  if moving:
+    if w.buttonPressed[KeyUp]: d.libMoveItem(c, imUp)
+    elif w.buttonPressed[KeyDown]: d.libMoveItem(c, imDown)
+    elif w.buttonPressed[KeyHome]: d.libMoveItem(c, imTop)
+    elif w.buttonPressed[KeyEnd]: d.libMoveItem(c, imBottom)
+    else: return
+  elif w.buttonPressed[KeyUp] and n > 0: d.libItem = max(0, d.libItem - 1)
+  elif w.buttonPressed[KeyDown] and n > 0: d.libItem = min(n - 1, d.libItem + 1)
+  elif w.buttonPressed[KeyHome] and n > 0: d.libItem = 0
+  elif w.buttonPressed[KeyEnd] and n > 0: d.libItem = n - 1
+  elif w.buttonPressed[KeyDelete]: d.libRemoveItem(c)
+  elif (w.buttonPressed[KeyF2] or w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]) and
+      d.libItem in 0 ..< n:
+    ui.enterUsed = true  # not OK
+    d.request = prLibChange
+  elif w.buttonPressed[KeyInsert]: d.request = prLibAddFolder
+  else: return
+  d.libReveal = true
+  ui.navVisible = true
+
+proc librariesPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
+  ## The libraries on the left, with buttons to create, remove and rename
+  ## them; the selected one's folders and files on the right, and the types
+  ## it lists.
+  let w = ui.window
+  ui.group(p, "Libraries")
+  ui.hint(p, "The Library panel (View > Library) lists the media in each library's folders, subfolders included, and files.")
+  let top = p.y + 2
+  let h = max(320'f32, bottom - top - 4)
+  let keys = ui.focusId.len == 0
+  if keys and ui.navId == "o-lib-list" and not d.libRenaming: d.libListKeys(ui, c)
+  if keys and ui.navId == "o-lib-items": d.libItemKeys(ui, c)
+  let sel = d.libIndex(c)
+
+  # The libraries, under their buttons.
+  let lx = p.x + 8
+  if ui.iconButton("o-lib-new", rect(lx, top + 2, 26, 24), "plus20", "Create new library (Insert)",
+      toggled = true, toggledCol = colGreen):
+    d.createLibrary(ui, c)
+  if ui.iconButton("o-lib-remove", rect(lx + 28, top + 2, 26, 24), "trash20", "Remove library (Delete)",
+      enabled = sel >= 0, toggled = true, toggledCol = colError):
+    d.removeLibrary(ui, c)
+  if ui.iconButton("o-lib-rename-btn", rect(lx + 56, top + 2, 26, 24), "rename20", "Rename library (F2)",
+      enabled = sel >= 0):
+    d.startLibRename(ui, c)
+  let sel2 = d.libIndex(c)  # the buttons may have changed it
+  let list = rect(lx, top + 32, LibListW, h - 32 - (if d.libRenameNote.len > 0: 20'f32 else: 0))
+  ui.rect(list, colBackground)
+  ui.border(list, colBorder)
+  let inner = rect(list.x + 1, list.y + 1, list.w - 2, list.h - 2)
+  let listFocused = ui.tabStop("o-lib-list", list)
+  let maxScroll = max(0'f32, c.libraries.len.float32 * LibRowH - inner.h)
+  if d.libRenaming and sel2 >= 0:  # the row being typed in stays in view
+    let y = sel2.float32 * LibRowH
+    d.libScroll = clamp(d.libScroll, y + LibRowH - inner.h, y)
+  if ui.hover(inner) and ui.scroll() != 0:
+    d.libScroll += ui.scroll() * LibRowH / 3
+    ui.scrollConsumed = true
+  d.libScroll = clamp(d.libScroll, 0, maxScroll)
+  let outerClip = ui.hitClip
+  ui.hitClip = inner
+  ui.sk.pushClipRect(inner)
+  for i in 0 ..< c.libraries.len:
+    let row = rect(inner.x, inner.y + i.float32 * LibRowH - d.libScroll, inner.w, LibRowH)
+    if row.y + LibRowH < inner.y or row.y > inner.y + inner.h: continue
+    let l = c.libraries[i]
+    let hov = ui.hover(row)
+    let isSel = i == sel2
+    let active = isSel and (ui.navId in ["o-lib-list", "o-lib-rename"])
+    if isSel: ui.rect(row, if active: colAccent else: colPressed)
+    elif hov: ui.rect(row, colHover)
+    if isSel and listFocused: ui.focusRing(rect(row.x + 2, row.y + 2, row.w - 4, row.h - 4))
+    if isSel and d.libRenaming:
+      let field = rect(row.x + 1, row.y, row.w - 2, row.h)
+      if w.buttonPressed[KeyEscape] and ui.focusId == "o-lib-rename":
+        d.endLibRename(ui, c, false)
+      else:
+        let ev = ui.textField("o-lib-rename", field, d.libRenameText, "Library name")
+        if eeCommitted in ev or (eeChanged notin ev and ui.focusId != "o-lib-rename"):
+          d.endLibRename(ui, c, true)
+      continue
+    let fg = if active: colOnAccent elif l.hidden: colTextDim else: colText
+    ui.icon("library16", vec2(row.x + 13, row.y + LibRowH / 2), if active: colOnAccent else: colTextDim)
+    let suffix = if l.hidden: " (hidden)" else: ""
+    ui.textIn(ui.ellipsize(l.name & suffix, row.w - 32), rect(row.x + 26, row.y, row.w - 30, LibRowH), fg)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      if not isSel:
+        (d.libSel, d.libItem, d.libItemScroll) = (i, -1, 0'f32)
+      ui.navId = "o-lib-list"
+    if hov and w.buttonPressed[DoubleClick]: d.startLibRename(ui, c)
+  if c.libraries.len == 0:
+    ui.textIn("No libraries", inner, colTextDim, FontSmall, h = CenterAlign)
+  ui.sk.popClipRect()
+  ui.hitClip = outerClip
+  if d.libRenameNote.len > 0:
+    ui.textIn(ui.ellipsize(d.libRenameNote, LibListW, FontSmall),
+      rect(lx, list.y + list.h + 2, LibListW, 18), colError, FontSmall)
+
+  # The selected library's folders and files, and its types.
+  let rx = lx + LibListW + 16
+  let rw = p.x + p.w - rx
+  p.y = top + h
+  if sel2 < 0:
+    ui.textIn("Create a library with the + button", rect(rx, top, rw, h), colTextDim, FontSmall,
+      h = CenterAlign)
+    return
+  ui.textIn("Folders and files", rect(rx, top + 2, rw, 24), colTextDim, FontSmall)
+  let kindsH = 26'f32 + 28 + 22 + 30
+  let box = rect(rx, top + 32, rw, h - 32 - 36 - kindsH)
+  ui.rect(box, colBackground)
+  ui.border(box, colBorder)
+  let ibox = rect(box.x + 1, box.y + 1, box.w - 2, box.h - 2)
+  let itemsFocused = ui.tabStop("o-lib-items", box)
+  let paths = c.libraries[sel2].paths
+  if d.libItem >= paths.len: d.libItem = paths.high
+  let itemMax = max(0'f32, paths.len.float32 * LibRowH - ibox.h)
+  if d.libReveal and d.libItem >= 0:
+    let y = d.libItem.float32 * LibRowH
+    d.libItemScroll = clamp(d.libItemScroll, y + LibRowH - ibox.h, y)
+  d.libReveal = false
+  if ui.hover(ibox) and ui.scroll() != 0:
+    d.libItemScroll += ui.scroll() * LibRowH / 3
+    ui.scrollConsumed = true
+  d.libItemScroll = clamp(d.libItemScroll, 0, itemMax)
+  ui.hitClip = ibox
+  ui.sk.pushClipRect(ibox)
+  var rowHit = false
+  for j, path in paths:
+    let row = rect(ibox.x, ibox.y + j.float32 * LibRowH - d.libItemScroll, ibox.w, LibRowH)
+    if row.y + LibRowH < ibox.y or row.y > ibox.y + ibox.h: continue
+    let hov = ui.hover(row)
+    let isSel = j == d.libItem
+    let active = isSel and ui.navId == "o-lib-items"
+    if isSel: ui.rect(row, if active: colAccent else: colPressed)
+    elif hov: ui.rect(row, colHover)
+    if isSel and itemsFocused: ui.focusRing(rect(row.x + 2, row.y + 2, row.w - 4, row.h - 4))
+    let info = d.libItemInfo(path)
+    let note = case info.state
+      of rsMissing: "missing"
+      of rsStuck: "not responding"
+      of rsError: "can't be read"
+      of rsScanning: "scanning..."
+      else: ""
+    let dark = info.state in {rsMissing, rsError}
+    let fg = if active: colOnAccent elif dark: colTextDisabled else: colText
+    ui.icon(if info.isFile: "nofile16" else: "folder16", vec2(row.x + 13, row.y + LibRowH / 2),
+      if active: colOnAccent elif dark: colTextDisabled else: colTextDim)
+    let noteW = if note.len > 0: ui.textSize(note, FontSmall).x + 12 else: 0'f32
+    ui.textIn(ui.ellipsize(path, row.w - 34 - noteW), rect(row.x + 26, row.y, row.w - 30 - noteW, LibRowH), fg)
+    if note.len > 0:
+      ui.textIn(note, rect(row.x + row.w - noteW, row.y, noteW - 6, LibRowH),
+        if active: colOnAccent elif info.state == rsStuck: colWarning elif dark: colTextDisabled
+        else: colTextDim, FontSmall)
+    ui.tip(row, path & (if note.len > 0: " (" & note & ")" else: ""))
+    if hov and (ui.pressed() or ui.pressed(MouseRight)):
+      ui.consumeClick()
+      d.libItem = j
+      ui.navId = "o-lib-items"
+      rowHit = true
+    if hov and w.buttonPressed[DoubleClick]: d.request = prLibChange
+    if hov and ui.released(MouseRight):
+      d.libItem = j
+      ui.navId = "o-lib-items"
+      d.ctxPos = ui.mouse
+      d.request = prLibContext
+      rowHit = true
+  if ui.hover(ibox) and not rowHit:
+    if ui.pressed() or ui.pressed(MouseRight):
+      d.libItem = -1
+      ui.navId = "o-lib-items"
+    if ui.released(MouseRight):
+      d.libItem = -1
+      d.ctxPos = ui.mouse
+      d.request = prLibContext
+  if paths.len == 0:
+    ui.textIn("Add the folders and files to scan", ibox, colTextDim, FontSmall, h = CenterAlign)
+  ui.sk.popClipRect()
+  ui.hitClip = outerClip
+  let by = box.y + box.h + 6
+  if ui.textButton("o-lib-addfolder", rect(rx, by, 120, 28), "Add Folder..."):
+    d.request = prLibAddFolder
+  if ui.textButton("o-lib-addfiles", rect(rx + 128, by, 120, 28), "Add Files..."):
+    d.request = prLibAddFiles
+
+  # What it lists.
+  var y = by + 28 + 10
+  ui.groupHeader(vec2(rx, y), rw, "Scan for")
+  y += 26
+  var x = rx + 8
+  let lib = c.libraries[sel2]
+  for (kind, label) in LibKinds:
+    let id = "o-lib-kind-" & $kind
+    let r = rect(x, y, 24 + ui.textSize(label).x, 22)
+    if ui.radioButton(id, vec2(x, y), label, lib.kind == kind):
+      if kind == lkCustom: d.request = prLibCustom
+      else: c.libraries[sel2].kind = kind
+    elif kind == lkCustom and lib.kind == lkCustom and ui.hover(r) and
+        w.buttonReleased[MouseLeft] and ui.pressId == id:
+      d.request = prLibCustom  # chosen already: its types again
+    x += r.w + 22
+  y += 28
+  let types = case lib.kind
+    of lkAudio: "Audio files, music modules and MIDI files"
+    of lkVideo: "Video files"
+    of lkAll: "Every audio and video file"
+    of lkCustom:
+      if lib.exts.len == 0: "No types chosen: Custom... picks them"
+      else: &"{lib.exts.len} type(s): " & lib.exts.mapIt("." & it).join(", ")
+  ui.textIn(ui.ellipsize(types, rw - 16, FontSmall), rect(rx + 8, y - 2, rw - 16, 18), colTextDim, FontSmall)
+  y += 22
+  var hidden = lib.hidden
+  if ui.checkbox("o-lib-hidden", vec2(rx + 8, y), "Hidden: left out of the Library panel's list, All and searches", hidden):
+    c.libraries[sel2].hidden = hidden
+
 proc miscPage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Steps")
   ui.numberRow(p, "o-move", "Move (pixels)", c.panStep, 1, 1, 500)
@@ -1607,7 +2026,10 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
   let clashing = c.keyClashes.card > 0
   # On the Keys page its list shows them already.
   let clashPages = if clashing and (searching or d.page != opKeys): {opKeys} else: {}
-  d.drawTree(ui, treeR, keys, changed, clashPages)
+  # While searching the tree waits for the pages, to tint those with results
+  # (it has no tab stop then, so the Tab order stays tree, page, buttons).
+  if not searching:
+    d.drawTree(ui, treeR, keys, changed, clashPages, default(array[OptionsPage, int]))
 
   let pageR = rect(treeR.x + treeR.w + 16, body.y, body.w - treeR.w - 16, body.h)
   ui.sk.pushClipRect(pageR)
@@ -1635,6 +2057,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
       of opReplayGain: replayGainPage(ui, c, p)
       of opSubtitles: d.subtitlesPage(ui, c, p)
       of opSubStyle: d.subStylePage(ui, c, p)
+      of opLibraries: d.librariesResults(ui, c, p)
       of opMisc: miscPage(ui, c, p)
       of opSystem: systemPage(ui, c, p)
     if not p.started:
@@ -1653,11 +2076,13 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     of opReplayGain: replayGainPage(ui, c, p)
     of opSubtitles: d.subtitlesPage(ui, c, p)
     of opSubStyle: d.subStylePage(ui, c, p)
+    of opLibraries: d.librariesPage(ui, c, p, pageR.y + pageR.h)
     of opMisc: miscPage(ui, c, p)
     of opSystem: systemPage(ui, c, p)
   ui.hitClip = outerClip
   ui.sk.popClipRect()
   let pageStopsEnd = ui.tabStops.len
+  if searching: d.drawTree(ui, treeR, keys, changed, clashPages, p.hits)
 
   # Long pages scroll when the window is small.
   let contentH = p.y - origin

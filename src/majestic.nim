@@ -2,14 +2,15 @@
 
 import gpumem  # first: it picks the GL library before anything loads one
 import std/[os, strutils, strformat, times, math, osproc, unicode, sequtils, algorithm,
-  random, tables, sets, streams, json, hashes]
+  random, tables, sets, streams, json, hashes, strtabs]
 import silky, vmath, bumpy, chroma, pixie, opengl, jsony
 import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, player, icons, debugscript,
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
   netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
-  avsview, plmanager, cue, animpic
+  avsview, plmanager, cue, animpic, library, libtypes, glyphcache
 from coverart import pictures
+from assoc import loadAssocItems
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
 when defined(posix): from std/posix import access, W_OK
 
@@ -30,6 +31,8 @@ const
   MinWindow = ivec2(480, 270)
   MinCompactWindow = ivec2(16, 16)  ## pixels, not UI units: compact mode shrinks all the way
   OptionsSize = ivec2(912, 684)
+  TypesSize = ivec2(600, 600)   ## Options > Libraries > Custom...
+  NewPlayerArg = "--new-player" ## files opened in a player of their own, never handed to a running one
   RenameSize = ivec2(400, 178)
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
@@ -56,6 +59,7 @@ const
     pfDimensions: ("Dimensions", "3840×2160"),
     pfAudioBitrate: ("Audio bitrate", "9 999 kb/s"),
     pfTrack: ("Track number", "999"),  # headed "#": see columnTitle
+    pfDisc: ("Disc number", "99"),     # headed "Disc": see columnTitle
     pfArtist: ("Artist", ""),
     pfYear: ("Year", "9999"),
     pfAlbum: ("Album", "")]
@@ -79,11 +83,33 @@ const
   PlaylistBarW = 14'f32     ## the playlist's scroll bar gutter
   PlaylistBarThin = 4'f32   ## its thumb's width at rest
   PlaylistBarWide = 10'f32  ## and with the pointer on it
+  LibraryMinH = 150'f32     ## the Library panel under the playlist, at least, and
+  LibraryPlaylistMinH = 120'f32  ## what it leaves the playlist
+  LibrarySplitGrip = 5'f32  ## its top edge's draggable band
+  LibrarySearchH = 30'f32   ## its search bar
+  LibraryStatusH = 22'f32   ## its bottom line
+  LibraryListMinW = 70'f32  ## the libraries' column, narrowest, and
+  LibraryListRest = 110'f32 ## at least what it leaves the files
+  LibraryBarW = 10'f32      ## the files' scroll bar
+  ## What the Library search suggests for a tag being started.
+  LibrarySearchTags = ["in:", "exclude:", "hidden", "format:", "filename contains:",
+    "size exactly:", "size biggerthan:", "size smallerthan:", "bitrate exactly:",
+    "bitrate biggerthan:", "bitrate smallerthan:", "dimension exactly:", "dimension biggerthan:",
+    "dimension smallerthan:", "path:", "title:", "artist:", "album:", "genre:", "year:"]
   SphereFov = 75'f32        ## 360° video: vertical field of view a file opens with
   SphereFovStep = 5'f32     ## degrees per Ctrl+Wheel notch
   SphereTextureMax = 8192   ## cap on the equirectangular texture's longer side
 
 type
+  ColumnDrag = object
+    ## A column header's right edge being dragged (the playlist's or the library's).
+    index: int            ## the column whose edge it is
+    x: float32            ## the pointer's x at the press
+    widths: seq[float32]  ## every column's width as drawn at the press
+    mins: seq[float32]    ## and the narrowest each can get
+    filler: int           ## a text column right of the edge filling the panel, giving way (-1: none)
+    moved: bool           ## the pointer moved: the widths are set from then on
+
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovSync,
     ovYtdlp, ovEmbed, ovUpdate, ovTags, ovPalette
@@ -105,13 +131,30 @@ type
     checked, enabled: bool
     action: proc ()
     trail: seq[(string, int)] ## mkSub: label and index of each submenu down to it
+    id: string                ## Change Visualizer's list: the preset (two may share a name)
 
   ContextMenu = enum
-    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistTab, cmPlaylistColumns, cmRepeat, cmRunLog, cmQuality, cmReplayGain  ## where the right-click menu was opened
+    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistTab, cmPlaylistColumns, cmRepeat, cmPlay, cmStop, cmPause, cmRunLog, cmQuality, cmReplayGain, cmLibrary  ## where the right-click menu was opened
+
+  AfterCurrent = enum
+    acOff, acStop, acPause  ## the Stop and Pause buttons' "... after current": one at a time
+
+  LibCtx = enum
+    lcLibrary, lcBlank, lcFiles, lcHeader  ## where in the Library panel its menu was opened
 
   PointerShape = enum
     ptArrow, ptHidden, ptResize, ptResizeV, ptResizeNWSE, ptResizeNESW, ptCross, ptMove,
     ptMoving, ptText
+
+  TurnState = enum
+    tnOff       ## no seamless turn on the way
+    tnParking   ## Enable reverse playback: the standby going to wait ahead,
+                ## facing the other way, for the Play button (parkTick)
+    tnParked    ## waiting there, silent
+    tnLoading   ## the standby going to its run-up, facing the other way
+    tnReady     ## waiting there
+    tnRolling   ## playing its run-up, silent, brought in line
+    tnFading    ## took over: the player it took over from fades out
 
   VideoTransform = object
     pan: Vec2
@@ -292,6 +335,7 @@ type
     plMarks: seq[int]         ## the whole selection, sorted, when more than plSelected
     plFocused: bool           ## the playlist was clicked last: it takes its keys
     plArrows: bool            ## clicked and the pointer has not left it since: Up/Down select
+    plSideKeys: bool          ## the playlists' side column was clicked or reached with Tab: Up/Down show a playlist
     plFindOpen: bool          ## the playlist's search bar is shown (Ctrl+F)
     plFind: string            ## its text
     plFindHits: seq[int]      ## the entries matching it, as of the last frame
@@ -307,7 +351,7 @@ type
     mediaInfo: Table[string, MediaInfo]  ## probe results, for columns and sorting
     plColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "plcolumn" is active
     plRowFrom: tuple[index: int, y: float32, moved, reselect: bool, at: float]  ## while "plrow" is active: the row pressed, the pointer's y, whether it left the press, whether a click without a drag selects only that row, and when the list last auto-scrolled
-    plWidthFrom: tuple[index: int, x, left, room: float32, filler: int, moved: bool]  ## while "plwidth" is active: the column whose edge is dragged, how far the columns right of it can give way, and the one left filling the panel
+    plWidthFrom: ColumnDrag   ## while "plwidth" is active
     plOverEdge: bool          ## the pointer is on a column header's resizable edge
     plDurSeconds: bool        ## the Duration column in plain seconds: nothing lasts over a minute
     fileSizes: Table[string, int64]      ## -1 for streams and unreadable files
@@ -319,6 +363,57 @@ type
     plAutosaveFailed: bool    ## the last autosave failed (said on screen once)
     plAutosaveAsk: bool       ## Save Playlist was asked for by ticking Autosave
     plOnline: bool            ## playlistOnline, as of the last autosave check
+    library: LibIndex         ## the libraries' files, walked and read on threads (library.nim)
+    libConfigured: seq[Library]  ## cfg.libraries as the index last took them
+    libRows: seq[int32]       ## the files the Library panel lists (the index's), in order
+    libRowsKey: string        ## what they were made from: search, library, sorting...
+    libRowsMoving: string     ## and the index's state, as files and tags come in
+    libRowsAt: float          ## when they were last made
+    libRowsDrop: int          ## the index's dropGen they were made at (their indices hold until it moves)
+    libView: seq[int32]       ## the panel's rows: files (the index's), and folder headers as -(group + 1)
+    libGroups: seq[tuple[label: string, count: int]]  ## those folders, with Group by Folder
+    libDurSeconds: bool       ## the Duration column in plain seconds: nothing listed lasts over a minute
+    libColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "libcolumn" is active
+    libWidthFrom: ColumnDrag  ## while "libwidth" is active
+    libCtxColumn: PlaylistField  ## the column header right-clicked
+    libBase: seq[int32]       ## the libraries listed, sorted, before the search's other tags
+    libBaseKey: string        ## what they were made from
+    libSel: HashSet[string]   ## the selected files
+    libAnchor: string         ## the file Shift+click selects from
+    libCursor: string         ## the file last clicked or moved to
+    libScroll: float32
+    libCatScroll: float32
+    libFocused: bool          ## the panel was clicked last: it takes its keys
+    libArrows: bool           ## its list was clicked and the pointer stayed: Up/Down select
+    libCatKeys: bool          ## its libraries' column was clicked or reached with Tab: Up/Down pick one, F2 renames
+    libCatRect: Rect          ## that column, last frame
+    libCatReveal: bool        ## scroll the library listed into view in it
+    libRename: string         ## the library whose name is being typed over in it, "" none
+    libRenameText: string
+    libReveal: bool           ## scroll the cursor's row into view
+    libListRect: Rect         ## the file rows, last frame
+    libVisible: seq[int]      ## the files in view (the index's), whose tags are read first
+    libOverEdge: bool         ## the pointer is on one of its resizing edges
+    libSplitFrom: (float32, float32)  ## pointer y and height when its top edge's drag began
+    libCatFrom: (float32, float32)    ## pointer x and width when its column edge's drag began
+    libThumbFrom: (float32, float32)  ## pointer y and scroll when the thumb drag began
+    libDrag: tuple[y: float32, moved: bool, row: int, reselect: bool]  ## while "librow" is active
+    libCtx: LibCtx            ## what its right-click menu is about
+    libCtxName: string        ## the library right-clicked ("" for All)
+    libSuggest: int           ## the search suggestion highlighted
+    libSuggestOff: bool       ## Escape put the suggestions away (until the search changes)
+    libSuggestKeep: int = -1  ## >= 0: a suggestion was taken, the caret goes there; -2: just keep the field
+    libSearchSeen: string     ## the search the library listed last followed
+    libSearchSynced: bool     ## libSearchSeen is set
+    libSuggestBox: Rect       ## where they hang, last frame
+    libBusy: bool             ## something plays, as the workers were last told
+    typesDlg: TypesDialog     ## Options > Libraries > Custom..., its window created on first use
+    typesWin: Window
+    typesSk: Silky
+    typesUi: Ui
+    typesBefore: tuple[kind: LibraryKind, exts: seq[string]]  ## the library's types when it opened
+    optMenus: MenuSystem      ## the Options window's context menus (Libraries' folders)
+    optMenuOpenedAt: float
     xf: VideoTransform
     subs: SubLayout
     subsKey: string           ## mpv subtitle placement last pushed
@@ -521,6 +616,8 @@ type
     dropTries: int            ## the dropped stream reopened this many times
                               ## the link last streamed, to try again with
     stopOnLoad: bool          ## Stop, once the link loads (going online stopped)
+    afterCurrent: AfterCurrent  ## Stop or Pause after current, for this session
+    pauseOnLoad: bool         ## the file opening came after Pause after current: it waits paused
     saved: SaveIndex          ## links kept on disk as they streamed (websave)
     webInfoAt: float          ## when Options > Playback > Media Cache's list was last read
     rec: Seg                  ## the stream being saved: its file and what it holds
@@ -531,7 +628,7 @@ type
     saveJob: SaveJob          ## File > Save, while saving
     rgJob: RgJob              ## the playlist's ReplayGain > Analyze and Apply ..., while measuring
     rgShown: int              ## its percent as the status bar last drew it
-    rgOpenTagged: bool        ## it tagged the open file, whose values mpv reads on opening
+    rgOpenTagged: string      ## the open file, when it tagged it: opened again at the end
     saveSrc: string           ## the file or link File > Save asked where to save
     ytRetry: string           ## a link to open again at ytRetryAt
     ytRetryAt: float
@@ -611,6 +708,13 @@ type
     palBack: seq[tuple[trail: seq[(string, int)], text: string]]  ## where opening submenus came from
     palTextNext: string       ## set after the field this frame (a key going back may edit it)
     palTextSet: bool
+    palTrackBefore: Table[string, tuple[path: string, id: int]]  ## Disable Audio / Video:
+                              ## the track each turned off ("aid"/"vid"), and in which file
+    palCenter: bool           ## scroll palSel to the middle (a list opened on its current item)
+    palAnchor: Vec2           ## the mouse when it opened: its search field's middle goes there
+    palAvsList: bool          ## Change Visualizer's list is open: highlighting a preset plays it
+    palAvsBefore: string      ## the preset playing when it opened, back on Esc
+    palAvsTypedAt: float      ## when the search last changed there (it plays a second later), 0: done
     # mouse interaction with the video frame
     videoPress: bool
     videoPressPos: Vec2
@@ -635,7 +739,7 @@ type
     lookLast: Vec2            ## pointer position the drag last turned from
     osdMsg: string            ## OSD message drawn by us over a 360° view
     osdUntil: float
-    osdLayer: OsdLayer        ## draws the OSD while the video is transformed
+    osdLayer: OsdLayer        ## draws the OSD over the whole video frame
     osdFlag: bool             ## the OSD layer asked for a redraw
     osdApart: bool            ## the OSD is drawn by osdLayer now
     osdLayerSizes: string     ## osdSizes last pushed to osdLayer
@@ -662,7 +766,46 @@ type
     hasLoopA, hasLoopB: bool
     abLoop: bool
     pingPongOn: bool          ## a ping-pong loop as last applied
+    loneLoopOn: bool          ## a lone entry's loop as last applied (loneLoop)
+    ctxKind: tuple[cover, ownCover, visualizer, sphere: bool]  ## what the right-click
+                              ## menu took the file for, once it was playing (buildMenu)
     pingPongLast: float       ## its position the pass before, for crossing A or B
+    softDecode: bool          ## hwdec off: a ping-pong loop on, or playing in reverse
+    tnState: TurnState        ## a seamless turn (turnTick)
+    tnAt: float               ## its turning point, the file's time
+    tnBack: bool              ## turning to play backward
+    tnFrom: bool              ## the playing player's way (backward) as planned
+    tnRunUp: float            ## the standby's run-up, media seconds (none at a file's end)
+    tnCenter: float           ## the crossfade's middle: tnAt, unless no run-up
+    tnUser: bool              ## the Play button's (else Ping-Pong's)
+    tnJumps: int              ## the playing player's jumps as planned
+    tnAsked: int              ## the standby's restarts when sent to its run-up
+    tnSentAt: float           ## and when
+    tnArmed: bool             ## the playing player's fade-out is in
+    tnFadeLen: float          ## the crossfade's length, seconds
+    tnExpect: float           ## how far off the standby is expected to be by then, s
+    tnVideo: bool             ## the file has a picture (the standby starts otherwise)
+    tnFormat: string          ## the decoded sound's sample format (Player.turnFormat)
+    tnRate: int               ## and rate
+    tnRolledAt: float         ## when the standby was set playing
+    tnMeasureAt: float        ## when to measure how far off it is, 0: done
+    tnPass: int               ## measurements taken
+    tnOverAt: float           ## when it took over
+    tnOld: Player             ## tnFading: the player taken over from
+    tnFadeIn: Player          ## the player whose fade-in is still in af
+    tnQueued: bool            ## the Play button again meanwhile: turns back after
+    tnRetried: bool           ## the Play button's turn moved on once (the standby late)
+    tnFailed: string          ## a file the standby couldn't open: turned the plain way
+    tnParkX: float            ## where the standby waits for the Play button (tnParked)
+    tnParkJumps: int          ## the playing player's jumps then
+    tnParkFrom: bool          ## and its way (backward)
+    tnFast: bool              ## a turn from there (quickTurn)
+    tnPrep: float = 0.3       ## how long the standby takes to get to its run-up, learned
+    tnEdge: bool              ## Ping-Pong's turn at a file's end or start
+    tnSmear: bool             ## the sound's filtered (not mirrored exactly): long crossfade
+    tnDelays: array[8, float] = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]
+                              ## how late the standby's sound comes once set
+                              ## playing, media s, learned, by turnDelay's index
     plDir: int = 1            ## ping-pong playlist: the way it goes next
     reopening: bool           ## the file opens again (Player.reopen)
     gapNext: GapNext          ## gapless: the entry queued in mpv (queueGapless)
@@ -898,10 +1041,14 @@ proc menuBarHeight(a: App): float32 =
   ## Height of the menu bar as laid out: none in full screen or compact mode.
   if a.fullscreen or a.cfg.compactMode: 0 else: MenuBarHeight
 
+proc sideShown(a: App): bool =
+  ## The column right of the video is shown: the playlist, the library or both.
+  a.cfg.showPlaylist or a.cfg.showLibrary
+
 proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode), in pixels.
   let menuH = if a.cfg.compactMode: 0'f32 else: MenuBarHeight
-  a.px(ivec2(int32(if a.cfg.showPlaylist: a.playlistWidth else: 0),
+  a.px(ivec2(int32(if a.sideShown: a.playlistWidth else: 0),
         int32(menuH + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))))
 
 proc naturalSize(a: App): Vec2 =
@@ -922,6 +1069,7 @@ proc videoAspect(a: App): float =
 proc glyphSet(): seq[string] =
   result = AsciiGlyphs
   for cp in 0xA0 .. 0x17F: result.add $Rune(cp)
+  for cp in 0x400 .. 0x45F: result.add $Rune(cp)  # Cyrillic; other scripts: glyphcache
   for s in ["…", "–", "—", "•", "‘", "’", "“", "”", "→", "←", "×", "°", "·", "▸", "›", "‹"]:
     result.add s
 
@@ -945,6 +1093,9 @@ proc buildAtlas(scale: float32): (Image, SilkyAtlas) =
   discard b.addImage("crown96", renderIcon(crownPath, 24, px(96)))
   discard b.addImage("music96", renderIcon(musicPath, 24, px(96)))
   discard b.addImage("knob16", renderIcon("M12 4a8 8 0 1 0 0.001 0z", 24, px(16)))
+  # Two half circles: one arc to a point a hair away from its start draws nothing.
+  discard b.addImage("dot6", renderIcon("M0 12a12 12 0 1 0 24 0a12 12 0 1 0 -24 0z", 24, px(6)))
+  initGlyphCache(b, fontPath, monoPath)
   (b.atlasImage, b.atlas)
 
 # --- window management ------------------------------------------------------
@@ -1004,6 +1155,25 @@ proc setFullscreen(a: App, on: bool) =
     a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
   elif a.cfg.compactMode:
     a.window.setDecorated(false)  # leaving full screen may restore the frame
+
+proc cycleBars(a: App, dir: int) =
+  ## Ctrl+2 / Ctrl+Shift+2: steps through the 8 show/hide combinations of
+  ## the seek bar, controls and status bar. Forward counts down in binary
+  ## (seek bar the high bit) from all three shown to none, so the status bar
+  ## goes first; back counts up. The video keeps its size.
+  let cur = (if a.cfg.showSeekBar: 4 else: 0) or (if a.cfg.showControls: 2 else: 0) or
+            (if a.cfg.showStatus: 1 else: 0)
+  let nxt = (cur - dir + 8) mod 8
+  let before = a.bottomHeight
+  a.cfg.showSeekBar = (nxt and 4) != 0
+  a.cfg.showControls = (nxt and 2) != 0
+  a.cfg.showStatus = (nxt and 1) != 0
+  a.resizeKeepingVideo(ivec2(0, int32(a.bottomHeight - before)))
+  var shown: seq[string]
+  if a.cfg.showSeekBar: shown.add "Seek bar"
+  if a.cfg.showControls: shown.add "Controls"
+  if a.cfg.showStatus: shown.add "Status"
+  a.osd(if shown.len > 0: shown.join(" + ") else: "No bars")
 
 proc setCompact(a: App, on: bool) =
   ## Compact mode hides the window frame and the menu bar (the right-click
@@ -1185,10 +1355,45 @@ proc pingPongAb(a: App): bool =
   ## Repeat > Ping-Pong on the A-B loop: back and forth between A and B.
   a.cfg.repeatPingPong and a.abLoop and a.loopReady and not a.synced
 
+proc backwardReady(a: App): bool =
+  ## Files open without mpv's demuxer thread (and cache), as playing in
+  ## reverse wants (Player.setDemuxing): Ping-Pong, or the Play button's
+  ## Enable reverse playback.
+  a.cfg.repeatPingPong or a.cfg.reversePlayback
+
+proc playingIndex(a: App): int
+proc gaplessFile(path: string): bool
+
+proc loneLoop(a: App): bool =
+  ## Repeat Playlist on a playlist of one entry, the one playing, nothing
+  ## queued: mpv loops the file itself, as with Repeat File, rather than it
+  ## opening anew at each end (the picture going black, the right-click menu
+  ## changing under the pointer, a stall: with a short animated picture,
+  ## several times a second). Not for audio mpv goes on to by itself
+  ## (gaplessTarget, with its short-file delay), nor a link, whose end may
+  ## be its saved part's (handleEof).
+  let p = a.player
+  a.cfg.repeatForever and a.cfg.repeatMode == rmPlaylist and a.playingCount == 1 and
+    a.playingIndex == 0 and a.queue.len == 0 and p.path.len > 0 and
+    not p.path.contains("://") and not p.path.gaplessFile
+
+proc fileLoops(a: App): bool =
+  ## mpv loops the file playing: Repeat File, or a lone entry's (loneLoop).
+  a.cfg.repeatForever and a.cfg.repeatMode == rmFile or a.loneLoop
+
 proc applyLoop(a: App) =
+  ## Repeat File (or a lone entry's repeat) has mpv loop the file itself,
+  ## unless Stop or Pause after current waits on its end.
+  a.loneLoopOn = a.loneLoop
   a.player.h.setProp("loop-file",
-    if a.cfg.repeatForever and a.cfg.repeatMode == rmFile and not a.pingPongFile: "inf"
+    if a.fileLoops and not a.pingPongFile and a.afterCurrent == acOff: "inf"
     else: "no")
+
+proc keepLoneLoop(a: App) =
+  ## The playlist or queue changed under a lone entry's loop (loneLoop):
+  ## mpv loops the file, or lets it end, as that now wants. A slave follows
+  ## the master's loop instead (follow).
+  if a.loneLoop != a.loneLoopOn and not a.isSlave: a.applyLoop()
 
 proc repeatOsd(a: App) =
   ## Names the repeat now set: what repeats, and whether it goes back and forth.
@@ -1204,6 +1409,21 @@ proc toggleRepeat(a: App) =
   a.cfg.repeatForever = not a.cfg.repeatForever
   a.applyLoop()
   a.repeatOsd()
+
+proc toggleAfterCurrent(a: App, mode: AfterCurrent) =
+  ## The Stop and Pause buttons' right-click menus: turning one on turns
+  ## the other off.
+  a.afterCurrent = if a.afterCurrent == mode: acOff else: mode
+  a.applyLoop()
+  let name = if mode == acStop: "Stop after current" else: "Pause after current"
+  a.osd(name & (if a.afterCurrent == mode: ": on" else: ": off"))
+
+proc afterCurrentKept(a: App): bool =
+  ## "Preserve the above after current" for the mode on.
+  case a.afterCurrent
+  of acStop: a.cfg.stopAfterKeep
+  of acPause: a.cfg.pauseAfterKeep
+  of acOff: false
 
 proc applyAbLoop(a: App) =
   a.sbPlayingB = NaN  # seamless loops: set again from this
@@ -1713,7 +1933,6 @@ proc showTab(a: App, i: int) =
   if a.ui.focusId == "pl-tabname": a.ui.focusId = ""
   a.plFindHits.setLen 0
   a.plFindFrom = max(0, a.plSelected)
-  a.plArrows = false
   a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
 
 proc newPlaylist(a: App, name = "", entries: seq[string] = @[], show = true): int =
@@ -1805,7 +2024,7 @@ proc duplicateTab(a: App, i: int) =
   if i notin 0 ..< a.tabs.len or a.editLocked: return
   var t = newTab(a.tabNames.uniqueName(a.tabs[i].name))
   t.entries = a.tabEntries(i)
-  (t.columns, t.columnWidths) = (a.tabs[i].columns, a.tabs[i].columnWidths)
+  (t.columns, t.columnWidths, t.columnOrder) = (a.tabs[i].columns, a.tabs[i].columnWidths, a.tabs[i].columnOrder)
   a.showTab(a.insertTab(t, i + 1))
 
 proc ownColumns(a: App): bool =
@@ -1821,6 +2040,11 @@ proc plColumnWidths(a: App): var Table[string, float] =
   ## And their widths resized by hand, by field name.
   if a.ownColumns: return a.tabs[a.tabView].columnWidths
   a.cfg.playlistColumnWidths
+
+proc plColumnOrder(a: App): var seq[PlaylistField] =
+  ## And every column, hidden ones too, in the header menu's order.
+  if a.ownColumns: return a.tabs[a.tabView].columnOrder
+  a.cfg.playlistColumnOrder
 
 proc saveColumns(a: App) =
   ## The shown columns changed: saved where they're kept.
@@ -2020,6 +2244,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
   a.netWasDown = false
   a.ytCookieTried.setLen 0
   a.stopOnLoad = false
+  a.pauseOnLoad = false
   a.handoffOff()
   # A link played before: from disk, when saved where it starts.
   a.qualitySwitch = false
@@ -2051,11 +2276,11 @@ proc playIndex(a: App, i: int, start = -1.0) =
   elif path.isCueEntry:
     # Its stretch of the album's file, as a file of its own.
     a.ytWatch = false
-    a.player.load(path, a.resumedAt, a.cfg.repeatPingPong,
+    a.player.load(path, a.resumedAt, a.backwardReady,
       opts = "force-media-title=" & quoted(path.fileTitle), source = path.cueSource)
   else:
     a.ytWatch = false
-    a.player.load(path, a.resumedAt, a.cfg.repeatPingPong and not path.contains("://"))
+    a.player.load(path, a.resumedAt, a.backwardReady and not path.contains("://"))
   a.applyLoop()
   a.cfg.addRecent(path)
   a.cfg.lastDir = path.parentDir
@@ -2308,9 +2533,17 @@ proc clearQuickCover(a: App) =
 proc quickCoverSaved(a: App): bool =
   a.qcImage.len > 0 and a.quickCovers.getOrDefault(a.qcFor) == a.qcImage
 
+proc shownVid(a: App): string =
+  ## The video track shown other than a quick cover, as vid ("no" for none:
+  ## the visualizer), read from the track list mpv sent.
+  for t in a.player.tracks:
+    if t.kind == "video" and t.selected and not t.isQuickCover: return $t.id
+  "no"
+
 proc showQuickCover(a: App, on: bool) =
-  ## Show Quick Cover: the quick cover, or what showed before it (the file's
-  ## cover, or nothing: the visualizer, a video's track left off).
+  ## Show Quick Cover: the quick cover, or what showed right before it was
+  ## shown (the video, the file's cover, or nothing: the visualizer), so the
+  ## two alternate.
   let p = a.player
   var id = 0
   for t in p.tracks:
@@ -2318,6 +2551,7 @@ proc showQuickCover(a: App, on: bool) =
   if id == 0: return
   if on:
     if a.quickCoverShown: return
+    a.qcPrevVid = a.shownVid  # what to go back to: picked since, maybe
     p.h.setProp("file-local-options/vid", $id)
     # mpv takes a moment to set the picture up again: its snapshot till then.
     if a.qcTex != 0:
@@ -2345,7 +2579,7 @@ proc setQuickCover(a: App, image: string) =
     a.osd("Can't show " & name & why, secs = 3)
     return
   let old = if a.qcImage.len > 0: p.quickCoverTrack(a.qcTrack) else: 0
-  let before = if a.qcImage.len > 0: a.qcPrevVid else: p.h.getStr("vid")
+  let before = if a.quickCoverShown: a.qcPrevVid else: a.shownVid
   makeContextCurrent(a.window)  # it may need a render context
   let id = p.addQuickCover(track)
   if id == 0:
@@ -2396,6 +2630,10 @@ proc pollQuickCover(a: App) =
     if listed: a.qcSeen = true
     if p.path != a.qcFor or not p.loaded or (if a.qcSeen: not listed else: now() - a.qcSetAt > 5):
       a.clearQuickCover()
+    elif a.qcSeen and not p.switching and not a.quickCoverShown:
+      # Hidden: what shows now is what it hides when shown again (from
+      # the Video menu too), the video picked meanwhile included.
+      a.qcPrevVid = a.shownVid
   let h = a.qcHooked
   if a.qcImage.len == 0 and h.path.len > 0 and p.loaded and h.path == p.path:
     if p.quickCoverTrack(h.track) != 0:
@@ -2576,6 +2814,7 @@ proc padHold(a: App, on: bool) =
 proc atLastFrame(a: App): bool
 
 proc play(a: App) =
+  a.pauseOnLoad = false
   if a.padLen > 0:
     a.padHold(false)
     return
@@ -2616,6 +2855,29 @@ proc togglePlay(a: App) =
 
 proc playPause(a: App) =
   if not a.reopenLast(): a.togglePlay()
+
+proc heading(a: App): bool
+proc turnTo(a: App, back: bool)
+proc cancelTurn(a: App)
+
+proc playButton(a: App) =
+  ## The Play button: playing in reverse goes forward again; with Enable
+  ## reverse playback on, playing forward turns around. Plain Play otherwise.
+  ## Playing, a turn is seamless (turnTo): it comes a moment later.
+  let p = a.player
+  if p.loaded and a.heading and p.playing and not p.opening:
+    a.turnTo(false)
+    a.osd("Playing forward")
+  elif p.loaded and a.heading:
+    a.cancelTurn()
+    p.setBackward(false)
+    if not p.playing: p.play()
+    a.osd("Playing forward")
+  elif a.cfg.reversePlayback and p.playing and not p.opening and not p.eofReached and
+       not a.synced and a.padLen == 0:
+    a.turnTo(true)
+    a.osd("Playing in reverse")
+  else: a.play()
 
 proc seekTo(a: App, t: float, exact = true) =
   if a.padLen > 0 and t >= a.player.duration: return  # already there, waiting
@@ -2895,18 +3157,72 @@ proc selectAll(a: App) =
   if a.plSelected notin 0 ..< a.playlist.len: a.plSelected = 0
   a.plMarks = toSeq(0 ..< a.playlist.len)
 
+type PanelStop = enum
+  psNone, psPlaylists, psEntries, psLibraries, psFiles
+
+proc panelStops(a: App): seq[PanelStop] =
+  ## The places Tab moves the keyboard through, in order: the playlists'
+  ## side column (Playlists in a Side Column), the playlist's entries, the
+  ## libraries' column and the Library's files.
+  if a.cfg.showPlaylist and not a.playlistLocked:
+    if a.cfg.playlistTabsSide: result.add psPlaylists
+    result.add psEntries
+  if a.cfg.showLibrary: result.add [psLibraries, psFiles]
+
+proc panelStop(a: App): PanelStop =
+  ## The place holding the keyboard (its arrows, Enter...), psNone for none.
+  if a.plSideKeys: psPlaylists
+  elif a.plArrows: psEntries
+  elif a.libCatKeys: psLibraries
+  elif a.libArrows: psFiles
+  else: psNone
+
+proc focusPanel(a: App, stop: PanelStop) =
+  ## Gives that place the keyboard (psNone: none of them): its arrows, Enter
+  ## and Ctrl keys, until Escape or a click elsewhere.
+  a.plFocused = stop in {psPlaylists, psEntries}
+  a.plSideKeys = stop == psPlaylists
+  a.plArrows = stop == psEntries
+  a.libFocused = stop in {psLibraries, psFiles}
+  a.libCatKeys = stop == psLibraries
+  a.libArrows = stop == psFiles
+  if stop == psPlaylists: a.tabSeen = -1  # the playlist shown into view
+  if stop == psEntries and a.plSelected in 0 ..< a.playlist.len: a.plReveal = true
+  if stop == psLibraries: a.libCatReveal = true
+  if stop == psFiles: a.libReveal = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
 proc playlistKeys(a: App): bool =
   ## Ctrl+A, Ctrl+D and Ctrl+Shift+Up/Down/Home/End while the playlist has
-  ## the focus, and Up/Down while the pointer stays where it clicked (plArrows);
-  ## true when one was taken.
+  ## the focus, and Up/Down and Enter while it holds the arrows (plArrows:
+  ## clicked or reached with Tab, until Escape); true when one was taken.
+  ## In the playlists' side column Up/Down/Home/End show another playlist
+  ## and Enter goes on to its entries.
   let w = a.window
   let pressed = w.buttonPressed
+  if a.plSideKeys and a.cfg.playlistTabsSide and a.cfg.showPlaylist and not a.playlistLocked and
+      a.tabs.len > 0 and not (w.ctrl or w.alt or w.shiftDown):
+    var to = -1
+    if pressed[KeyUp]: to = max(0, a.tabView - 1)
+    elif pressed[KeyDown]: to = min(a.tabs.high, a.tabView + 1)
+    elif pressed[KeyHome]: to = 0
+    elif pressed[KeyEnd]: to = a.tabs.high
+    elif pressed[KeyEnter] or pressed[NumpadEnter]:
+      a.focusPanel(psEntries)
+      return true
+    if to >= 0:
+      if to != a.tabView: a.showTab(to)
+      return true
   if a.plArrows and a.cfg.showPlaylist and not a.playlistLocked and a.playlist.len > 0 and
-      not (w.ctrl or w.alt or w.shiftDown) and (pressed[KeyUp] or pressed[KeyDown]):
-    let step = if pressed[KeyUp]: -1 else: 1
-    a.selectOnly(clamp(a.plSelected + step, 0, a.playlist.high))
-    a.plReveal = true
-    return true
+      not (w.ctrl or w.alt or w.shiftDown):
+    if pressed[KeyUp] or pressed[KeyDown]:
+      let step = if pressed[KeyUp]: -1 else: 1
+      a.selectOnly(clamp(a.plSelected + step, 0, a.playlist.high))
+      a.plReveal = true
+      return true
+    if (pressed[KeyEnter] or pressed[NumpadEnter]) and a.plSelected in 0 ..< a.playlist.len:
+      a.playIndex(a.plSelected)
+      return true
   if not (a.plFocused and a.cfg.showPlaylist) or a.playlistLocked or not w.ctrl or w.alt:
     return
   result = true
@@ -3055,7 +3371,7 @@ proc sortPlaylist(a: App, by: PlaylistField) =
     case by
     of pfFilename: names[i] = p.extractFilename
     of pfSize: keys[i] = (a.fileSize(p).float, 0.0)
-    of pfName, pfDuration, pfDimensions, pfAudioBitrate, pfTrack, pfArtist, pfYear, pfAlbum:
+    of pfName, pfDuration, pfDimensions, pfAudioBitrate, pfTrack, pfDisc, pfArtist, pfYear, pfAlbum:
       let m = a.probeInfo(p)
       case by
       of pfName: names[i] = a.rowName(p)
@@ -3065,6 +3381,7 @@ proc sortPlaylist(a: App, by: PlaylistField) =
       of pfDimensions: keys[i] = (float(m.width * m.height), m.width.float)
       of pfAudioBitrate: keys[i] = (m.audioBitrate, 0.0)
       of pfTrack: keys[i] = (m.track.float, 0.0)
+      of pfDisc: keys[i] = (m.disc.float, m.track.float)
       of pfYear: keys[i] = (m.year.float, 0.0)
       else: discard
   if by notin {pfFilename, pfSize}: a.prober.finish()
@@ -3163,7 +3480,28 @@ proc runAfterPlayback(a: App) =
   else: a.runPowerAction()
 
 proc afterEof(a: App) =
-  ## The file ended: the queue's next, else the playing playlist's.
+  ## The file ended: the queue's next, else the playing playlist's. Stop
+  ## after current stops there instead; Pause after current has what comes
+  ## next wait paused at its start (with Repeat File, this file again).
+  let mode = a.afterCurrent
+  if mode != acOff and not a.afterCurrentKept:
+    a.afterCurrent = acOff
+    a.applyLoop()
+  if mode == acStop:
+    a.stop()
+    a.osd("Stopped after current")
+    return
+  let hold = mode == acPause
+  if hold and a.fileLoops:
+    a.pause(report = false)
+    a.seekTo(0)
+    a.osd("Paused after current")
+    return
+  defer:
+    if hold and a.player.opening:  # something comes next: it opens paused
+      a.pauseOnLoad = true
+      a.player.h.setProp("pause", true)
+      a.osd("Paused after current")
   if a.playQueued(): return
   var over = false
   a.inPlaying:
@@ -3185,7 +3523,8 @@ proc shortAudioPad(a: App): float =
   if not a.cfg.shortAudioDelay or not p.loaded or p.hasRealVideo or p.duration <= 0 or
      p.duration * 1000 >= a.cfg.shortAudioMs: return
   if p.partEnd > 0 or a.pingPongFile or a.abLoop or a.playlistLocked: return
-  if a.cfg.repeatForever and a.cfg.repeatMode == rmFile: return  # mpv loops it: no end
+  if a.fileLoops: return  # mpv loops it: no end
+  if a.afterCurrent != acOff: return  # stops or pauses there
   let n = a.playingCount
   let next = a.queue.len > 0 or a.cfg.repeatForever and n > 0 or a.playingIndex + 1 < n or
     a.afterPlayback == apNextInFolder and a.folderNeighbor(1).len > 0
@@ -3221,10 +3560,12 @@ proc gaplessTarget(a: App): GapNext =
   ## loops, the queue, a short file's delay, synchronized players...).
   let p = a.player
   if not p.loaded or p.opening or p.stopped or p.backward or p.hidden or p.endHold or
+     a.tnState notin {tnOff, tnParking, tnParked} or
      p.partEnd > 0 or p.hasRealVideo or not p.path.gaplessFile or
      p.source.len > 0 and not p.source.startsWith("edl://"): return
   if a.queue.len > 0 or a.playlistLocked or a.abLoop or a.pingPongFile or
-     a.cfg.repeatPingPong or a.cfg.repeatForever and a.cfg.repeatMode == rmFile: return
+     a.cfg.repeatPingPong or a.fileLoops or
+     a.afterCurrent != acOff: return
   if a.shortAudioPad > 0: return
   let ti = if a.tabPlaying in 0 ..< a.tabs.len: a.tabPlaying else: a.tabView
   let entries = a.tabEntries(ti)
@@ -3298,9 +3639,19 @@ proc handleEof(a: App) =
   if p.partEnd > 0:  # the end of a link's saved part: the stream goes on
     p.beyond = p.timePos
     return
-  if a.pingPongFile or a.pingPongAb:  # at either end of the file: turn around
+  # At either end of the file: turn around (seamlessly, turnTick, when the
+  # standby is running up for it). Stop or Pause after current takes the
+  # forward end as the file's.
+  if a.tnState in {tnReady, tnRolling}: return
+  if a.pingPongFile and not (a.afterCurrent != acOff and not p.backward) or a.pingPongAb:
     p.setBackward(not p.backward)
     p.h.setProp("pause", false)
+    return
+  # Played in reverse (the Play button) back to the start: it waits there,
+  # paused, facing forward.
+  if p.backward:
+    p.setBackward(false)
+    p.h.setProp("pause", true)
     return
   # A synchronized player's file may be shorter than the master's: it waits at
   # the end (clamped) until the group seeks back.
@@ -4052,6 +4403,15 @@ proc mirrorStandby(a: App) =
     if name in p.props and sb.props.getOrDefault(name) != p.props[name]:
       sb.h.setProp(trackProp(name), p.props[name])
 
+proc standbyForward(a: App) =
+  ## The standby as seamless loops, loop frames and step frames want it
+  ## before they open a file in it, whatever a turn left it as: forward, no
+  ## fades, decoding as usual.
+  let sb = a.standby
+  sb.setBackward(false)
+  sb.clearTurnFades()
+  sb.h.setProp("hwdec", hwdecMode())
+
 proc standbyAt(a: App, path: string, start: float, opts = "") =
   ## Sends the standby (paused, muted) to `start` in `path`, opened with
   ## mpv's per-file options `opts`.
@@ -4071,10 +4431,11 @@ proc standbyAt(a: App, path: string, start: float, opts = "") =
     sb.loadError = ""
     sb.sphere = a.player.sphere  # its added tracks come with mirroring
     sb.h.setProp("pause", true)
+    a.standbyForward()
     # Before opening: changed later, it would reopen the sound output.
     sb.h.setProp("audio-device", a.player.h.getStr("audio-device"))
-    sb.h.commandAsync("loadfile", path, "replace", "-1",
-      "start=" & formatFloat(start, ffDecimal, 6) & (if opts.len > 0: "," & opts else: ""))
+    sb.h.commandAsync("loadfile", path, "replace", "-1", withDecoderOpts(
+      "start=" & formatFloat(start, ffDecimal, 6) & (if opts.len > 0: "," & opts else: ""), path))
     a.sbState = sbLoading
   else:
     # Seeking first: pausing first would have it wait for its sound to stop.
@@ -4173,6 +4534,7 @@ proc standbyStep(a: App, la, lb, start: float) =
 proc seamlessLoop(a: App) =
   ## Keeps a standby ready for the loop playing, and hands over at B.
   if a.sbHandoff: return  # busy going online (webHandoff)
+  if a.tnState != tnOff: return  # a turn has it (turnTick)
   let p = a.player
   let (la, lb) = a.loopRegion
   let need = lb > la and lb - la >= StandbyMinLoop and p.loaded and not p.stopped and
@@ -4211,44 +4573,629 @@ proc placeLoopEnd(a: App) =
     a.sbPlayingB = b
     q.h.setProp("ab-loop-b", b)
 
+proc reopenHere(a: App, threadless: bool) =
+  ## The file playing opens again where it is, paused or not, for what mpv
+  ## reads only on opening one (its tags, after they're written); its added
+  ## tracks and the tracks picked come back once it's open.
+  let p = a.player
+  a.reopening = true
+  a.reopenTracks = p.tracks.filterIt(it.external and it.kind in ["sub", "audio"])
+  a.reopenSel = @[("aid", p.selectedTrack("audio")), ("sid", p.selectedTrack("sub")),
+                  ("vid", p.selectedTrack("video"))]
+  p.reopen(threadless)
+
 proc pingPong(a: App) =
   ## Ping-pong loops: turns around on crossing B forward or A backward (the
-  ## file's own ends come as EOF: handleEof). Back to forward when off.
+  ## file's own ends come as EOF: handleEof). Back to forward when turned
+  ## off; otherwise backward stays as the Play button left it.
   let p = a.player
   let on = a.pingPongFile or a.pingPongAb
   if on != a.pingPongOn:
     a.pingPongOn = on
-    # mpv plays backward a keyframe's span at a time, decoding all of it
-    # before showing its last frame: hardware decoders take several times
-    # as long to hand over a span's frames.
-    p.h.setProp("hwdec", if on: "no" else: hwdecMode())
+    if not on and p.backward: p.setBackward(false)
     if not a.isSlave:  # following sets its loops itself
       a.applyLoop()
       a.applyAbLoop()
-  # Ping-Pong turned on with a file open: it opens again without the
-  # demuxer thread, as files opened from now on do.
-  if a.cfg.repeatPingPong and not a.synced and p.loaded and not p.threadless and
+  # A synchronized group's clock only runs forward.
+  if a.synced and p.backward: p.setBackward(false)
+  # mpv plays backward a keyframe's span at a time, decoding all of it
+  # before showing its last frame: hardware decoders take several times
+  # as long to hand over a span's frames.
+  let soft = on or p.backward
+  if soft != a.softDecode:
+    a.softDecode = soft
+    p.h.setProp("hwdec", if soft: "no" else: hwdecMode())
+  # Ping-Pong or Enable reverse playback turned on with a file open: it
+  # opens again without the demuxer thread, as files opened from now on do.
+  if a.backwardReady and not a.synced and p.loaded and not p.threadless and
      not a.reopening and not p.path.contains("://"):
-    a.reopening = true
-    a.reopenTracks = p.tracks.filterIt(it.external and it.kind in ["sub", "audio"])
-    a.reopenSel = @[("aid", p.selectedTrack("audio")), ("sid", p.selectedTrack("sub")),
-                    ("vid", p.selectedTrack("video"))]
-    p.reopen(true)
-  if not on:
-    if p.backward: p.setBackward(false)
-    return
+    a.reopenHere(true)
+  if not on: return
   let pos = p.timePos
-  if a.pingPongAb and p.playing and not p.seeking:
+  # A seamless turn (turnTick) turns around itself; this is for when the
+  # standby couldn't be had or ready in time.
+  if a.pingPongAb and p.playing and not p.seeking and a.tnState == tnOff:
     if not p.backward and a.pingPongLast < a.loopB and pos >= a.loopB: p.setBackward(true)
     elif p.backward and a.pingPongLast > a.loopA and pos <= a.loopA: p.setBackward(false)
   a.pingPongLast = pos
+
+# --- seamless turns ---------------------------------------------------------
+# mpv turns around (play-direction) with a seek: it throws away the sound
+# queued for the output and starts again from the turning point, so the
+# sound jumps by the output's latency (40-65 ms) with a click, and with video
+# breaks off while the decoder catches up. A turn goes to the standby
+# instead. Facing the other way, it waits a little past the turning point
+# (its run-up) and plays from there unheard: its sound fades in at the
+# turning point, the playing player's fades out there, both placed by the
+# file's time with ffmpeg's afade, so to the sample (Player.setTurnFades).
+# It starts on a PipeWire cycle (21 ms or more), never quite in time, so
+# while both play, how far it is from the playing player's mirror image is
+# measured (Player.heardPos, to a fraction of a millisecond) and taken out
+# to the sample, dropping some of its silent sound or adding silence. (A
+# speed change can't: mpv filters the sound in bursts, a tenth of a second
+# each, so how much it covers is anyone's guess.) At the turning point it
+# takes over the picture too, as at a seamless loop's B, and the sound turns
+# around there through a crossfade, in line to ~0.2 ms (recorded off a null
+# sink: tmp/revsnd).
+# The crossfade is as short as that allows: two mirrored copies of a sound
+# partly cancel while they overlap (a dip on a steady tone).
+
+const
+  TurnRunUp = 1.2         ## Ping-Pong's run-up, seconds (at the speed playing):
+                          ## time to line the standby up, and check
+  TurnRunUpUser = 0.65    ## the Play button's: once, as it delays the turn
+  TurnArm = 0.45          ## the fades go in at least this long before the
+                          ## turning point, seconds: mpv filters the sound up to
+                          ## ~0.3 s ahead of what's heard
+  TurnArmAt = 0.52        ## and at the latest this long before (a pass of the
+                          ## loop can take a while: the visualizer drawing);
+                          ## usually right after the first measurement
+  TurnFade = 0.02         ## the crossfade, seconds, unless lined up closely
+  TurnFadeMin = 0.005     ## the shortest, for a standby in line to 1.25 ms
+  TurnFadeStretch = 0.08  ## with pitch correction at another speed: mpv's
+                          ## scaletempo2 puts its sound together from pieces
+                          ## (~20 ms, sought within 30), and can skip over
+                          ## much of a shorter fade
+  TurnSettle = 0.33       ## until a change of the standby's sound is all heard, seconds
+  TurnStart = 0.06        ## from setting the standby playing until its time is good
+  TurnClose = 0.0004      ## in line closer than this: left as it is, seconds
+  TurnQuick = 0.65        ## a turn from the parked standby comes this long after
+                          ## the click, seconds: mpv has ~0.44 s of the sound
+                          ## filtered ahead of what's heard (its audio-buffer and
+                          ## PulseAudio's), which no fade can reach any more, plus
+                          ## measuring the standby and a pass of the loop
+  TurnParkRunUp = 0.6     ## the parked standby waits at least this far past the
+                          ## turning point, seconds: lined up once playing, mpv
+                          ## filters its sound that far ahead too
+  TurnParkSpan = 3.0      ## and up to this much further, media seconds, the
+                          ## extra dropped once playing; it moves on beyond that.
+                          ## (A video's picture couldn't catch up with that much
+                          ## played backward: its standby is sent to the turn on
+                          ## the click, quickly as it has the file open already.)
+  TurnEdge = 0.04         ## Ping-Pong turns this far inside a file's start, seconds:
+                          ## playing backward, mpv's sound stops ~17 ms short of it
+  TurnEdgeEnd = 0.17      ## and this far inside its end: sent backward, mpv
+                          ## starts at the start of the packet holding that point
+                          ## (up to ~0.1 s short), and not from the last 60 ms
+
+let traceTurns = existsEnv("MMP_TRACE_TURNS")  ## each turn's steps to stderr
+
+proc turnTrace(a: App, msg: string) =
+  if traceTurns: stderr.writeLine &"turn {epochTime():.4f} {msg}"
+
+proc heading(a: App): bool =
+  ## Which way the Play button's turn has playback going (backward), once a
+  ## turn on the way is done.
+  if a.tnState in {tnLoading, tnReady, tnRolling}: a.tnBack else: a.player.backward
+
+proc turnFree(a: App): bool =
+  ## Whether a turn can go to the standby: a local file playing on, its
+  ## start and end in reach of mpv's backward playback (threadless), and
+  ## nothing else using the standby or the sound (the loop sound).
+  let (p, sb) = (a.player, a.standby)
+  let (la, lb) = a.loopRegion
+  sb != nil and p.loaded and p.playing and not p.opening and not p.seeking and
+    not p.eofReached and not p.endHold and p.threadless and p.duration > 0 and
+    p.path.len > 0 and not p.path.contains("://") and
+    (p.source.len == 0 or p.source.startsWith("edl://")) and p.partEnd <= 0 and
+    not p.isSpherical and not a.synced and a.padLen == 0 and lb <= la and
+    a.sbState == sbOff and a.lfState in {lfOff, lfFailed} and not a.sfOn and
+    a.lsState == lsOff and p.path != a.tnFailed
+
+proc canTurn(a: App): bool =
+  ## turnFree, and the standby not busy with a turn (or waiting for one).
+  a.turnFree and a.tnState == tnOff
+
+proc sendStandby(a: App, start: float, back: bool, fadeIn: float)
+proc parkWindow(a: App): tuple[lo, hi: float]
+
+proc turnDelay(a: App): var float =
+  ## The standby's learned start delay for this turn: it differs going
+  ## backward (mpv decodes back from a keyframe, and starts the sound with the
+  ## picture) and with or without a picture. A file's ends have their own:
+  ## too little run-up to put it in line there, it's learned turn by turn at
+  ## the same place.
+  a.tnDelays[ord(a.tnBack) * 2 + ord(a.tnVideo) + 4 * ord(a.tnEdge)]
+
+proc planTurn(a: App, at: float, back: bool, runUp: float, user: bool): bool =
+  ## Sends the standby to its run-up for a turn at `at` (the file's time),
+  ## to play backward from there or not; false if it can't be had, or there's
+  ## no time for it.
+  let (p, sb) = (a.player, a.standby)
+  if not a.canTurn or back == p.backward: return false
+  let dir = if p.backward: -1.0 else: 1.0
+  let ahead = dir * (at - p.posNow) / max(p.speed, 0.01)  # wall seconds
+  if ahead < a.tnPrep + TurnArm + 0.05: return false
+  # Inside the file as Ping-Pong would turn at its ends at the latest.
+  if at > p.duration - TurnEdgeEnd + 1e-6 or at < TurnEdge - 1e-6: return false
+  # The sound as the turn's filters take it (asked of the playing player,
+  # going forward or not: not of the standby, which may be busy reading).
+  a.tnFormat = p.turnFormat
+  a.tnRate = p.h.getInt("audio-params/samplerate")
+  if a.tnFormat.len == 0 or a.tnRate <= 0: return false
+  # As much run-up past the turning point as the file has, and as there's
+  # time for: it starts once the standby's there. Not from the very end:
+  # sent backward there, mpv starts tens of milliseconds short of it.
+  let room = if dir > 0: p.duration - 0.06 - at else: at
+  let r = clamp(min(runUp, ahead - a.tnPrep - 0.05) * p.speed, 0, max(room, 0))
+  (a.tnAt, a.tnBack, a.tnFrom, a.tnRunUp, a.tnUser) = (at, back, p.backward, r, user)
+  a.tnEdge = not user and a.pingPongFile and not a.pingPongAb
+  a.tnVideo = p.hasRealVideo
+  # The equalizer (filters with a phase), or pitch correction's stretching,
+  # don't give a sound played backward the mirror image of their own going
+  # forward: up to a millisecond or so apart by frequency, a short crossfade
+  # would leave a hole. The longest one smooths it over.
+  let (eqOn, gains) = a.equalizer
+  let stretch = abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no"
+  a.tnSmear = eqOn and gains.anyIt(it != 0) or stretch
+  a.tnFadeLen = if stretch: TurnFadeStretch else: TurnFade
+  # With no room (a file's end), the crossfade can't reach past the turning
+  # point: it ends there, the standby's sound fading in from where it starts.
+  a.tnCenter = at - dir * max(a.tnFadeLen / 2 - r, 0)
+  a.tnJumps = p.jumps
+  a.tnArmed = false
+  a.tnFast = false
+  a.tnExpect = 1
+  a.tnPass = 0
+  a.tnMeasureAt = 0
+  # mpv mustn't go on to a gapless next file once the turn's done.
+  p.queueNext("")
+  a.sendStandby(at + dir * r, back, a.tnCenter)
+  a.tnState = tnLoading
+  a.turnTrace(&"plan at {at:.4f} back={back} runup={r:.3f} from {p.posNow:.4f} prep {a.tnPrep:.3f}")
+  true
+
+proc sendStandby(a: App, start: float, back: bool, fadeIn: float) =
+  ## The standby to `start` in the file playing, paused, facing backward or
+  ## not, its sound faded in at fadeIn (silent before it).
+  let (p, sb) = (a.player, a.standby)
+  (a.sbPath, a.sfPath) = ("", "")  # the standby holds the file for the turn now
+  sb.h.setProp("pause", true)
+  sb.stopped = false
+  sb.setBackward(back)
+  sb.setTurnFades(fadeIn = fadeIn, d = a.tnFadeLen)
+  sb.h.setProp("hwdec", if back or a.pingPongOn: "no" else: hwdecMode())
+  sb.muted = p.muted
+  sb.h.setProp("mute", p.muted)
+  sb.setVolume(p.volume)
+  let f = (proc (t: float): string = formatFloat(t, ffDecimal, 6))
+  if sb.path != p.path or sb.source != p.source or not sb.loaded or not sb.threadless:
+    sb.setDemuxing(true)
+    (sb.path, sb.source, sb.partStart, sb.partEnd, sb.fullDuration) = (p.path, p.source, 0.0, 0.0, 0.0)
+    sb.loaded = false
+    sb.loadError = ""
+    sb.sphere = p.sphere  # its added tracks come with mirroring
+    # Before opening: changed later, it would reopen the sound output.
+    sb.h.setProp("audio-device", p.h.getStr("audio-device"))
+    sb.h.commandAsync("loadfile", if p.source.len > 0: p.source else: p.path, "replace", "-1",
+      "start=" & f(start) & (if p.openOpts.len > 0: "," & p.openOpts else: ""))
+  else:
+    sb.h.commandAsync("seek", f(start), "absolute", "exact")
+    sb.seeking = true  # until mpv says otherwise
+  a.tnAsked = sb.restarts
+  a.tnSentAt = now()
+
+proc cancelTurn(a: App) =
+  ## Called off before the takeover: the standby stops, the playing player
+  ## keeps its sound.
+  if a.tnState notin {tnLoading, tnReady, tnRolling}: return
+  a.turnTrace(&"cancel in {a.tnState}")
+  a.standby.h.setProp("pause", true)
+  a.standby.clearTurnFades()
+  a.player.clearTurnFades()
+  a.tnState = tnOff
+
+proc missedTurn(a: App) =
+  ## The standby not ready in time: the Play button's turn moves on once,
+  ## then turns the plain way; Ping-Pong's turns the plain way (pingPong,
+  ## handleEof).
+  let p = a.player
+  let (user, back) = (a.tnUser, a.tnBack)
+  a.cancelTurn()
+  if not user: return
+  let dir = if p.backward: -1.0 else: 1.0
+  if not a.tnRetried:
+    a.tnRetried = true
+    a.tnPrep = min(a.tnPrep * 1.5, 3)
+    if a.planTurn(p.posNow + dir * p.speed * (a.tnPrep + TurnRunUpUser + 0.1), back,
+                  TurnRunUpUser, user = true): return
+  p.setBackward(back)
+
+proc turnLate(a: App): float =
+  ## How much later than the playing player the standby gets to the turning
+  ## point, media seconds (negative: sooner), as both are heard; NaN when
+  ## that can't be told now. They mirror each other there: the sum of their
+  ## places stays twice the turning point's.
+  let (p, sb) = (a.player, a.standby)
+  let dir = if p.backward: -1.0 else: 1.0
+  var v: seq[float]
+  for i in 0 ..< 3:
+    let (mp, mt) = p.heardPos
+    let (sp, st) = sb.heardPos
+    if math.isNaN(mp) or math.isNaN(sp): continue
+    v.add dir * (sp + mp + dir * p.speed * (st - mt) - 2 * a.tnAt)
+  if v.len < 2: return NaN
+  v.sort
+  v[v.len div 2]
+
+proc alignTurn(a: App) =
+  ## While the standby runs up, unheard: measures how far off it is and puts
+  ## it in line, to the sample (Player.setTurnFades' shift), with the
+  ## crossfade as short as that allows; measured again once that's heard,
+  ## and mended if there's time.
+  let (p, sb) = (a.player, a.standby)
+  if a.tnMeasureAt == 0 or now() < a.tnMeasureAt or sb.seeking: return
+  let late = a.turnLate
+  if math.isNaN(late): return  # again next pass
+  # Way off: one of them stalled (a slow disk?), nothing to mend. (From
+  # the parked standby, its extra distance is still to be dropped.)
+  if abs(late) > (if a.tnFast: a.parkWindow.hi - a.parkWindow.lo + 0.5 else: 0.25):
+    a.turnTrace(&"late {late * 1000:+.1f} ms: way off")
+    a.missedTurn()
+    return
+  inc a.tnPass
+  a.tnMeasureAt = 0
+  # The first one: how late it started, for the next turn to start it that
+  # much earlier.
+  if a.tnPass == 1 and not a.tnFast: a.turnDelay = clamp(a.turnDelay + late, -0.15, 0.25)
+  let dir = if p.backward: -1.0 else: 1.0
+  let ahead = dir * (a.tnAt - p.posNow) / max(p.speed, 0.01)
+  a.turnTrace(&"measure {a.tnPass}: late {late * 1000:+.2f} ms, {ahead:.3f} s ahead")
+  # A change must reach the standby's sound before mpv filters it for the
+  # turning point (~0.44 s ahead, TurnArm), with time to spare for a busy
+  # core: else it stays as it is.
+  let shift = if abs(late) >= TurnClose: late else: 0.0
+  a.tnExpect = if shift != 0: 0.0003 else: abs(late) + 0.0002
+  if ahead < TurnArm + 0.04: return
+  # The crossfade as short as that allows, unless the playing player's
+  # fade-out is in already (or there's no run-up: it ends at the turning point).
+  let d = if a.tnArmed or a.tnCenter != a.tnAt or a.tnSmear: a.tnFadeLen
+          else: clamp(4 * a.tnExpect, TurnFadeMin, TurnFade)
+  if shift == 0 and d == a.tnFadeLen: return
+  a.tnFadeLen = d
+  sb.setTurnFades(fadeIn = a.tnCenter, d = d, shift = shift, fmt = a.tnFormat, rate = a.tnRate)
+  if shift != 0: a.tnMeasureAt = now() + TurnSettle  # to check, once heard
+
+proc turnOver(a: App) =
+  ## At the turning point: the standby, running up, becomes the playing
+  ## player. The other one plays on unheard until its fade-out's heard.
+  let (old, sb) = (a.player, a.standby)
+  a.mirrorStandby()  # anything changed meanwhile
+  (sb.muted, sb.volume) = (old.muted, old.volume)
+  sb.h.setProp("mute", old.muted)
+  a.player = sb
+  a.standby = old
+  (sb.hidden, old.hidden) = (false, true)
+  sb.justLoaded = false  # not to be taken for a file opened
+  a.framePending = false
+  a.renderNow = true  # the new one's frame, right away
+  a.sbPending = false
+  a.pingPongLast = sb.timePos
+  (a.tnOld, a.tnFadeIn) = (old, sb)
+  a.tnOverAt = now()
+  a.tnState = tnFading
+  a.turnTrace(&"over at {old.posNow:.4f} (standby {sb.posNow:.4f})")
+
+proc parkWindow(a: App): tuple[lo, hi: float] =
+  ## How far ahead of the playing player the parked standby may wait, media
+  ## seconds, for a turn at TurnQuick.
+  let s = max(a.player.speed, 0.01)
+  let lo = (TurnQuick + TurnParkRunUp) * s
+  (lo, lo + TurnParkSpan)
+
+proc unpark(a: App) =
+  if a.tnState notin {tnParking, tnParked}: return
+  a.standby.h.setProp("pause", true)
+  a.tnState = tnOff
+
+proc park(a: App) =
+  ## With Enable reverse playback on, the standby waits ahead of the playing
+  ## player, facing the other way and silent, so a click on Play has it play
+  ## at once (quickTurn) without going there first.
+  let p = a.player
+  let dir = if p.backward: -1.0 else: 1.0
+  let (lo, hi) = a.parkWindow
+  var x = p.posNow + dir * hi
+  # Not from the very end backward (sendStandby), nor before the start.
+  x = if dir > 0: min(x, p.duration - TurnEdgeEnd) else: max(x, TurnEdge)
+  if dir * (x - p.posNow) < lo + 0.1:  # no room left: the plain way, if clicked
+    a.unpark()
+    return
+  a.tnFormat = p.turnFormat
+  a.tnRate = p.h.getInt("audio-params/samplerate")
+  if a.tnFormat.len == 0 or a.tnRate <= 0:  # its turns go the plain way
+    a.tnFailed = p.path
+    a.unpark()
+    return
+  a.tnFadeLen = TurnFade
+  # Silent all through: its fade-in far ahead of it.
+  a.sendStandby(x, not p.backward, if p.backward: 1e5 else: -1e5)
+  (a.tnParkX, a.tnParkJumps, a.tnParkFrom) = (x, p.jumps, p.backward)
+  a.tnState = tnParking
+  a.turnTrace(&"park at {x:.3f}, {dir * (x - p.posNow):.3f} ahead")
+
+proc parkTick(a: App) =
+  ## Keeps the standby parked while Enable reverse playback is on and a
+  ## file plays (not in a ping-pong loop, which turns by itself): sent on
+  ## again once playback has come too close, or went elsewhere.
+  if a.tnState notin {tnOff, tnParking, tnParked}: return
+  let p = a.player
+  if not (a.cfg.reversePlayback and not (a.pingPongFile or a.pingPongAb) and not a.tnQueued and
+          a.turnFree):
+    a.unpark()
+    return
+  let dir = if p.backward: -1.0 else: 1.0
+  let (lo, hi) = a.parkWindow
+  let d = dir * (a.tnParkX - p.posNow)
+  let moved = p.jumps != a.tnParkJumps or p.backward != a.tnParkFrom or a.standby.path != p.path
+  # With a picture, where it waits doesn't matter (it's sent to the turn).
+  let far = not p.hasRealVideo and (d < lo + 0.02 or d > hi + 0.3)
+  if a.tnState == tnOff or moved or a.tnState == tnParked and far:
+    a.park()
+
+proc quickTurn(a: App, back: bool): bool =
+  ## The Play button's turn from the parked standby: set playing at once,
+  ## lined up by alignTurn (it's that much further than the turning point:
+  ## dropped), the turn TurnQuick later.
+  let (p, sb) = (a.player, a.standby)
+  if a.tnState != tnParked or back == p.backward or back != sb.backward or not a.turnFree or
+     p.hasRealVideo:
+    return false
+  let dir = if p.backward: -1.0 else: 1.0
+  let s = max(p.speed, 0.01)
+  let (lo, hi) = a.parkWindow
+  let d = dir * (a.tnParkX - p.posNow)
+  if p.jumps != a.tnParkJumps or p.backward != a.tnParkFrom or sb.path != p.path or
+     d < lo - 0.02 or d > hi + 0.3:
+    return false
+  let at = p.posNow + dir * TurnQuick * s
+  (a.tnAt, a.tnBack, a.tnFrom, a.tnRunUp, a.tnUser) = (at, back, p.backward, dir * (a.tnParkX - at), true)
+  (a.tnEdge, a.tnVideo, a.tnFast) = (false, p.hasRealVideo, true)
+  let (eqOn, gains) = a.equalizer
+  let stretch = abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no"
+  a.tnSmear = eqOn and gains.anyIt(it != 0) or stretch
+  a.tnFadeLen = if stretch: TurnFadeStretch else: TurnFade
+  a.tnCenter = at
+  a.tnJumps = p.jumps
+  a.tnArmed = false
+  a.tnExpect = 1
+  a.tnPass = 0
+  p.queueNext("")
+  # Its fade-in where the turn is (the sound it has ready is still silent).
+  sb.setTurnFades(fadeIn = at, d = a.tnFadeLen)
+  a.mirrorStandby()
+  sb.h.setProp("mute", p.muted)
+  sb.h.setProp("pause", false)
+  a.tnRolledAt = now()
+  a.tnMeasureAt = now() + TurnStart
+  a.tnState = tnRolling
+  a.turnTrace(&"quick turn at {at:.4f} from {p.posNow:.4f}, standby {d:.3f} ahead")
+  true
+
+proc turnTo(a: App, back: bool) =
+  ## The Play button turning playback around: seamless when the standby can
+  ## be had (a moment later, once it's ready), at once otherwise.
+  let p = a.player
+  case a.tnState
+  of tnLoading, tnReady:
+    if back == p.backward:  # asked to go on the way it goes: called off
+      a.turnTrace("called off")
+      a.cancelTurn()
+      return
+  of tnRolling:
+    if back == p.backward and (not a.tnArmed or
+       (if p.backward: -1.0 else: 1.0) * (a.tnAt - p.posNow) / p.speed > TurnArmAt):
+      a.turnTrace("called off")
+      a.cancelTurn()
+      return
+    a.tnQueued = back == p.backward  # too late to call off: back after it
+    return
+  of tnFading:
+    a.tnQueued = back != p.backward
+    return
+  of tnOff, tnParking, tnParked: discard
+  if back == p.backward: return
+  a.tnRetried = false
+  if p.playing and a.quickTurn(back): return
+  a.unpark()
+  let dir = if p.backward: -1.0 else: 1.0
+  if p.playing and a.planTurn(p.posNow + dir * p.speed * (a.tnPrep + TurnRunUpUser + 0.05),
+                              back, TurnRunUpUser, user = true): return
+  p.setBackward(back)
+
+proc pingPongTurn(a: App) =
+  ## Ping-Pong's next turn, at B or A, or the file's end or start, readied
+  ## as soon as the standby's free.
+  let p = a.player
+  if not (a.pingPongAb or a.pingPongFile) or not p.playing or a.tnQueued: return
+  let (at, back) =
+    if a.pingPongAb: (if p.backward: (a.loopA, false) else: (a.loopB, true))
+    elif p.backward: (TurnEdge, false)
+    else: (p.duration - TurnEdgeEnd, true)
+  # Stop or Pause after current takes the forward end as the file's (handleEof).
+  if a.pingPongFile and not a.pingPongAb and not p.backward and a.afterCurrent != acOff: return
+  discard a.planTurn(at, back, TurnRunUp, user = false)
+
+proc turnBroken(a: App): bool =
+  ## Something took the playing player elsewhere since the turn was planned,
+  ## or its reason went.
+  let p = a.player
+  p.jumps != a.tnJumps or p.stopped or not p.loaded or p.opening or
+    p.backward != a.tnFrom or a.synced or p.path != a.standby.path or
+    not a.tnUser and not (a.pingPongAb and a.tnAt == (if p.backward: a.loopA else: a.loopB) or
+                          a.pingPongFile and not a.pingPongAb)
+
+proc armTurn(a: App) =
+  ## The playing player's fade-out in, as long as the standby's fade-in
+  ## (alignTurn shortens that once it's lined it up).
+  let p = a.player
+  let ahead = (if p.backward: -1.0 else: 1.0) * (a.tnAt - p.posNow) / max(p.speed, 0.01)
+  p.setTurnFades(fadeOut = a.tnCenter, d = a.tnFadeLen)
+  a.tnArmed = true
+  a.turnTrace(&"arm {a.tnFadeLen * 1000:.1f} ms crossfade, {ahead:.3f} s ahead (expect {a.tnExpect * 1000:.2f} ms off)")
+
+proc turnTick(a: App) =
+  ## Each pass: a seamless turn's next step.
+  let sb = a.standby
+  if sb == nil: return
+  # The new playing player's fade-in, once heard, goes from af.
+  let q = a.tnFadeIn
+  if q != nil and (q != a.player or not q.playing or
+     (if q.backward: -1.0 else: 1.0) * (q.posNow - a.tnCenter) > a.tnFadeLen / 2 + 0.06):
+    q.clearTurnFades()
+    a.tnFadeIn = nil
+  if a.tnState == tnOff: a.pingPongTurn()
+  a.parkTick()
+  if a.tnState == tnOff: return
+  discard sb.pollEvents()
+  if traceTurns and a.tnState notin {tnLoading, tnParking, tnParked} and now() - a.sbUsedAt > 0.04:
+    a.turnTrace(&"slow pass: {(now() - a.sbUsedAt) * 1000:.0f} ms")
+  a.sbUsedAt = now()
+  let p = a.player
+  let dir = if p.backward: -1.0 else: 1.0
+  let s = max(p.speed, 0.01)
+  if a.tnState in {tnLoading, tnReady, tnRolling} and a.turnBroken:
+    let (user, back, paused) = (a.tnUser, a.tnBack, p.paused and not p.stopped)
+    a.turnTrace(&"broken: jumps {p.jumps}/{a.tnJumps} backward {p.backward}/{a.tnFrom}")
+    a.cancelTurn()
+    # Paused, a turn makes no sound: the Play button's goes the plain way.
+    if user and paused and p.jumps == a.tnJumps and p.backward == a.tnFrom: p.setBackward(back)
+    return
+  let ahead = dir * (a.tnAt - p.posNow) / s  # wall seconds to the turning point
+  case a.tnState
+  of tnOff, tnParked: discard
+  of tnParking:
+    if sb.loadError.len > 0:
+      a.tnFailed = p.path
+      a.unpark()
+    elif sb.justLoaded:
+      sb.justLoaded = false
+      a.mirrorStandby()
+    elif sb.loaded and sb.restarts > a.tnAsked and not sb.seeking:
+      a.tnPrep = clamp(0.7 * a.tnPrep + 0.3 * 1.3 * (now() - a.tnSentAt), 0.05, 3)
+      a.mirrorStandby()
+      a.tnState = tnParked
+      a.turnTrace(&"parked after {now() - a.tnSentAt:.3f} s")
+  of tnLoading:
+    if sb.loadError.len > 0:
+      a.tnFailed = p.path
+      a.missedTurn()
+      return
+    if sb.justLoaded:
+      sb.justLoaded = false
+      a.mirrorStandby()
+    if sb.loaded and sb.restarts > a.tnAsked and not sb.seeking:
+      a.tnPrep = clamp(0.7 * a.tnPrep + 0.3 * 1.3 * (now() - a.tnSentAt), 0.05, 3)
+      a.mirrorStandby()
+      a.tnState = tnReady
+      a.turnTrace(&"ready after {now() - a.tnSentAt:.3f} s at {sb.timePos:.4f}, {ahead:.3f} s ahead")
+    elif ahead < TurnArm + 0.05 and not p.paused:
+      a.turnTrace(&"not ready in time ({ahead:.3f} s ahead)")
+      a.missedTurn()
+  of tnReady:
+    if not p.playing and not p.eofReached: return  # waits ready
+    # Started a little late (a pass of the loop can take a while: the
+    # visualizer drawing), alignTurn makes up for it; much later, its run-up
+    # would end past the turning point.
+    # Without run-up (a file's end) the start is all there is: timed by the
+    # sound heard (posNow lags it there, and the end may come first).
+    var near = ahead
+    if a.tnRunUp / s < 0.1 and ahead < 0.3:
+      let (hp, ht) = p.heardPos
+      if not math.isNaN(hp): near = dir * (a.tnAt - hp) / s - (now() - ht)
+    let rollIn = near - (a.tnRunUp + a.turnDelay) / s
+    # Started late, alignTurn mends it given run-up; else it's that late.
+    let tolerance = if a.tnRunUp / s >= TurnArm + 0.15: 0.2 else: 0.08
+    if rollIn < -tolerance and not p.eofReached or ahead < TurnArm and not a.tnArmed:
+      a.turnTrace(&"missed the start ({rollIn:.3f} s, {ahead:.3f} s ahead)")
+      a.missedTurn()
+      return
+    # Too little run-up to line it up (a file's end): the fades go in now,
+    # with time to spare; else once it's lined up (alignTurn), or by TurnArmAt.
+    if not a.tnArmed and (ahead <= TurnArmAt or a.tnRunUp / s < TurnArm + 0.15 and ahead < 2):
+      a.armTurn()
+    if rollIn <= 0 or p.eofReached:
+      a.mirrorStandby()
+      sb.h.setProp("mute", p.muted)
+      sb.h.setProp("pause", false)
+      a.tnRolledAt = now()
+      # Measured once it's had time to start; with too little run-up to put
+      # it in line (a file's end) as soon as can be, to start the next one
+      # better.
+      a.tnMeasureAt = now() + (if a.tnRunUp / s >= TurnArm + 0.15: TurnStart else: 0.03)
+      a.tnState = tnRolling
+      a.turnTrace(&"roll at {p.posNow:.4f}, {ahead:.3f} s ahead")
+  of tnRolling:
+    # At the end, mpv pauses there by itself: the standby takes over then.
+    if p.eofReached:
+      a.turnOver()
+      return
+    if not p.playing:
+      # Paused (the Play button's turns then the plain way, unheard).
+      let (user, back) = (a.tnUser, a.tnBack)
+      a.turnTrace("paused")
+      a.cancelTurn()
+      if user and p.paused and not p.stopped: p.setBackward(back)
+      return
+    a.alignTurn()
+    if a.tnState != tnRolling: return  # given up
+    if not a.tnArmed:
+      if ahead < TurnArm:  # too late for the fades (the loop held up)
+        a.turnTrace(&"too late for the fades ({ahead:.3f} s ahead)")
+        a.missedTurn()
+        return
+      # Once the standby's lined up (the crossfade's length known), or at
+      # the latest TurnArmAt.
+      if a.tnPass > 0 or ahead <= (if a.tnFast: TurnArm + 0.04 else: TurnArmAt): a.armTurn()
+    # The picture goes over at the turning point (its sound's fades are in
+    # place); a file's end waits a moment for its measurement.
+    let measuring = not a.tnFast and a.tnRunUp / s < TurnArm + 0.15 and a.tnMeasureAt > 0 and
+      ahead > -0.05 / s
+    if ahead <= 0.004 / s and not measuring: a.turnOver()
+  of tnFading:
+    # Its fade-out heard (or nothing more to hear): it waits as the standby.
+    # By the sound heard: the picture's time (posNow) can be ahead of it, by
+    # more than the crossfade at a higher speed.
+    let old = a.tnOld
+    let odir = if old.backward: -1.0 else: 1.0
+    let (heard, _) = if old.playing and not old.eofReached: old.heardPos else: (NaN, 0.0)
+    if not old.playing or old.eofReached or now() - a.tnOverAt > 1 or
+       not math.isNaN(heard) and odir * (heard - a.tnCenter) > a.tnFadeLen / 2 + 0.01:
+      old.h.setProp("pause", true)
+      old.clearTurnFades()
+      a.tnOld = nil
+      a.tnState = tnOff
+      a.turnTrace("faded")
+      if a.tnQueued:
+        a.tnQueued = false
+        a.turnTo(not a.player.backward)
 
 proc releaseStandby(a: App) =
   ## Its render context, once nothing's needed the standby a while. Loop
   ## frames leave it open.
   let sb = a.standby
   if sb == nil or sb.render == nil: return
-  if a.sbState != sbOff or a.lfState in {lfSeeking, lfStepping} or a.sfOn:
+  if a.sbState != sbOff or a.lfState in {lfSeeking, lfStepping} or a.sfOn or a.tnState != tnOff:
     a.sbUsedAt = now()
     return
   discard sb.pollEvents()
@@ -4262,11 +5209,12 @@ proc renderStandby(a: App) =
   ## The standby's frames go to its own target, unseen, so it plays on and
   ## shows the right one the moment it takes over.
   let sb = a.standby
-  if sb == nil or a.sbState notin {sbSeeking, sbReady, sbRolling}: return
+  if sb == nil or a.sbState notin {sbSeeking, sbReady, sbRolling} and
+     a.tnState notin {tnParking, tnParked, tnLoading, tnReady, tnRolling, tnFading}: return
   if (sb.render.update() and MpvRenderUpdateFrame) != 0:
     a.sbPending = true
   if not a.sbPending: return
-  if a.sbState == sbRolling:
+  if a.sbState == sbRolling or a.tnState in {tnRolling, tnFading}:
     let due = sb.render.nextFrameTarget()
     if due != 0 and mpv_get_time_ns(sb.h) < due - 1_500_000: return
   a.sbPending = false
@@ -4580,6 +5528,7 @@ proc loopFrames(a: App) =
   let sb = a.standby
   let (la, lb) = a.loopRegion
   let need = sb != nil and lb > la and lb - la < StandbyMinLoop and a.sbState == sbOff and
+    a.tnState == tnOff and
     p.loaded and not p.stopped and p.hasRealVideo and not p.isSpherical and
     p.path.len > 0 and not p.path.contains("://") and a.lfSize[0] > 1
   var want = -1
@@ -4605,12 +5554,13 @@ proc loopFrames(a: App) =
       # the one showing at A may have started before it. Opened anew: a seek
       # in the middle of a step lands anywhere.
       a.lfStart = max(la - 0.1, 0)
+      a.standbyForward()
       sb.path = p.path
       sb.loaded = false
       sb.loadError = ""
       sb.sphere = p.sphere
       sb.h.commandAsync("loadfile", p.path, "replace", "-1",
-        "start=" & formatFloat(a.lfStart, ffDecimal, 6))
+        withDecoderOpts("start=" & formatFloat(a.lfStart, ffDecimal, 6), p.path))
       a.lfAsked = sb.restarts
       a.lfAskedAt = now()
       a.lfPending = false
@@ -4821,12 +5771,13 @@ proc stepFill(a: App, start, stop: float, before: bool) =
                  ("pause", "yes"), ("speed", "100")]:  # a step waits out the frame's time
     sb.h.setProp(k, v)
   sb.stopped = false
+  a.standbyForward()
   sb.path = p.path
   sb.loaded = false
   sb.loadError = ""
   sb.sphere = p.sphere
   sb.h.commandAsync("loadfile", p.path, "replace", "-1",
-    "start=" & formatFloat(a.sfStart, ffDecimal, 6))
+    withDecoderOpts("start=" & formatFloat(a.sfStart, ffDecimal, 6), p.path))
 
 proc stepOn(a: App) =
   ## Has the standby step to the next frame.
@@ -4957,7 +5908,7 @@ proc stepFrames(a: App) =
   let (la, lb) = a.loopRegion
   if a.sbState != sbOff or a.lfState != lfOff: a.sfPath = ""
   let need = sb != nil and not cpuWanted and lb <= la and a.sbState == sbOff and
-    a.lfState == lfOff and p.loaded and not p.stopped and not p.backward and
+    a.lfState == lfOff and a.tnState == tnOff and p.loaded and not p.stopped and not p.backward and
     (p.paused or now() - a.sfPlainAt < StepPlain) and
     p.hasRealVideo and not p.isSpherical and p.path.len > 0 and
     not p.path.contains("://") and a.lfSize[0] > 1 and a.stepFramesMax >= StepMin
@@ -5184,28 +6135,36 @@ proc saveReplayGain(a: App, mode: RgMode, files: seq[string]) =
   if files.len == 0: return
   a.rgJob = rgscan.start(files, files.mapIt(a.mediaInfo.getOrDefault(it).duration), mode)
   a.rgShown = -1
-  a.rgOpenTagged = false
+  a.rgOpenTagged = ""
   a.osd(&"Analyzing ReplayGain of {files.len} file" & (if files.len == 1: "" else: "s"))
 
-proc rgReport(a: App, did: string, written, total: int, failed: seq[string], openTagged: bool) =
-  ## The OSD's word on a finished ReplayGain job: how many, the first file
-  ## that failed, and when the open file's change is heard.
+proc rgReport(a: App, did: string, written, total: int, failed: seq[string]) =
+  ## The OSD's word on a finished ReplayGain job: how many, and the first
+  ## file that failed.
   let n = if total == 1: "1 file" else: &"{total} files"
-  let open = if openTagged: " (the open file's applies when it's opened again)" else: ""
-  if failed.len == 0: a.osd(&"ReplayGain {did} {n}{open}", 3)
+  if failed.len == 0: a.osd(&"ReplayGain {did} {n}", 3)
   else:
     let more = if failed.len > 1: &" (and {failed.len - 1} more)" else: ""
-    a.osd(&"ReplayGain {did} {written} of {n}{open}. {failed[0]}{more}", 6)
+    a.osd(&"ReplayGain {did} {written} of {n}. {failed[0]}{more}", 6)
+
+proc reopenRetagged(a: App, path: string) =
+  ## path's ReplayGain tags were written: still the file playing, it opens
+  ## again where it is, as mpv reads them (and the button and menus show
+  ## them) only on opening it.
+  let p = a.player
+  if path.len > 0 and p.loaded and p.path == path and not a.reopening:
+    a.reopenHere(p.threadless)
 
 proc pollReplayGain(a: App) =
   let j = a.rgJob
   if not j.running: return
   let changed = j.poll()
-  # A file tagged: the playlist's probe reads its new values (the open file
-  # gets them from mpv when it's opened again).
+  # A file tagged: the playlist's probe reads its new values. The open file
+  # opens again once the job ends, not twice for an album's track and album
+  # gains.
   for path in j.tagged:
     a.mediaInfo.del path
-    if path == a.player.path: a.rgOpenTagged = true
+    if path == a.player.path: a.rgOpenTagged = path
   j.tagged.setLen 0
   let pc = int(j.progress.percent)
   if changed or pc != a.rgShown:
@@ -5215,7 +6174,9 @@ proc pollReplayGain(a: App) =
   a.rgJob = nil
   if j.cancelled:
     a.osd(&"ReplayGain analysis cancelled: applied to {j.written} of {j.paths.len} files")
-  else: a.rgReport("applied to", j.written, j.paths.len, j.failed, a.rgOpenTagged)
+  else: a.rgReport("applied to", j.written, j.paths.len, j.failed)
+  a.reopenRetagged(a.rgOpenTagged)
+  a.rgOpenTagged = ""
 
 proc cancelReplayGain(a: App) =
   if not a.rgJob.running: return
@@ -5224,14 +6185,17 @@ proc cancelReplayGain(a: App) =
 proc removeReplayGain(a: App, files: seq[string]) =
   ## Takes the ReplayGain values out of files' tags.
   var failed: seq[string]
-  var openTagged = false
+  var open = ""
   for f in files:
     let err = rgscan.removeGain(f)
     if err.len > 0: failed.add f.extractFilename & ": " & err
     else:
       a.mediaInfo.del f
-      if f == a.player.path: openTagged = true
-  a.rgReport("removed from", files.len - failed.len, files.len, failed, openTagged)
+      # Opened again only for values mpv had (a file without is untouched).
+      if f == a.player.path and
+         a.player.tracks.anyIt(it.kind == "audio" and it.selected and it.rg.known): open = f
+  a.rgReport("removed from", files.len - failed.len, files.len, failed)
+  a.reopenRetagged(open)
 
 const PlaylistFilters = @[("M3U playlist", @["m3u", "m3u8"]), ("PLS playlist", @["pls"])]
 
@@ -5428,6 +6392,10 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
     if a.overlay == ovOptions: a.cfg.mkvpropedit = paths[0]
   of "optytdlp":  # Options' yt-dlp Browse... button
     if a.overlay == ovOptions: a.cfg.ytdlp = paths[0]
+  of "libaddfolder", "libaddfiles":  # Options > Libraries' Add Folder... and Add Files...
+    if a.overlay == ovOptions: a.optionsDlg.libAddPaths(a.cfg, paths)
+  of "libchange":  # its Change...
+    if a.overlay == ovOptions: a.optionsDlg.libChangeItem(a.cfg, paths[0])
   of "optsoundfont":  # Options' SoundFont Browse... button
     if a.overlay == ovOptions: a.cfg.soundFont = paths[0]
   of "optshotdir", "optopendir", "optwebdir":  # Options' Browse... buttons
@@ -5484,7 +6452,7 @@ proc langList(s: string): string =
   s.multiReplace((";", ","), (" ", ",")).split(',').filterIt(it.len > 0).join(",")
 
 proc coverNameList(s: string): seq[string] =
-  ## Options' folder picture names, one per line, as mpv takes them.
+  ## Options' folder pictures, one pattern per line (folderpics).
   s.splitLines.mapIt(it.strip).filterIt(it.len > 0)
 
 proc subPathList(s: string): string =
@@ -5516,7 +6484,7 @@ proc syncSettings(a: App) =
   # other settings changing mustn't do again.
   if not a.coverSynced or c.coverNames != a.coverNames:
     a.coverNames = c.coverNames
-    a.player.setCoverNames(coverNameList(c.coverNames))
+    setCoverPatterns(coverNameList(c.coverNames))
   if not a.coverSynced or c.showFileCover != a.fileCoverShown:
     a.fileCoverShown = c.showFileCover
     if a.standby != nil: a.standby.fileCover = c.showFileCover
@@ -5570,7 +6538,11 @@ proc hookYtdlp(a: App)
 
 proc rendererChanged(a: App, before: RenderMode)
 
+proc closeTypes(a: App, ok: bool)  # below
+
 proc closeOptions(a: App, ok: bool) =
+  if a.typesWin != nil and a.typesWin.visible: a.closeTypes(false)
+  if a.optMenus != nil: a.optMenus.close()
   if ok:
     a.cfg.save(ownKeys = a.cfg.keys != a.cfgBefore.keys)
     a.rendererChanged(a.cfgBefore.renderMode)
@@ -5602,8 +6574,9 @@ proc closeOptions(a: App, ok: bool) =
     a.window.activate()
 
 proc newDialogWindow(a: App, title: string, size: IVec2, modal = true,
-                     resizable = false): (Window, Silky, Ui) =
-  ## A hidden dialog window over the main one, with its own Silky and Ui.
+                     resizable = false, parent: Window = nil): (Window, Silky, Ui) =
+  ## A hidden dialog window over the main one (or parent), with its own
+  ## Silky and Ui.
   let w = newWindow(title, size, style = if resizable: DecoratedResizable else: Decorated,
     visible = false,
     vsync = false)
@@ -5611,7 +6584,7 @@ proc newDialogWindow(a: App, title: string, size: IVec2, modal = true,
   # main one instead (same visual), sharing the atlas texture and shaders.
   makeContextCurrent(a.window)
   w.icon = appIcon()
-  w.setDialogFor(a.window, modal)
+  w.setDialogFor(if parent != nil: parent else: a.window, modal)
   w.keepContentsOnResize(colPanel)
   let sk = newSilky(w, a.atlasImg, a.atlas)
   sk.uiScale = a.sk.uiScale
@@ -5635,6 +6608,11 @@ proc newDialogWindow(a: App, title: string, size: IVec2, modal = true,
 proc ensureOptionsWindow(a: App) =
   if a.optWin != nil: return
   (a.optWin, a.optSk, a.optUi) = a.newDialogWindow("Options", OptionsSize)
+  # Libraries' folders and files: what the index knows of them (never asked
+  # of the file system here, which a silent share would hold up).
+  a.optionsDlg.pathInfo = proc (path: string): PathInfo =
+    let r = a.library.roots.getOrDefault(path.normPath)
+    (r.state, r.isFile)
 
 proc showDialog(a: App, w: Window, size: IVec2, minSize = ivec2(0, 0)) =
   ## Centres a dialog's frame on the main window's frame (both have the
@@ -5660,7 +6638,7 @@ proc applyUiScale(a: App) =
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
   for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk, a.eqSk,
-             a.tagSk, a.avsSk]:
+             a.tagSk, a.avsSk, a.typesSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
     sk.uiScale = s
@@ -5728,6 +6706,8 @@ const MatroskaExts = [".mkv", ".mka", ".mk3d", ".webm"]
 
 proc closeDialogs(a: App)  # below
 proc closePalette(a: App)  # below
+proc paletteAvsCancel(a: App)  # below
+proc pickAvs(a: App, id: string)  # below
 proc showPalette(a: App)  # below
 proc closeUpdate(a: App)  # Check for Updates, below
 proc shortPath(path: string): string  # yt-dlp, below
@@ -5970,12 +6950,7 @@ proc applyTags(a: App): bool =
       a.mediaInfo[path].retag(fields)
     if p.loaded and p.path == path: reopen = true
   if a.prober != nil: a.prober.finish()
-  if reopen and not a.reopening:
-    a.reopening = true
-    a.reopenTracks = p.tracks.filterIt(it.external and it.kind in ["sub", "audio"])
-    a.reopenSel = @[("aid", p.selectedTrack("audio")), ("sid", p.selectedTrack("sub")),
-                    ("vid", p.selectedTrack("video"))]
-    p.reopen(p.threadless)
+  if reopen and not a.reopening: a.reopenHere(p.threadless)
   d.statusError = notes.len > 0
   d.status =
     if notes.len > 0: notes.join("; ")
@@ -6064,9 +7039,11 @@ proc closeTip(a: App, act: KeyAction): string =
   if key.len > 0: &"Close ({key})" else: "Close"
 
 proc setPlaylistShown(a: App, shown: bool) =
-  ## Shows or hides the playlist, growing or shrinking the window by its width.
+  ## Shows or hides the playlist, growing or shrinking the window by its
+  ## width (not when the library keeps the column).
   if a.cfg.showPlaylist == shown: return
   a.cfg.showPlaylist = shown
+  if a.cfg.showLibrary: return
   let w = int32(a.playlistWidth)
   a.resizeKeepingVideo(ivec2(if shown: w else: -w, 0))
 
@@ -7186,6 +8163,430 @@ proc bindAct[T](f: proc (x: T), x: T): proc () =
   ## the loop's variables; building them here gives each item its own copy.
   result = proc () = f(x)
 
+# --- library ------------------------------------------------------------------
+
+proc setLibraryShown(a: App, shown: bool) =
+  ## Shows or hides the Library panel: under the playlist when that's shown
+  ## (the two share its column, the window keeps its size), else as the
+  ## column itself, growing or shrinking the window by its width.
+  if a.cfg.showLibrary == shown: return
+  a.cfg.showLibrary = shown
+  if shown: a.library.activate()
+  else:
+    a.libFocused = false
+    a.libArrows = false
+    a.libCatKeys = false
+    if a.ui.focusId == "lib-search": a.ui.focusId = ""
+  if not a.cfg.showPlaylist:
+    let w = int32(a.playlistWidth)
+    a.resizeKeepingVideo(ivec2(if shown: w else: -w, 0))
+
+proc openLibrarySearch(a: App) =
+  ## Shows the Library panel (when it's hidden) with its search field taking
+  ## the keyboard, its text selected.
+  a.setLibraryShown(true)
+  a.libFocused = true
+  a.libArrows = false
+  a.libCatKeys = false
+  a.ui.focusId = "lib-search"
+  a.ui.focusFresh = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc libraryIndexOf(a: App, name: string): int =
+  ## The library of that name, -1 for none (All).
+  for i, l in a.cfg.libraries:
+    if l.name == name: return i
+  -1
+
+proc libraryRows(a: App, baseKey: string): seq[int32] =
+  ## The files the panel lists: the library shown (or All, every library not
+  ## hidden), or those the search's in: tags pick, without those its
+  ## exclude: tags pick, matching the rest of the search, sorted. The sorted
+  ## libraries are kept while only the rest of the search changes (typing
+  ## only filters them, which keeps their order).
+  let ix = a.library
+  let libs = a.cfg.libraries
+  let q = parseQuery(a.cfg.librarySearch)
+  let key = baseKey & "\n" & $q.ins & $q.excludes & $q.hidden
+  if key == a.libBaseKey:
+    result = a.libBase
+    ix.filterRows(result, q)
+    return
+  var pick: seq[int]
+  if q.ins.len > 0:
+    for v in q.ins:
+      for i in libraryNamed(libs, v, q.hidden):
+        if i notin pick: pick.add i
+  else:
+    let shown = a.libraryIndexOf(a.cfg.libraryShown)
+    if shown >= 0: pick = @[shown]
+    else:
+      for i, l in libs:
+        if not l.hidden or q.hidden: pick.add i
+  var mark = newSeq[bool](ix.files.len)
+  for i in pick:
+    for id in ix.members(libs[i]): mark[id] = true
+  for v in q.excludes:
+    for i in libraryNamed(libs, v, true):
+      for id in ix.members(libs[i]): mark[id] = false
+  for id in 0 ..< ix.files.len:
+    if mark[id]: result.add int32(id)
+  let sortKey = try: parseEnum[PlaylistField](a.cfg.librarySort) except ValueError: pfName
+  ix.sortRows(result, sortKey, a.cfg.librarySortDescending)
+  a.libBase = result
+  a.libBaseKey = key
+  ix.filterRows(result, q)
+
+proc buildLibraryView(a: App) =
+  ## The rows to draw: the files, under a header per folder when grouped, a
+  ## collapsed folder showing its header alone. The selection keeps the files
+  ## still shown.
+  let ix = a.library
+  if a.libGroups.len > 0:
+    let collapsed = a.cfg.libraryCollapsed.toHashSet
+    a.libView = newSeqOfCap[int32](a.libRows.len + a.libGroups.len)
+    var k = 0
+    for g, grp in a.libGroups:
+      a.libView.add int32(-(g + 1))
+      if grp.label notin collapsed: a.libView.add a.libRows[k ..< k + grp.count]
+      k += grp.count
+  else: a.libView = a.libRows
+  if a.libSel.len > 0:
+    var keep = initHashSet[string]()
+    for id in a.libView:
+      if id >= 0 and ix.files[id].path in a.libSel: keep.incl ix.files[id].path
+    a.libSel = keep
+
+proc libGroupCollapsed(a: App, label: string): bool = label in a.cfg.libraryCollapsed
+
+proc libToggleGroup(a: App, label: string) =
+  ## Collapses a folder's group, or expands it again.
+  let i = a.cfg.libraryCollapsed.find(label)
+  if i >= 0: a.cfg.libraryCollapsed.delete(i)
+  else: a.cfg.libraryCollapsed.add label
+  a.buildLibraryView()
+  a.cfg.save()
+
+proc libCollapseAll(a: App, collapse: bool) =
+  ## Collapses every group listed, or expands every group (listed or not).
+  if collapse:
+    let had = a.cfg.libraryCollapsed.toHashSet
+    for g in a.libGroups:
+      if g.label notin had: a.cfg.libraryCollapsed.add g.label
+  else: a.cfg.libraryCollapsed.setLen 0
+  a.buildLibraryView()
+  a.cfg.save()
+
+proc libSelectShown(a: App) =
+  ## Selects every file shown (not those of collapsed folders).
+  a.libSel.clear()
+  for id in a.libView:
+    if id >= 0: a.libSel.incl a.library.files[id].path
+
+proc libShow(a: App, name: string) =
+  ## Lists the library name ("" for All), the search's in: tags becoming
+  ## its own.
+  if a.cfg.libraryShown != name: a.libScroll = 0
+  a.cfg.libraryShown = name
+  a.cfg.librarySearch = withInLibrary(a.cfg.librarySearch, name)
+  a.libSearchSeen = a.cfg.librarySearch
+  a.libSearchSynced = true
+
+proc libPick(a: App, name: string) =
+  ## A library picked in the libraries' column (a click, Up/Down): listed,
+  ## and the search's in: tag made its own again if it was changed.
+  if a.cfg.libraryShown != name or
+      parseQuery(a.cfg.librarySearch).ins != (if name.len > 0: @[unicode.toLower(name)] else: @[]):
+    a.libShow(name)
+    a.cfg.save()
+
+proc libColumnNames(a: App): seq[string] =
+  ## The libraries' column, top to bottom: "" for All, then the libraries
+  ## not hidden (all of them with Show Hidden Libraries, and the one listed).
+  result = @[""]
+  for l in a.cfg.libraries:
+    if not l.hidden or a.cfg.libraryShowHidden or l.name == a.cfg.libraryShown: result.add l.name
+
+proc startLibRename(a: App) =
+  ## F2 in the libraries' column: the name of the library listed typed over
+  ## in its row (All has none to change).
+  let name = a.cfg.libraryShown
+  if name.len == 0 or a.libraryIndexOf(name) < 0: return
+  a.libRename = name
+  a.libRenameText = name
+  a.libCatReveal = true
+  a.ui.focusId = "lib-rename"
+  a.ui.focusFresh = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc endLibRename(a: App) =
+  ## Takes the name typed for the library being renamed, as Options >
+  ## Libraries does: the search's in: and exclude: tags follow. A name that
+  ## can't be used says why and, unless a click went elsewhere, typing goes on.
+  let i = a.libraryIndexOf(a.libRename)
+  let old = a.libRename
+  let name = a.libRenameText.strip
+  if i >= 0 and name != old:
+    let why = validLibraryName(a.cfg.libraries, name, i)
+    if why.len > 0:
+      a.osd(why)
+      if not a.window.buttonPressed[MouseLeft]:
+        a.ui.focusId = "lib-rename"
+        return
+      a.libRename = ""
+      return
+    if a.cfg.libraryShown == old: a.cfg.libraryShown = name
+    a.cfg.librarySearch = renamedInSearch(a.cfg.librarySearch, old, name)
+    a.libSearchSeen = a.cfg.librarySearch
+    a.cfg.libraries[i].name = name
+    a.cfg.save()
+  a.libRename = ""
+
+proc libSearchIsLibraryOnly(a: App): bool =
+  ## Whether the search is only the in: tag of the library listed (or empty
+  ## for All): what clearing it leaves first.
+  const Trim = Whitespace + {','}
+  a.cfg.librarySearch.strip(chars = Trim) ==
+    withInLibrary("", a.cfg.libraryShown).strip(chars = Trim)
+
+proc clearLibrarySearch(a: App) =
+  ## Clears the Library's search a step at a time (Escape, the clear
+  ## button): to the in: tag of the library listed, then to nothing, which
+  ## lists All. The caret ends after what's left.
+  if a.cfg.librarySearch.len == 0: return
+  if a.libSearchIsLibraryOnly: a.libShow("")
+  else: a.cfg.librarySearch = withInLibrary("", a.cfg.libraryShown)
+  a.libSuggestOff = true  # not straight back after the in: tag's comma
+  a.libSuggest = 0
+  a.libScroll = 0
+  a.cfg.save()
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc syncLibraryShown(a: App) =
+  ## The library listed follows the search's in: tag: one naming a library
+  ## lists it, none lists All. A library listed without a tag (as older
+  ## versions left it) gets one.
+  if a.libSearchSynced and a.cfg.librarySearch == a.libSearchSeen: return
+  let q = parseQuery(a.cfg.librarySearch)
+  if q.ins.len == 0:
+    if not a.libSearchSynced and a.cfg.libraryShown.len > 0:
+      a.cfg.librarySearch = withInLibrary(a.cfg.librarySearch, a.cfg.libraryShown)
+    else: a.cfg.libraryShown = ""
+  elif q.ins.len == 1:
+    for l in a.cfg.libraries:
+      if unicode.toLower(l.name) == q.ins[0]: a.cfg.libraryShown = l.name
+  a.libSearchSeen = a.cfg.librarySearch
+  a.libSearchSynced = true
+
+proc refreshLibraryRows(a: App, force = false) =
+  ## Makes the list again when what it's made from changed: at once for
+  ## the search, the library shown, the sorting or files gone; while files
+  ## and tags pour in, now and then (less often while something plays).
+  a.syncLibraryShown()
+  let ix = a.library
+  let base = &"{a.cfg.libraryShown}\n{a.cfg.librarySort}\n{a.cfg.libraryGroupFolders}\n" &
+    &"{a.cfg.librarySortDescending}\n{ix.dropGen}\n{a.cfg.libraries.len}\n" &
+    a.cfg.libraries.mapIt(it.name & "|" & $it.hidden & "|" & $it.kind & "|" & it.paths.join("|") &
+      "|" & it.exts.join(",")).join("\n")
+  let settled = a.cfg.librarySearch & "\n" & base
+  let moving = &"{ix.gen}/{ix.metaGen}"
+  let now = now()
+  let wait = if a.player.loaded and not a.player.stopped: 1.5 else: 0.4
+  if not force and settled == a.libRowsKey and
+     (moving == a.libRowsMoving or now - a.libRowsAt < wait):
+    return
+  a.libRowsKey = settled
+  a.libRowsMoving = moving
+  a.libRowsAt = now
+  a.libRowsDrop = ix.dropGen
+  a.libRows = a.libraryRows(base & "\n" & moving)
+  a.libDurSeconds = not a.libRows.anyIt(ix.files[it].duration > 60)
+  a.libGroups.setLen 0
+  if a.cfg.libraryGroupFolders and a.libRows.len > 0: a.libGroups = ix.groupRows(a.libRows)
+  a.buildLibraryView()
+
+proc libSelectedPaths(a: App): seq[string] =
+  ## The selected files, in the list's order.
+  for id in a.libRows:
+    let p = a.library.files[id].path
+    if p in a.libSel: result.add p
+
+proc libCursorRow(a: App): int =
+  ## The row of the file last clicked or moved to, -1 when it's not listed.
+  for i, id in a.libView:
+    if id >= 0 and a.library.files[id].path == a.libCursor: return i
+  -1
+
+proc libFileRow(a: App, row, step: int): int =
+  ## The row of a file at row or past it going step (1 or -1), else the other
+  ## way; folder headers are skipped. -1 when there's no file.
+  let n = a.libView.len
+  if n == 0: return -1
+  var r = clamp(row, 0, n - 1)
+  while r in 0 ..< n and a.libView[r] < 0: r += step
+  if r in 0 ..< n: return r
+  r = clamp(row, 0, n - 1)
+  while r in 0 ..< n and a.libView[r] < 0: r -= step
+  if r in 0 ..< n: r else: -1
+
+proc libSelectRow(a: App, row: int, extend = false) =
+  ## Selects row alone, or with extend every file from the anchor to it.
+  if row notin 0 ..< a.libView.len or a.libView[row] < 0: return
+  let path = a.library.files[a.libView[row]].path
+  if extend and a.libAnchor.len > 0:
+    var from0 = -1
+    for i, id in a.libView:
+      if id >= 0 and a.library.files[id].path == a.libAnchor: from0 = i
+    if from0 >= 0:
+      a.libSel.clear()
+      for i in min(from0, row) .. max(from0, row):
+        if a.libView[i] >= 0: a.libSel.incl a.library.files[a.libView[i]].path
+      a.libCursor = path
+      a.libReveal = true
+      return
+  a.libSel = toHashSet([path])
+  a.libAnchor = path
+  a.libCursor = path
+  a.libReveal = true
+
+proc libPlay(a: App, paths: seq[string]) =
+  ## Plays files of the library in the Default playlist, as opening them
+  ## would. They're files the walk found: nothing checks them again here,
+  ## where a share gone silent would hold up the window.
+  if paths.len == 0 or a.editLocked: return
+  a.showTab(a.scratchTab)
+  if a.playlist.len > 0: a.undoPoint("Open " & countLabel(paths.len, "file"))
+  a.playlist = paths
+  a.bindPlaylist("")
+  a.plScroll = 0
+  a.selectOnly(-1)
+  a.playIndex(0)
+
+proc libAddToPlaylist(a: App, paths: seq[string], at = -1) =
+  ## Adds files of the library to the playlist shown, showing the playlist
+  ## when it is hidden so the files added can be seen.
+  if paths.len == 0 or a.editLocked: return
+  a.setPlaylistShown(true)
+  let first = a.insertEntries(paths, at)
+  if at >= 0:
+    a.plSelected = first
+    a.plMarks = if paths.len > 1: toSeq(first ..< first + paths.len) else: @[]
+  if not a.player.loaded: a.playIndex(first)
+  else: a.osd("Added " & countLabel(paths.len, "file") & " to " & a.tabs[a.tabView].name)
+
+proc libPlayNew(a: App, paths: seq[string]) =
+  ## Plays files of the library in a player of its own, whatever "Same
+  ## player for each media file" says (this one keeps what it plays).
+  if paths.len == 0: return
+  var env = newStringTable()
+  for k, v in envPairs():
+    if k != "MMP_SCRIPT": env[k] = v  # a debug script stays with this player
+  try:
+    startProcess(selfExe(), args = @[NewPlayerArg] & paths, env = env,
+      options = {poParentStreams, poDaemon}).close()
+    a.osd(if paths.len == 1: "Playing in a new player" else: "Playing " & $paths.len & " files in a new player")
+  except OSError as e:
+    a.osd("Can't start another player: " & e.msg)
+
+proc editLibraries(a: App, name = "", create = false) =
+  ## Options > Libraries, with the library of that name selected, or a new
+  ## one being named.
+  a.showOverlay(ovOptions)
+  a.optionsDlg.selectPage(a.optUi, opLibraries)
+  if create: a.optionsDlg.createLibrary(a.optUi, a.cfg)
+  elif name.len > 0: a.optionsDlg.showLibrary(a.cfg, name)
+  a.optWin.activate()
+
+proc setLibraryHidden(a: App, name: string, hidden: bool) =
+  let i = a.libraryIndexOf(name)
+  if i < 0: return
+  a.cfg.libraries[i].hidden = hidden
+  if hidden and a.cfg.libraryShown == name and not a.cfg.libraryShowHidden: a.libShow("")
+  a.cfg.save()
+
+proc libGroupItems(a: App, m: MenuNode) =
+  ## Collapse All Groups and Expand All Groups, for the folders listed.
+  let collapsed = a.cfg.libraryCollapsed.toHashSet
+  m.item("Collapse All Groups", enabled = a.libGroups.anyIt(it.label notin collapsed),
+    action = proc () = a.libCollapseAll(true))
+  m.item("Expand All Groups", enabled = a.libGroups.anyIt(it.label in collapsed),
+    action = proc () = a.libCollapseAll(false))
+
+proc libraryMenu(a: App): MenuNode =
+  ## The Library panel's right-click menus: a library's, the blank space
+  ## under them, the files', the column headers'.
+  let m = newMenuRoot()
+  case a.libCtx
+  of lcLibrary:
+    let name = a.libCtxName
+    let i = a.libraryIndexOf(name)
+    m.item("Edit...", action = proc () = a.editLibraries(name))
+    if i >= 0 and a.cfg.libraries[i].hidden:
+      m.item("Show", action = proc () = a.setLibraryHidden(name, false))
+    else:
+      m.item("Hide", enabled = i >= 0, action = proc () = a.setLibraryHidden(name, true))
+    m.sep()
+    m.item("Rescan", enabled = a.cfg.libraries.len > 0, action = proc () =
+      a.library.activate()
+      a.library.rescan())
+  of lcBlank:
+    m.item("Create Library...", action = proc () = a.editLibraries(create = true))
+    m.sep()
+    m.check("Show Hidden Libraries", checked = a.cfg.libraryShowHidden, action = proc () =
+      a.cfg.libraryShowHidden = not a.cfg.libraryShowHidden
+      let i = a.libraryIndexOf(a.cfg.libraryShown)
+      if not a.cfg.libraryShowHidden and i >= 0 and a.cfg.libraries[i].hidden: a.libShow("")
+      a.cfg.save())
+  of lcFiles:
+    let sel = a.libSelectedPaths
+    let one = if sel.len == 1: sel[0] else: ""
+    m.item("Play", "Enter", enabled = sel.len > 0 and not a.editLocked, action = proc () = a.libPlay(sel))
+    m.item("Add to Playlist", enabled = sel.len > 0 and not a.editLocked, action = proc () =
+      a.libAddToPlaylist(sel))
+    m.sep()
+    m.item("Play in New Player", "Shift+Enter", enabled = sel.len > 0, action = proc () =
+      a.libPlayNew(sel))
+    m.sep()
+    m.item("Open Containing Directory", enabled = one.len > 0, action = proc () = a.showInFolder(one))
+    m.item("Copy Path", enabled = sel.len > 0, action = proc () =
+      setClipboardString(sel.join("\n"))
+      a.osd(if sel.len == 1: "Copied the path" else: "Copied " & $sel.len & " paths"))
+    m.sep()
+    m.item("Select All", "Ctrl+A", enabled = a.libView.anyIt(it >= 0), action = proc () =
+      a.libSelectShown())
+    m.item("Rescan", enabled = a.cfg.libraries.len > 0, action = proc () = a.library.rescan())
+    if a.libGroups.len > 0:
+      m.sep()
+      a.libGroupItems(m)
+  of lcHeader:
+    # As the playlist's column headers: the columns shown, their widths, and
+    # the files grouped by folder.
+    if a.libCtxColumn == pfDuration:
+      m.check("Show milliseconds", checked = a.cfg.libraryShowMillis, action = proc () =
+        a.cfg.libraryShowMillis = not a.cfg.libraryShowMillis
+        a.cfg.save())
+      m.sep()
+    let toggle = proc (f: PlaylistField) =
+      toggleColumn(a.cfg.libraryColumnOrder, a.cfg.libraryColumns, f)
+      a.cfg.save()
+    let shown = a.cfg.libraryColumns
+    # In the header's order, a hidden column where it was when last shown.
+    for f in columnOrder(a.cfg.libraryColumnOrder, shown):
+      # The last column left stays: the header is what brings the others back.
+      m.check(PlaylistFields[f].label, checked = f in shown,
+        enabled = f notin shown or shown.len > 1, action = bindAct(toggle, f))
+    m.sep()
+    m.item("Reset column widths", enabled = a.cfg.libraryColumnWidths.len > 0, action = proc () =
+      a.cfg.libraryColumnWidths.clear()
+      a.cfg.save())
+    m.sep()
+    m.check("Group by Folder", checked = a.cfg.libraryGroupFolders, action = proc () =
+      a.cfg.libraryGroupFolders = not a.cfg.libraryGroupFolders
+      a.libReveal = true
+      a.cfg.save())
+    if a.libGroups.len > 0: a.libGroupItems(m)
+  m
+
 proc relabeled(n: MenuNode, label: string): MenuNode =
   ## Same item under another name, sharing its action and children.
   result = MenuNode()
@@ -7352,6 +8753,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.resizeKeepingVideo(ivec2(0, int32(if a.cfg.showStatus: StatusHeight else: -StatusHeight))))
   view.check("Playlist", k(kaPlaylist), cfg.showPlaylist, action = proc () =
     a.setPlaylistShown(not a.cfg.showPlaylist))
+  view.check("Library", k(kaLibrary), cfg.showLibrary, action = proc () =
+    a.setLibraryShown(not a.cfg.showLibrary))
   view.check("Run Log", k(kaRunLog), cfg.showRunLog, action = proc () =
     a.setRunLogShown(not a.cfg.showRunLog))
   view.sep()
@@ -7611,6 +9014,21 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
 
   # Right-click menu, built from the bar's nodes.
   let ctx = newMenuRoot()
+  # What the file is (has it a picture, a cover of its own...) is known once
+  # it plays: while it opens (again, as looping a playlist of one short
+  # file does), the items stay as they were, not changing under the pointer.
+  if loaded and not p.switching:
+    a.ctxKind = (
+      # Only for audio files: not links (YouTube's have a thumbnail item of
+      # their own) nor videos, even with their video track turned off.
+      cover: not p.path.contains("://") and
+        not p.tracks.anyIt(it.kind == "video" and not it.albumArt),
+      # A picture named after the file, over the one inside it and the folder's.
+      ownCover: p.hasOwnCover,
+      # The visualizer, for sound without a picture.
+      visualizer: not p.hasVideo,
+      sphere: p.isSpherical)
+  let fileKind = a.ctxKind
   # A picture dropped or pasted on the file: first, over everything else.
   if loaded and a.qcImage.len > 0 and a.qcFor == p.path:
     let shown = a.quickCoverShown
@@ -7627,24 +9045,19 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
       a.cfg.save()
       a.dirtyUntil = max(a.dirtyUntil, now() + 0.1))
     ctx.sep()
-  # Only for audio files: not links (YouTube's have a thumbnail item of their
-  # own) nor videos, even with their video track turned off.
-  elif loaded and not a.player.path.contains("://") and
-     not p.tracks.anyIt(it.kind == "video" and not it.albumArt):
+  elif loaded and fileKind.cover:
     ctx.check("Show Front Cover", checked = a.cfg.showCover, action = proc () =
       a.cfg.showCover = not a.cfg.showCover
       a.cfg.save()
       a.syncSettings())
-    # A picture named after the file, over the one inside it and the folder's.
-    if a.player.hasOwnCover:
+    if fileKind.ownCover:
       ctx.check("Show Front Cover (file)", checked = a.cfg.showFileCover,
                 enabled = a.cfg.showCover, action = proc () =
         a.cfg.showFileCover = not a.cfg.showFileCover
         a.cfg.save()
         a.syncSettings())
     ctx.sep()
-  # The visualizer, for sound without a picture.
-  if loaded and not p.hasVideo:
+  if loaded and fileKind.visualizer:
     ctx.check("Show Visualizer", checked = a.cfg.showVisualizer, action = proc () =
       a.cfg.showVisualizer = not a.cfg.showVisualizer
       a.cfg.save()
@@ -7693,7 +9106,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.ytThumbnail = not a.cfg.ytThumbnail
         a.cfg.save())
     ctx.sep()
-  if p.isSpherical:
+  if loaded and fileKind.sphere:
     ctx.check("Ctrl+Drag to Look",
       checked = a.cfg.sphereDragMovesWindow, action = proc () =
         a.cfg.sphereDragMovesWindow = not a.cfg.sphereDragMovesWindow
@@ -7745,6 +9158,27 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let rc = newMenuRoot()
     rc.children = rep.children
     (root, rc)
+  of cmPlay:
+    let m = newMenuRoot()
+    m.check("Enable reverse playback", checked = cfg.reversePlayback, action = proc () =
+      a.cfg.reversePlayback = not a.cfg.reversePlayback
+      a.cfg.save())
+    (root, m)
+  of cmStop, cmPause:
+    # The button's "... after current", and whether it stays on once done.
+    let m = newMenuRoot()
+    let stopping = a.ctxMenu == cmStop
+    let mode = if stopping: acStop else: acPause
+    m.check(if stopping: "Stop after current" else: "Pause after current",
+      checked = a.afterCurrent == mode,
+      action = bindAct(proc (md: AfterCurrent) = a.toggleAfterCurrent(md), mode))
+    m.check("Preserve the above after current",
+      checked = (if stopping: cfg.stopAfterKeep else: cfg.pauseAfterKeep),
+      action = bindAct(proc (st: bool) =
+        if st: a.cfg.stopAfterKeep = not a.cfg.stopAfterKeep
+        else: a.cfg.pauseAfterKeep = not a.cfg.pauseAfterKeep
+        a.cfg.save(), stopping))
+    (root, m)
   of cmReplayGain:
     let rg = newMenuRoot()
     a.replayGainItems(rg, a.currentRg, a.rgButton)
@@ -7876,6 +9310,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     vc.markListed()
     ac.markListed()
     (root, q)
+  of cmLibrary: (root, a.libraryMenu())
   of cmRunLog:
     let rl = newMenuRoot()
     # The selected text, or the whole log when nothing is selected.
@@ -7893,12 +9328,36 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let n = a.playlist.len
     let hasSel = a.plSelection.len > 0
     let edit = not locked
+    # ReplayGain, under Properties (or Add Media File with nothing selected).
+    # With a local file selected, its values once the columns' probe read them.
+    let sel = if hasSel: a.playlist[a.plSelected] else: ""
+    let opened = sel.len > 0 and sel == p.path and p.loaded
+    let read = opened or sel.len > 0 and not sel.contains("://") and sel in a.mediaInfo
+    let replayGainSub = proc () =
+      let rgm = pl.sub("ReplayGain")
+      a.replayGainItems(rgm,
+        if opened: a.currentRg elif read: a.mediaInfo[sel].rg else: ReplayGain(), read)
+      rgm.sep()
+      if a.rgJob.running:
+        rgm.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
+      else:
+        # Measured from the audio (ffmpeg decodes it), written with TagLib.
+        let files = a.rgFiles.len
+        let ok = files > 0 and canWriteTags()
+        let count = if files > 1: &" ({files} files)" else: ""
+        rgm.item("Analyze and Apply as Tracks" & count, enabled = ok, action = proc () =
+          a.saveReplayGain(rmTrack, a.rgFiles))
+        rgm.item("Analyze and Apply as Album" & count, enabled = ok, action = proc () =
+          a.saveReplayGain(rmAlbum, a.rgFiles))
+        rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
+          a.removeReplayGain(a.rgFiles))
     if hasSel:
       let path = a.playlist[a.plSelected]
       pl.item("Open Containing Directory", enabled = not path.contains("://"),
         action = proc () = a.showInFolder(path))
       pl.item("Properties...", enabled = a.plSelection.anyIt(not a.playlist[it].contains("://")),
         action = proc () = a.showTagProps())
+      replayGainSub()
       pl.sep()
     else:
       pl.item("Add Media File...", enabled = edit, action = proc () =
@@ -7906,7 +9365,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           filterName = "Media files",
           extraFilters = @[("Tracker modules", @TrackerExtensions),
                            ("MIDI files", @MidiExtensions), ("Cue sheets", @["cue"])]))
-    pl.item("Remove Media File", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
+      replayGainSub()
+      pl.sep()
+    pl.item("Remove From List", k(kaRemoveFromPlaylist), enabled = hasSel and edit, action = proc () =
       a.removeSelected())
     pl.item("Duplicate", "Ctrl+D", enabled = hasSel and edit, action = proc () =
       a.duplicateSelected())
@@ -7954,36 +9415,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     pl.item("Load Playlist...", enabled = edit, action = proc () = a.loadPlaylistDialog())
     pl.sep()
     pl.item("Clear", enabled = n > 0 and edit, action = proc () = a.clearPlaylist())
-    let tab = a.tabs[a.tabView]
-    pl.item(if tab.undo.len > 0: "Undo " & tab.undo[^1].label else: "Undo", k(kaUndoPlaylist),
-      enabled = tab.undo.len > 0 and edit, action = proc () = a.undoRedo(false))
-    pl.item(if tab.redo.len > 0: "Redo " & tab.redo[^1].label else: "Redo", k(kaRedoPlaylist),
-      enabled = tab.redo.len > 0 and edit, action = proc () = a.undoRedo(true))
     pl.sep()
     pl.check("Cursor follows playback", checked = a.cfg.playlistCursorFollows, action = proc () =
       a.cfg.playlistCursorFollows = not a.cfg.playlistCursorFollows)
-    pl.sep()
-    # With a local file selected, its values once the columns' probe read them.
-    let sel = if hasSel: a.playlist[a.plSelected] else: ""
-    let opened = sel.len > 0 and sel == p.path and p.loaded
-    let read = opened or sel.len > 0 and not sel.contains("://") and sel in a.mediaInfo
-    let rgm = pl.sub("ReplayGain")
-    a.replayGainItems(rgm,
-      if opened: a.currentRg elif read: a.mediaInfo[sel].rg else: ReplayGain(), read)
-    rgm.sep()
-    if a.rgJob.running:
-      rgm.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
-    else:
-      # Measured from the audio (ffmpeg decodes it), written with TagLib.
-      let files = a.rgFiles.len
-      let ok = files > 0 and canWriteTags()
-      let count = if files > 1: &" ({files} files)" else: ""
-      rgm.item("Analyze and Apply as Tracks" & count, enabled = ok, action = proc () =
-        a.saveReplayGain(rmTrack, a.rgFiles))
-      rgm.item("Analyze and Apply as Album" & count, enabled = ok, action = proc () =
-        a.saveReplayGain(rmAlbum, a.rgFiles))
-      rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
-        a.removeReplayGain(a.rgFiles))
     (root, pl)
   of cmPlaylistTab:
     # A tab's menu (it's shown), or the strip's around the tabs.
@@ -8032,14 +9466,13 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
         a.cfg.save())
       cols.sep()
     let toggle = proc (f: PlaylistField) =
-      var shown = a.plColumns
-      let at = shown.find(f)
-      if at >= 0: shown.delete(at)
-      else: shown.add f
-      a.plColumns = shown
+      var (order, shown) = (a.plColumnOrder, a.plColumns)
+      toggleColumn(order, shown, f)
+      (a.plColumnOrder, a.plColumns) = (order, shown)
       a.saveColumns()
     let shown = a.plColumns
-    for f in PlaylistField:
+    # In the header's order, a hidden column where it was when last shown.
+    for f in columnOrder(a.plColumnOrder, shown):
       # The last column left stays: the header is what brings the others back.
       cols.check(PlaylistFields[f].label, checked = f in shown,
         enabled = f notin shown or shown.len > 1, action = bindAct(toggle, f))
@@ -8054,8 +9487,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     cols.check("Override columns for this playlist", checked = own,
       enabled = a.tabView in 0 ..< a.tabs.len, action = proc () =
         let t = addr a.tabs[a.tabView]
-        if own: (t.columns, t.columnWidths) = (newSeq[PlaylistField](), initTable[string, float]())
-        else: (t.columns, t.columnWidths) = (a.cfg.playlistColumns, a.cfg.playlistColumnWidths)
+        if own: (t.columns, t.columnWidths, t.columnOrder) = (newSeq[PlaylistField](), initTable[string, float](), newSeq[PlaylistField]())
+        else: (t.columns, t.columnWidths, t.columnOrder) = (a.cfg.playlistColumns, a.cfg.playlistColumnWidths, a.cfg.playlistColumnOrder)
         a.savePlaylistStore())
     (root, cols)
 
@@ -8090,18 +9523,31 @@ const
   PaletteContext = "Right-Click Menu"  ## the right-click menu's own items
   ## Commands with a key but no menu item, filed under the menu of their key group.
   PaletteKeyOnly = {kaNextAudio, kaPrevAudio, kaNextSub, kaPrevSub, kaSeek10 .. kaSeek90,
-    kaSubTopLeft .. kaSubSmaller, kaFindPlaylist, kaNewPlaylist .. kaUnqueue}
+    kaSubTopLeft .. kaSubSmaller, kaFindPlaylist, kaNewPlaylist .. kaUnqueue,
+    kaSearchLibrary}
   ## Submenus that come first among what a search finds.
   PaletteFavored = ["Play › Audio Track", "Play › Subtitle Track", "Play › Video Track"]
   PaletteSubBonus = 50
   PaletteFavoredBonus = 150
+  ## The presets, in a list of its own: highlighting one plays it.
+  PaletteAvs = "Change Visualizer"
+  PaletteAvsTypeDelay = 1.0  ## seconds a search waits before playing the preset it highlights
+  ## Other names that find a command as well as its own.
+  PaletteAliases = [(PaletteAvs, "Switch Visualizer"),
+    ("View" & PaletteSep & "Search Library", "Find Library")]
 
 proc runAction(a: App, act: KeyAction)  # below
 proc trackerButton(a: App): bool  # below
 proc setShield(a: App, on: bool)  # below
 
 proc paletteKey(it: PaletteItem): string =
-  (it.path & it.label).join(PaletteSep)
+  result = (it.path & it.label).join(PaletteSep)
+  if it.id.len > 0: result.add "\t" & it.id
+
+proc avsPaletteItem(a: App, i: int): PaletteItem =
+  let id = a.avs.presets[i]
+  PaletteItem(label: presetName(id), path: @[PaletteAvs], kind: mkRadio,
+    checked: i == a.avs.current, enabled: true, id: id)
 
 proc paletteRoot(a: App): MenuNode =
   ## Everything the palette lists, as one menu tree.
@@ -8125,9 +9571,12 @@ proc paletteRoot(a: App): MenuNode =
   # The controls bar's buttons (all of them, as a wide bar has them), and
   # the menus their right-click opens.
   let ctl = result.sub("Controls")
-  ctl.item("Play", enabled = p.loaded or a.cfg.recentFiles.len > 0, action = proc () = a.play())
+  ctl.item("Play", enabled = p.loaded or a.cfg.recentFiles.len > 0, action = proc () = a.playButton())
+  ctl.sub("Play Options").children = menuOf(cmPlay)
   ctl.item("Pause", enabled = p.loaded, action = proc () = a.pause())
+  ctl.sub("Pause Options").children = menuOf(cmPause)
   ctl.item("Stop", enabled = p.loaded, action = proc () = a.stop())
+  ctl.sub("Stop Options").children = menuOf(cmStop)
   let navOk = p.loaded and not a.playlistLocked
   ctl.item("Previous", enabled = navOk, action = proc () = a.navigate(-1))
   ctl.item("Slow Down", enabled = p.loaded, action = proc () = a.changeRate(-1))
@@ -8145,6 +9594,8 @@ proc paletteRoot(a: App): MenuNode =
     ctl.sub("ReplayGain").children = menuOf(cmReplayGain)
   ctl.check("Mute", checked = p.muted, action = proc () = a.setMute(not a.player.muted))
   ctl.check("Shield", checked = a.shielded, action = proc () = a.setShield(not a.shielded))
+  # The presets, listed by paletteFind (they play as they're highlighted).
+  discard result.sub(PaletteAvs, enabled = a.avsShown and a.avs != nil)
   # The status bar's right-click menus: its time's and its own.
   let st = result.sub("Status Bar")
   st.sub("Timestamp").children = menuOf(cmTime)
@@ -8182,6 +9633,33 @@ proc paletteRoot(a: App): MenuNode =
           if c.action != nil: c.action = atPlaying(c.action)
           wrap(c)
       wrap(entry)
+  # Disable Audio / Video: the track to None, and back to the one it was.
+  var play: MenuNode
+  for c in result.children:
+    if c.kind == mkSub and c.label == "Play": play = c
+  let toggleTrack = proc (kp: (string, string)) =
+    let (kind, prop) = kp
+    let p = a.player
+    if not p.loaded: return
+    let cur = p.selectedTrack(kind)
+    if cur > 0:
+      a.palTrackBefore[prop] = (p.path, cur)
+      a.setTrack(prop, 0)
+      a.osd(if kind == "audio": "Audio: Off" else: "Video: Off")
+      return
+    # back to the track turned off, if it's this file's; else the first
+    let was = a.palTrackBefore.getOrDefault(prop)
+    var id = 0
+    for t in p.tracks:
+      if t.kind == kind and (id == 0 or (was.path == p.path and t.id == was.id)): id = t.id
+    if id > 0:
+      a.setTrack(prop, id)
+      a.osd(if kind == "audio": "Audio: On" else: "Video: On")
+  if play != nil:
+    for (label, kind, prop) in [("Disable Audio", "audio", "aid"), ("Disable Video", "video", "vid")]:
+      let has = p.loaded and p.tracks.anyIt(it.kind == kind)
+      play.check(label, "", has and p.selectedTrack(kind) == 0, enabled = has,
+        action = bindAct(toggleTrack, (kind, prop)))
   # The commands that only have a key, in the menu of their group.
   for act in PaletteKeyOnly:
     let name =
@@ -8236,13 +9714,21 @@ proc paletteFind(a: App): seq[PaletteItem] =
   ## submenu's items in menu order, at the top after the ones run lately.
   let root = a.paletteRoot()
   var node = paletteNode(root, a.palTrail)
-  if node == nil:  # it went (the file closed, say): back to the top
+  if node == nil or (a.palAvsList and not node.enabled):
+    # It went (the file closed, the visualizer hid): back to the top.
+    a.paletteAvsCancel()
     a.palTrail = @[]
     a.palBack.setLen 0
     node = root
   let base = a.palTrail.mapIt(it[0])  # the open submenu's path
   var all: seq[PaletteItem]
-  paletteItems(node, a.palTrail, base, true, true, all)
+  if a.palAvsList:
+    # The presets turned on: those turned off are hidden, the one playing too.
+    for i in 0 ..< a.avs.presets.len:
+      if a.avs.enabled(i): all.add a.avsPaletteItem(i)
+    if a.palText.strip.len == 0: return all
+  else:
+    paletteItems(node, a.palTrail, base, true, true, all)
   let recent = a.cfg.paletteRecent
   if a.palText.strip.len == 0:
     if a.palTrail.len == 0:
@@ -8260,6 +9746,9 @@ proc paletteFind(a: App): seq[PaletteItem] =
   for i, it in all:
     let where = it.path[base.len .. ^1].join(" ")  # the menus below the open one
     var score = searchScore(it.label, where & " " & it.shortcut, a.palText)
+    for (key, alias) in PaletteAliases:
+      if it.paletteKey == key:
+        score = max(score, searchScore(alias, where & " " & it.shortcut, a.palText))
     if score < 0: continue
     if it.kind == mkSub:
       score += PaletteSubBonus
@@ -8291,12 +9780,23 @@ proc showPalette(a: App) =
     a.palBack.setLen 0
   a.paletteReset()
   a.palPress = -1
+  # Asked of the server: the pointer may have moved without motion events
+  # (opened by a key right after the window got focus).
+  a.palAnchor = if a.ui.fakeMouse.x >= 0: a.ui.fakeMouse
+                else: a.window.pointerPos.local.vec2 / a.ui.scale
   a.ui.focusId = "palette"
   a.ui.focusFresh = true
 
 proc closePalette(a: App) =
+  a.paletteAvsCancel()
   if a.ui.focusId == "palette": a.ui.focusId = ""
   if a.overlay == ovPalette: a.overlay = ovNone
+
+proc paletteAvsSelectCurrent(a: App) =
+  ## Highlights the preset playing in Change Visualizer's list, in the middle.
+  if a.avs.current >= 0:
+    a.palSelKey = a.avsPaletteItem(a.avs.current).paletteKey
+    a.palCenter = true
 
 proc paletteOpen(a: App, it: PaletteItem) =
   ## Opens a submenu in the palette, its search empty.
@@ -8304,10 +9804,16 @@ proc paletteOpen(a: App, it: PaletteItem) =
   a.palTrail = it.trail
   a.palText = ""
   a.paletteReset()
+  if it.trail.len == 1 and it.label == PaletteAvs and a.avs != nil:
+    a.palAvsList = true
+    a.palAvsBefore = if a.avs.current >= 0: a.avs.presets[a.avs.current] else: ""
+    a.palAvsTypedAt = 0
+    a.paletteAvsSelectCurrent()
 
 proc paletteUp(a: App) =
   ## Back to where the open submenu was opened from, its search as it was.
   if a.palBack.len == 0: return
+  a.paletteAvsCancel()
   let (trail, text) = a.palBack.pop()
   a.palTrail = trail
   # After the field has taken this frame's keys: the Backspace that brought
@@ -8316,10 +9822,42 @@ proc paletteUp(a: App) =
   a.palTextSet = true
   a.paletteReset()
 
+proc paletteAvsPreview(a: App, it: PaletteItem) =
+  ## Plays the preset highlighted in Change Visualizer's list, kept only
+  ## when it's picked (paletteAvsCancel puts the one before back).
+  a.palAvsTypedAt = 0
+  if it.id.len == 0 or a.avs == nil: return
+  if a.avs.current < 0 or a.avs.presets[a.avs.current] != it.id:
+    if a.avs.selectId(it.id): a.cfg.avsPreset = it.id
+  a.palSelKey = it.paletteKey
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc paletteAvsCancel(a: App) =
+  ## Leaving Change Visualizer's list without picking a preset: the one
+  ## playing when it opened plays again.
+  if not a.palAvsList: return
+  a.palAvsList = false
+  a.palAvsTypedAt = 0
+  let id = a.palAvsBefore
+  a.palAvsBefore = ""
+  if id.len > 0 and a.avs != nil and
+     (a.avs.current < 0 or a.avs.presets[a.avs.current] != id):
+    a.pickAvs(id)
+
 proc runPaletteItem(a: App, it: PaletteItem) =
   ## Runs a command found, or opens a submenu. A check or radio item leaves
   ## the palette open, any other command closes it first (it may open a
-  ## dialog of its own).
+  ## dialog of its own). A preset in Change Visualizer's list is kept, and
+  ## closes it.
+  if it.id.len > 0:
+    a.palAvsList = false
+    a.palAvsTypedAt = 0
+    if a.avs != nil and a.avs.current >= 0 and a.avs.presets[a.avs.current] == it.id:
+      a.cfg.avsPreset = it.id  # playing already: kept, not started over
+      a.cfg.save()
+    else: a.pickAvs(it.id)
+    a.closePalette()
+    return
   if not it.enabled or (it.kind != mkSub and it.action == nil): return
   let key = it.paletteKey
   a.cfg.paletteRecent.keepItIf(it != key)
@@ -8360,46 +9898,69 @@ proc paletteKeys(a: App) =
     a.palSel = sel
     a.palSelKey = a.palItems[sel].paletteKey
     a.palFollow = true
+    if a.palAvsList: a.paletteAvsPreview(a.palItems[sel])
   if pressed[KeyEnter] or pressed[NumpadEnter]:
     a.runPaletteItem(a.palItems[clamp(a.palSel, 0, n - 1)])
 
 proc paletteOverlay(a: App) =
-  ## The command palette: a search field over the commands found, at the
-  ## top of the window; the highlighted one runs with Enter or a click. In a
-  ## submenu, a button left of the field goes back.
+  ## The command palette: a search field over the commands found, opened
+  ## with the field under the mouse and kept inside the window, in the look
+  ## of Blender's menu search; the highlighted one runs with Enter or a
+  ## click. In a submenu, a button left of the field goes back.
   let ui = a.ui
   const
-    Pad = 8'f32
-    FieldH = 32'f32
+    Pad = 6'f32
+    FieldH = 30'f32
+    Gap = 6'f32
     RowH = 26'f32
     IconW = 24'f32
     ArrowW = 22'f32
+    SepW = 14'f32      ## a ▸ between a path's menus
+    Radius = 6'f32
     MaxRows = 12
+    Edge = 4'f32       ## kept clear between it and the window's edges
   let W = ui.size.x
   let H = ui.size.y
-  let pw = max(120'f32, min(640'f32, W - 16))
-  let px = floor((W - pw) / 2)
-  let py = min(a.menuBarHeight + 12, max(4'f32, H - (Pad * 2 + FieldH + 6 + RowH) - 4))
-  # The submenu open: its name on a button that goes back.
+  let pw = max(120'f32, min(560'f32, W - Edge * 2))
+  # Clamped as though all the rows showed, so the field stays put as
+  # typing changes how many do.
+  let fullH = Pad * 2 + FieldH + Gap + MaxRows.float32 * RowH
+  let px = max(Edge, min(W - Edge - pw, floor(a.palAnchor.x - pw / 2)))
+  let py = max(Edge, min(H - Edge - fullH, floor(a.palAnchor.y - Pad - FieldH / 2)))
+  # The field's ground, drawn first: the field only draws its text.
   var fieldR = rect(px + Pad, py + Pad, pw - Pad * 2, FieldH)
+  ui.roundRect(fieldR, colSearchField, 4)
+  # The submenu open: its name on a button that goes back.
   if a.palTrail.len > 0:
     let name = ui.ellipsize("‹  " & a.palTrail[^1][0], pw * 0.4)
     let bw = ui.textSize(name).x + 20
-    let br = rect(fieldR.x, fieldR.y, bw, FieldH)
+    let br = rect(fieldR.x + 3, fieldR.y + 3, bw, FieldH - 6)
     let hov = ui.hover(br)
-    ui.rect(br, if hov: colPressed else: colHover)
+    ui.roundRect(br, if hov: blend(colPressed, colText, 0.12) else: colPressed, 3)
     ui.textIn(name, br, colText, h = CenterAlign)
     if hov and ui.pressed():
       ui.consumeClick()
       a.paletteUp()
-    fieldR = rect(br.x + bw + 6, fieldR.y, fieldR.w - bw - 6, FieldH)
+    fieldR = rect(br.x + bw + 3, fieldR.y, fieldR.x + fieldR.w - br.x - bw - 3, FieldH)
+  else:
+    ui.icon("search16", vec2(fieldR.x + 14, fieldR.y + FieldH / 2), colTextDim)
   let before = a.palText
   let placeholder =
-    if a.palTrail.len > 0: "Search " & a.palTrail.mapIt(it[0]).join(PaletteSep)
-    else: "Search commands"
-  let ev = ui.textField("palette", fieldR, a.palText, placeholder)
+    if a.palAvsList: "Search visualizer presets…"
+    elif a.palTrail.len > 0: "Search " & a.palTrail.mapIt(it[0]).join(PaletteSep) & "…"
+    else: "Search…"
+  let ev = ui.textField("palette", fieldR, a.palText, placeholder, framed = false,
+                        lead = if a.palTrail.len > 0: 0'f32 else: 20'f32)
   ui.focusId = "palette"  # Enter and Tab end editing; this field keeps it
-  if eeChanged in ev and a.palText != before: a.paletteReset()
+  if eeChanged in ev and a.palText != before:
+    a.paletteReset()
+    if a.palAvsList:
+      # The preset found plays once typing pauses; with the search
+      # emptied, the one playing is highlighted again.
+      if a.palText.strip.len > 0: a.palAvsTypedAt = now()
+      else:
+        a.palAvsTypedAt = 0
+        a.paletteAvsSelectCurrent()
   if a.palTextSet:
     a.palTextSet = false
     a.palText = a.palTextNext
@@ -8415,12 +9976,21 @@ proc paletteOverlay(a: App) =
         a.palSel = i
         break
   a.palSel = clamp(a.palSel, 0, max(0, n - 1))
-  let fit = int((H - 4 - py - Pad * 2 - FieldH - 6) / RowH)
+  if a.palAvsList and a.palAvsTypedAt > 0:
+    if now() - a.palAvsTypedAt >= PaletteAvsTypeDelay:
+      if n > 0: a.paletteAvsPreview(a.palItems[a.palSel])
+      else: a.palAvsTypedAt = 0
+    else: a.dirtyUntil = max(a.dirtyUntil, a.palAvsTypedAt + PaletteAvsTypeDelay + 0.02)
+  let fit = int((H - Edge - py - Pad * 2 - FieldH - Gap) / RowH)
   let rows = clamp(min(fit, n), 1, MaxRows)
   a.palRows = rows
-  let r = rect(px, py, pw, Pad * 2 + FieldH + 6 + rows.float32 * RowH)
-  let listR = rect(px + Pad, fieldR.y + FieldH + 6, pw - Pad * 2, rows.float32 * RowH)
+  let r = rect(px, py, pw, Pad * 2 + FieldH + Gap + rows.float32 * RowH)
+  let listR = rect(px + Pad, py + Pad + FieldH + Gap, pw - Pad * 2, rows.float32 * RowH)
   a.palScroll = clamp(a.palScroll, 0, max(0, n - rows))
+  if a.palCenter:
+    a.palCenter = false
+    a.palFollow = false
+    a.palScroll = clamp(a.palSel - rows div 2, 0, max(0, n - rows))
   if a.palFollow:
     a.palFollow = false
     if a.palSel < a.palScroll: a.palScroll = a.palSel
@@ -8429,14 +9999,15 @@ proc paletteOverlay(a: App) =
     a.palScroll = clamp(a.palScroll + (if ui.scroll() > 0: 3 else: -3), 0, max(0, n - rows))
     ui.scrollConsumed = true
   # Under the field, which went first to take the keys first: on the layer
-  # below, last there.
+  # below, last there. A soft shadow, a thin edge and the ground.
   ui.sk.pushLayer(NormalLayer)
-  ui.rect(rect(r.xy + vec2(4, 6), r.wh), colShadow)
-  ui.rect(r, colPopup)
-  ui.border(r, colBorder)
+  ui.roundRect(rect(r.x - 2, r.y + 3, r.w + 4, r.h + 5), colShadow, Radius + 6, feather = 14)
+  ui.roundRect(r, colBorder, Radius)
+  ui.roundRect(rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2), colSearchBg, Radius - 1)
   ui.sk.popLayer()
   if n == 0:
-    ui.textIn(if a.palText.strip.len > 0: "No commands found" else: "Empty",
+    ui.textIn(if a.palText.strip.len > 0: (if a.palAvsList: "No presets found" else: "No commands found")
+              else: "Empty",
       rect(listR.x + IconW, listR.y, listR.w - IconW, RowH), colTextDim)
   let shown = a.palTrail.len  # path entries the open submenu accounts for
   ui.sk.pushClipRect(listR)
@@ -8449,14 +10020,17 @@ proc paletteOverlay(a: App) =
     if hov and ui.pressed():
       ui.consumeClick()
       a.palPress = i
-    if i == a.palSel: ui.rect(rr, colPressed)
-    elif hov: ui.rect(rr, colHover)
-    let fg = if it.enabled: colText else: colTextDisabled
-    let dim = if it.enabled: colTextDim else: colTextDisabled
+    let sel = i == a.palSel
+    if sel: ui.roundRect(rr, colSearchSel, 4)
+    elif hov: ui.roundRect(rr, colHover, 4)
+    let fg = if not it.enabled: colTextDisabled elif sel: colWhite else: colText
+    let dim = if not it.enabled: colTextDisabled elif sel: colSearchSelDim else: colTextDim
     if it.checked:
       ui.icon(if it.kind == mkRadio: "radio16" else: "check16",
-        vec2(rr.x + IconW / 2 + 2, rr.y + RowH / 2), if it.enabled: colAccent else: colTextDisabled)
-    # Path, dim, then the label; the path gives way first when it's narrow.
+        vec2(rr.x + IconW / 2 + 2, rr.y + RowH / 2),
+        if not it.enabled: colTextDisabled elif sel: colWhite else: colAccent)
+    # Shortcut or submenu arrow at the right, then the path (dim, a ▸ after
+    # each menu) and the label; the path gives way first when it's narrow.
     var right = rr.x + rr.w - 8
     if it.kind == mkSub:
       ui.icon("arrow16", vec2(rr.x + rr.w - ArrowW / 2, rr.y + RowH / 2), fg)
@@ -8467,21 +10041,32 @@ proc paletteOverlay(a: App) =
         h = RightAlign)
       right -= sw + 16
     var x = rr.x + IconW + 4
-    let avail = max(0'f32, right - x)
     let labelW = ui.textSize(it.label).x
-    let path = it.path[min(shown, it.path.len) .. ^1]
-    if path.len > 0 and avail - labelW > 40:
-      let ps = ui.ellipsize(path.join(PaletteSep) & PaletteSep, avail - labelW)
-      let psW = ui.textSize(ps).x
-      ui.textIn(ps, rect(x, rr.y, psW + 2, RowH), dim)
-      x += psW
+    var path = it.path[min(shown, it.path.len) .. ^1]
+    let room = right - x - labelW
+    if path.len > 0 and room > 40:
+      proc crumbsW(p: seq[string]): float32 =
+        for s in p: result += ui.textSize(s).x + SepW
+      # The outer menus give way to "…" first, then the innermost shortens.
+      if path.len > 1 and crumbsW(path) > room:
+        var k = 1
+        while k < path.high and crumbsW(@["…"] & path[k .. ^1]) > room: inc k
+        path = @["…"] & path[k .. ^1]
+      let others = crumbsW(path[0 ..< path.high])
+      if others + crumbsW(path[^1 .. ^1]) > room:
+        path[^1] = ui.ellipsize(path[^1], max(0'f32, room - others - SepW))
+      for s in path:
+        let sw = ui.textSize(s).x
+        ui.textIn(s, rect(x, rr.y, sw + 2, RowH), dim)
+        ui.icon("arrow16", vec2(x + sw + SepW / 2, rr.y + RowH / 2), dim)
+        x += sw + SepW
     ui.textIn(ui.ellipsize(it.label, max(0'f32, right - x)), rect(x, rr.y, right - x, RowH), fg)
   ui.sk.popClipRect()
   # A thin scroll bar when the list runs past the rows shown.
   if n > rows:
     let th = max(16'f32, listR.h * rows.float32 / n.float32)
     let ty = listR.y + (listR.h - th) * a.palScroll.float32 / float32(n - rows)
-    ui.rect(rect(r.x + r.w - 5, ty, 3, th), colBorder)
+    ui.roundRect(rect(r.x + r.w - 5, ty, 3, th), colBorder, 1.5)
   if ui.released() and a.palPress >= 0:
     let i = a.palPress
     a.palPress = -1
@@ -8829,6 +10414,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaSeekBar: a.runMenuPath(@["View", "Seek Bar"])
   of kaControls: a.runMenuPath(@["View", "Controls"])
   of kaStatus: a.runMenuPath(@["View", "Status"])
+  of kaCycleBars, kaCycleBarsBack: a.cycleBars(if act == kaCycleBars: 1 else: -1)
   of kaPlaylist: a.runMenuPath(@["View", "Playlist"])
   of kaFindPlaylist: a.openPlaylistFind()
   of kaNewPlaylist:
@@ -8850,6 +10436,8 @@ proc runAction(a: App, act: KeyAction) =
   of kaQueue: (if a.cfg.showPlaylist: a.queueSelected())
   of kaUnqueue: (if a.cfg.showPlaylist: a.unqueueSelected())
   of kaRunLog: a.runMenuPath(@["View", "Run Log"])
+  of kaLibrary: a.runMenuPath(@["View", "Library"])
+  of kaSearchLibrary: a.openLibrarySearch()
   of kaShowOsd: a.runMenuPath(@["View", "Show OSD"])
   of kaFullScreen: a.setFullscreen(not a.fullscreen)
   of kaOptions: a.showOverlay(ovOptions)
@@ -8859,6 +10447,25 @@ proc runAction(a: App, act: KeyAction) =
     a.runMenuPath(@["View", "Pan, Rotate & Zoom", PanMenuLabels[act]])
 
 proc rectKeys(a: App): bool  # rectangle drawing, below
+
+proc libraryKeys(a: App): bool  # below
+
+proc panelTab(a: App): bool =
+  ## Tab / Shift+Tab: the keyboard to the next or previous place shown (see
+  ## panelStops), round the end, unless a command has the key.
+  let w = a.window
+  if not w.buttonPressed[KeyTab] or a.ui.focusId.len > 0: return
+  let mods = w.heldMods
+  if mods notin [{}, {kmShift}] or a.cfg.pressedAction(w).ok: return
+  let stops = a.panelStops
+  if stops.len == 0: return
+  let back = kmShift in mods
+  let at = stops.find(a.panelStop)
+  let next =
+    if at < 0: (if back: stops.high else: 0)
+    else: (at + (if back: stops.high else: 1)) mod stops.len
+  a.focusPanel(stops[next])
+  true
 
 proc handleKeys(a: App) =
   let w = a.window
@@ -8888,6 +10495,16 @@ proc handleKeys(a: App) =
     elif pressed[KeyDown] or pressed[KeyUp]:
       a.plFindGo(if pressed[KeyUp]: -1 else: 1)
     return
+  # So does a library's name being typed over in the libraries' column.
+  if a.ui.focusId == "lib-rename":
+    if a.libRename.len == 0 or not a.cfg.showLibrary or pressed[KeyEscape]:
+      a.libRename = ""
+      a.ui.focusId = ""
+    return
+  # And the library's search field.
+  if a.ui.focusId == "lib-search":
+    if a.overlay == ovNone: discard a.libraryKeys()
+    return
   if pressed[KeyEscape]:
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
@@ -8897,6 +10514,9 @@ proc handleKeys(a: App) =
     elif a.menus.isOpen: a.menus.close()
     elif a.tkOpen: a.setTrackerPanel(false)
     elif a.plFindOpen: a.closePlaylistFind()
+    elif a.libFocused and a.cfg.showLibrary and a.cfg.librarySearch.len > 0:
+      a.clearLibrarySearch()  # then the next Escape gives the keys back
+    elif a.panelStop != psNone: a.focusPanel(psNone)  # the arrows' commands again
     elif a.fullscreen: a.setFullscreen(false)
     return
   if a.overlay == ovProperties:
@@ -8921,7 +10541,9 @@ proc handleKeys(a: App) =
   if a.plFindOpen and pressed[KeyF3] and not (w.ctrl or w.alt):
     a.plFindGo(if w.shiftDown: -1 else: 1)
     return
+  if a.panelTab(): return
   if a.playlistKeys(): return
+  if a.libraryKeys(): return
 
   let (ok, act) = a.cfg.pressedAction(w)
   if ok: a.runAction(act)
@@ -8984,16 +10606,16 @@ proc osdStatusText(a: App): string =
     result.add &" ({int(part * 100)}%)"
 
 proc updateOsdApart(a: App) =
-  ## mpv draws its OSD into the picture, which pan, rotation and scaling
-  ## would carry along: while any applies, the OSD layer draws it instead,
-  ## over the untransformed frame.
+  ## mpv draws its OSD into the picture: a video of another aspect than the
+  ## frame would squeeze it into the picture (smaller, off the letterbox),
+  ## and pan, rotation and scaling would carry it along. Loop and step
+  ## frames hold none, and an animated cover covers it. So whenever video
+  ## shows, the OSD layer draws it instead, over the whole video frame.
   let l = a.osdLayer
   if l == nil: return
   while mpv_wait_event(l.h, 0).eventId != evNone: discard  # nothing to act on
   let p = a.player
-  # Loop and step frames hold no OSD, and an animated cover covers mpv's.
-  let apart = p.hasVideo and not p.stopped and not p.isSpherical and
-    (a.xf != VideoTransform() or a.lfOn or a.sfShow >= 0 or a.animOn)
+  let apart = p.hasVideo and not p.stopped and not p.isSpherical
   if apart != a.osdApart:
     a.osdApart = apart
     a.osdStatus = ""
@@ -9013,10 +10635,9 @@ proc updateOsdApart(a: App) =
   p.expanded.setLen 0
 
 proc osdLayerRect(a: App, area: Rect): Rect =
-  ## Where the OSD layer goes: over the frame as it would be untransformed.
-  let (center, size) = a.videoGeometry(area, VideoTransform())
-  let (w, h) = (max(1'f32, round(size.x)), max(1'f32, round(size.y)))
-  rect(round(center.x - w / 2), round(center.y - h / 2), w, h)
+  ## Where the OSD layer goes: over the whole video frame, letterbox and all.
+  let (x, y) = (round(area.x), round(area.y))
+  rect(x, y, max(1'f32, round(area.x + area.w) - x), max(1'f32, round(area.y + area.h) - y))
 
 proc renderOsdLayer(a: App, area: Rect) =
   ## Brings the OSD layer's texture up to date. Outside the frame's scissor
@@ -9579,7 +11200,7 @@ proc showAvsList(a: App) =
   a.ensureAvs()
   if a.avsDlg == nil:
     a.avsDlg = newAvsDialog(a.cfg.avsColumnWidths, a.cfg.avsStarRatings, a.cfg.avsAddedDates,
-      a.cfg.avsSort, a.cfg.avsSortDescending, a.cfg.avsAddSubfolders)
+      a.cfg.avsSort, a.cfg.avsSortDescending, a.cfg.avsAddSubfolders, a.cfg.avsShowHidden)
   let cur = a.avs.current
   a.avsDlg.jumpTo(if cur >= 0: a.avs.presets[cur] else: "")
   a.avsDlg.forget()
@@ -9684,6 +11305,12 @@ proc removeAvs(a: App, ids: seq[string]) =
   if a.avsDlg != nil: a.avsDlg.sel.setLen 0
   if n > 0: a.osd(if n == 1: "Removed a preset from the list" else: &"Removed {n} presets from the list")
 
+proc showHiddenAvs(a: App, on: bool) =
+  ## Visualizers' Show hidden: the presets turned off listed too.
+  a.cfg.avsShowHidden = on
+  if a.avsDlg != nil: a.avsDlg.showHidden = on
+  a.cfg.save()
+
 proc askAddAvs(a: App) =
   ## Visualizers' Add...: its own folder, not the media one, as presets live
   ## apart from media.
@@ -9762,6 +11389,7 @@ proc buildAvsMenu(a: App): MenuNode =
     m.item("Add...", action = proc () = a.askAddAvs())
     m.item("Add Folder...", action = proc () = a.askAddAvsDir())
     m.sep()
+    m.check("Show Hidden", checked = d.showHidden, action = proc () = a.showHiddenAvs(not a.avsDlg.showHidden))
     a.avsSortMenu(m.sub("Sort By"))
   of acRows:
     let sel = d.sel.filterIt(it in a.avs.presets)
@@ -9789,6 +11417,7 @@ proc buildAvsMenu(a: App): MenuNode =
     m.item("Add Folder...", action = proc () = a.askAddAvsDir())
     m.item("Remove", "Delete", enabled = files.len > 0, action = proc () = a.removeAvs(files))
     m.sep()
+    m.check("Show Hidden", checked = d.showHidden, action = proc () = a.showHiddenAvs(not a.avsDlg.showHidden))
     a.avsSortMenu(m.sub("Sort By"))
 
 proc pollThumbnail(a: App) =
@@ -10289,9 +11918,44 @@ proc controls(a: App, r: Rect) =
   template divider() =
     ui.rect(rect(x + 4, y + 6, 1, bh - 12), colBorder)
     x += CtlSepW
-  btn("play", "play", "Play", p.loaded or a.cfg.recentFiles.len > 0, p.playing or a.padRunning): a.play()
-  btn("pause", "pause", "Pause", p.loaded, p.loaded and p.paused and not p.stopped and not a.padRunning): a.pause()
-  btn("stop", "stop", "Stop", p.loaded, p.stopped): a.stop()
+  # Mirrored and cyan while playing in reverse; right-click opens its menu.
+  let playR = rect(x, y, bw, bh)
+  let rev = p.loaded and a.heading  # a turn on its way shows already
+  let playTip =
+    if rev: "Playing in reverse (click to play forward)"
+    elif a.cfg.reversePlayback: "Play (while playing: reverse)"
+    else: "Play"
+  btn("play", if rev: "playrev" else: "play", playTip & " (right-click for options)",
+      p.loaded or a.cfg.recentFiles.len > 0, rev or p.playing or a.padRunning,
+      if rev: colLoop else: colAccent):
+    a.playButton()
+  if ui.hover(playR) and ui.released(MouseRight):
+    a.ctxMenu = cmPlay
+    a.menus.openContext(ui.mouse)
+  # Right-click on Pause or Stop opens its "... after current" menu; a white
+  # dot at the top right of the symbol shows it on. Not greyed out with
+  # nothing open: it can be set before playing.
+  template afterCurrentMark(br: Rect, mode: AfterCurrent, menu: ContextMenu, corner: Vec2) =
+    if ui.hover(br) and ui.released(MouseRight):
+      a.ctxMenu = menu
+      a.menus.openContext(ui.mouse)
+    if a.afterCurrent == mode:
+      # corner: the symbol's top right in its 20 px icon; the dot sits just past it.
+      # White when it goes off once used, indigo when preserved.
+      let origin = (br.xy + br.wh / 2 - vec2(10, 10)).floor
+      ui.icon("dot6", origin + corner + vec2(3, -3),
+              if a.afterCurrentKept: colAccent else: colWhite)
+  let afterTip = " (right-click for options)"
+  let pauseR = rect(x, y, bw, bh)
+  btn("pause", "pause",
+      (if a.afterCurrent == acPause: "Pause: pausing after current" else: "Pause") & afterTip,
+      p.loaded, p.loaded and p.paused and not p.stopped and not a.padRunning): a.pause()
+  afterCurrentMark(pauseR, acPause, cmPause, vec2(15, 4))
+  let stopR = rect(x, y, bw, bh)
+  btn("stop", "stop",
+      (if a.afterCurrent == acStop: "Stop: stopping after current" else: "Stop") & afterTip,
+      p.loaded, p.stopped): a.stop()
+  afterCurrentMark(stopR, acStop, cmStop, vec2(15, 5))
   if tier < 4:
     divider()
     let navOk = p.loaded and not a.playlistLocked
@@ -10405,7 +12069,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   let rot = &"{a.cfg.rotateStep:g}°"
   # View toggles and pan/rotate/scale only show with "Show all shortcuts".
   let all = a.cfg.showAllShortcuts
-  let viewToggles = {kaCompact, kaSeekBar, kaControls, kaStatus, kaPlaylist, kaRunLog, kaShowOsd}
+  let viewToggles = {kaCompact, kaSeekBar, kaControls, kaStatus, kaCycleBars, kaCycleBarsBack, kaPlaylist, kaRunLog, kaLibrary, kaShowOsd}
   # Ctrl+C copies the run log's selected text while there is some (handleKeys).
   let logSel = a.cfg.showRunLog and a.rlSelection.len > 0
   for g in KeyGroup:
@@ -10443,6 +12107,15 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if mods == {kmCtrl}: result.add @[("A", "Select All Entries"), ("D", "Duplicate Entries")]
     elif mods == {kmCtrl, kmShift}:
       result.add @[("Up/Down", "Move Entries"), ("Home/End", "Move Entries To Top/Bottom")]
+  # The library's own keys while it has the focus (libraryKeys).
+  if a.libFocused and a.cfg.showLibrary:
+    if mods == {kmCtrl}: result.add @[("A", "Select All Files"), ("F", "Search Library")]
+    elif mods == {kmShift} and a.libArrows:
+      result.add @[("Up/Down", "Extend Library Selection"), ("Enter", "Play In New Player")]
+  # Tab's way back through the panels' columns and lists (panelTab), unless a command has Shift+Tab.
+  if mods == {kmShift} and a.panelStops.len > 0 and not KeyAction.toSeq.anyIt(
+      a.cfg.combos(it).anyIt(it.key == KeyTab and it.mods == {kmShift})):
+    result.add @[("Tab", "Previous Column Or List")]
   # The playlist search's way back (handleKeys); Enter only while typing in it.
   if a.plFindOpen and mods == {kmShift}:
     result.add @[((if a.ui.focusId == "pl-find": "Enter/F3" else: "F3"), "Previous Match")]
@@ -10452,10 +12125,15 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if a.player.isSpherical:
       # 360° view: the wheel changes the field of view; Ctrl swaps what a drag does.
       mouse = @[("Wheel", "Field Of View"),
-        ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window")]
-    elif a.chartShown: mouse = @[("Wheel", "Zoom Chart"), ("Drag", "Pan Chart")]
-    else: mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video")]
+        ("Drag", if a.cfg.sphereDragMovesWindow: "Look Around" else: "Move Window"),
+        ("MMB", "Reset View")]
+    elif a.chartShown:
+      mouse = @[("Wheel", "Zoom Chart"), ("Drag", "Pan Chart"), ("MMB", "Fit Chart")]
+    else:
+      mouse = @[("Wheel", "Zoom At Cursor"), ("Drag", "Pan Zoomed Video"),
+                ("MMB", "Restore Zoom")]
     if plShown: mouse.add @[("LMB", "Toggle Playlist Entry"), ("Drag", "Copy Playlist Entries")]
+    if a.cfg.showLibrary and a.libRows.len > 0: mouse.add ("LMB", "Toggle Library File")
   elif mods == {kmAlt}: mouse = @[("MDrag", "Rotate Frame"), ("MMB", "Reset Rotation")]
   elif mods == {kmAlt, kmShift}: mouse = @[("MDrag", "Rotate In " & rot & " Steps")]
   elif mods == {kmCtrl, kmAlt}: mouse = @[("MDrag", "Rotate Around Cursor")]
@@ -10466,6 +12144,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
               ("RMB", "Menu Bar's Menus")]
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
     if plShown: mouse.add ("LMB", "Select Playlist Range")
+    if a.cfg.showLibrary and a.libRows.len > 0: mouse.add ("LMB", "Select Library Range")
     if plShown and a.tabs.len > 1: mouse.add ("Drag", "Move Entries To A Tab")
   # Mouse shortcuts lead the bar, before any key group.
   if mouse.len > 0: result.insert(mouse, 0)
@@ -10684,57 +12363,122 @@ proc fmtSize(bytes: int64): string =
   &"{v:.1f} " & ["KB", "MB", "GB", "TB"][unit]
 
 proc columnTitle(field: PlaylistField): string =
-  ## A column's header. Track number's label would be far wider than its values.
-  if field == pfTrack: "#" else: PlaylistFields[field].label
+  ## A column's header. Track and disc number's labels would be far wider than
+  ## their values.
+  case field
+  of pfTrack: "#"
+  of pfDisc: "Disc"
+  else: PlaylistFields[field].label
 
-proc columnFills(a: App, field: PlaylistField): bool =
-  ## A text column nobody resized: it shares the width the others leave.
-  PlaylistFields[field].sample.len == 0 and $field notin a.plColumnWidths
+proc fillsIn(sized: Table[string, float], field: PlaylistField): bool =
+  ## A text column nobody resized (sized: the widths set by hand): it shares
+  ## the width the others leave.
+  PlaylistFields[field].sample.len == 0 and $field notin sized
 
-proc columnMin(a: App, cells: seq[(Rect, PlaylistField)], i: int): float32 =
-  if a.columnFills(cells[i][1]): PlaylistMinTextW
+proc columnFills(a: App, field: PlaylistField): bool = a.plColumnWidths.fillsIn(field)
+
+proc minIn(sized: Table[string, float], cells: seq[(Rect, PlaylistField)], i: int): float32 =
+  ## The narrowest column i can get.
+  if sized.fillsIn(cells[i][1]): PlaylistMinTextW
   elif i == 0: PlaylistIconW + PlaylistMinColW
   else: PlaylistMinColW
 
-proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
-  ## The shown columns, left to right, always fitting the panel. A resized
-  ## column keeps its width; the others are as wide as their widest text,
-  ## except the text columns, which share what the rest leave (with none
-  ## shown, the last column takes it).
+proc columnMin(a: App, cells: seq[(Rect, PlaylistField)], i: int): float32 =
+  a.plColumnWidths.minIn(cells, i)
+
+proc layoutCells(a: App, hdr: Rect, cols: seq[PlaylistField], sized: Table[string, float],
+                 longDur: bool): seq[(Rect, PlaylistField)] =
+  ## Columns cols left to right, always fitting hdr (the playlist's or the
+  ## library's). A resized column keeps its width; the others are as wide as
+  ## their widest text, except the text columns, which share what the rest
+  ## leave (with none shown, the last column takes it). longDur: Duration
+  ## shows milliseconds.
   let ui = a.ui
-  let cols = a.plColumns
-  a.plDurSeconds = pfDuration in cols and
-    not a.playlist.anyIt(it in a.mediaInfo and a.mediaInfo[it].duration > 60)
   var widths = newSeq[float32](cols.len)
   var used = 0'f32
   var shared = 0
   for i, f in cols:
     let sample = PlaylistFields[f].sample
-    if $f in a.plColumnWidths:
-      widths[i] = a.plColumnWidths[$f].float32
+    if $f in sized:
+      widths[i] = sized[$f].float32
       used += widths[i]
     elif sample.len == 0: inc shared
     else:
-      let longMillis = f == pfDuration and a.cfg.playlistShowMillis and not a.plDurSeconds
+      let longMillis = f == pfDuration and longDur
       let text = if longMillis: sample & ".000" else: sample
       widths[i] = max(ui.textSize(f.columnTitle, FontSmall).x, ui.textSize(text, FontSmall).x) + 18
       if i == 0: widths[i] += PlaylistIconW
       used += widths[i]
-  if shared == 0: widths[^1] = max(PlaylistMinColW, widths[^1] + hdr.w - used)
+  if shared == 0: widths[^1] += max(0'f32, hdr.w - used)  # too narrow a panel: see below
   else:
     for i, f in cols:
-      if a.columnFills(f): widths[i] = max(PlaylistMinTextW, (hdr.w - used) / shared.float32)
-  # Too narrow a panel takes it from the rightmost columns.
-  var excess = widths.sum - hdr.w
-  for i in countdown(cols.high, 0):
-    let floorW = if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW
-    let cut = clamp(excess, 0, max(0'f32, widths[i] - floorW))
-    widths[i] -= cut
-    excess -= cut
+      if sized.fillsIn(f): widths[i] = max(PlaylistMinTextW, (hdr.w - used) / shared.float32)
+  # Too narrow a panel takes it from every column, each giving as much of
+  # what it has above its narrowest (so none is crushed while others keep
+  # their width).
+  let excess = widths.sum - hdr.w
+  if excess > 0:
+    var give = 0'f32
+    for i in 0 .. cols.high:
+      give += max(0'f32, widths[i] - (if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW))
+    if give > 0:
+      let part = min(1'f32, excess / give)
+      for i in 0 .. cols.high:
+        let floorW = if i == 0: PlaylistIconW + PlaylistMinColW else: PlaylistMinColW
+        widths[i] -= max(0'f32, widths[i] - floorW) * part
   var x = hdr.x
   for i, f in cols:
     result.add (rect(x, hdr.y, widths[i], hdr.h), f)
     x += widths[i]
+
+proc startColumnDrag(sized: Table[string, float], cells: seq[(Rect, PlaylistField)],
+                     edge: int, x: float32): ColumnDrag =
+  ## A press on column edge's right edge (not the last column's: that one
+  ## only fits). A text column right of it that fills the panel gives way;
+  ## without one, the columns right of the edge do.
+  result = ColumnDrag(index: edge, x: x, filler: -1)
+  for j in edge + 1 .. cells.high:
+    if result.filler < 0 and sized.fillsIn(cells[j][1]): result.filler = j
+  for j, (cr, _) in cells:
+    result.widths.add cr.w
+    result.mins.add(if j == result.filler: PlaylistMinTextW
+                    elif j == 0: PlaylistIconW + PlaylistMinColW
+                    else: PlaylistMinColW)
+
+proc dragColumn(sized: var Table[string, float], cells: seq[(Rect, PlaylistField)],
+                d: var ColumnDrag, x: float32) =
+  ## The widths for the pointer at x: only the dragged column changes width
+  ## and the ones right of it move along, each keeping the width it had at the
+  ## press. The filler gives way; without one, the last column takes up the
+  ## slack, and once they'd pass the panel's edge, the columns right of the
+  ## edge all narrow, each giving as much of what it has above its narrowest.
+  ## Every column keeps the width it's drawn with (a click alone changes
+  ## nothing), so what was cut to fit the panel is what's kept.
+  if d.index >= cells.high or d.widths.len != cells.len: return
+  if not d.moved:
+    if x == d.x: return
+    d.moved = true
+  let e = d.index
+  var room = 0'f32
+  if d.filler >= 0: room = d.widths[d.filler] - d.mins[d.filler]
+  else:
+    for j in e + 1 .. cells.high: room += max(0'f32, d.widths[j] - d.mins[j])
+  let least = d.mins[e] - d.widths[e]
+  let dx = clamp(x - d.x, min(0'f32, least), max(0'f32, room))
+  var give = 0'f32
+  if d.filler < 0 and dx > 0: give = dx / max(room, 1e-3)
+  for j, (_, f) in cells:
+    if j == d.filler: sized.del $f  # fills what the others leave
+    elif j == e: sized[$f] = float(d.widths[j] + dx)
+    elif j > e and give > 0: sized[$f] = float(d.widths[j] - max(0'f32, d.widths[j] - d.mins[j]) * give)
+    else: sized[$f] = d.widths[j].float
+
+proc playlistCells(a: App, hdr: Rect): seq[(Rect, PlaylistField)] =
+  ## The shown playlist's columns (see layoutCells).
+  let cols = a.plColumns
+  a.plDurSeconds = pfDuration in cols and
+    not a.playlist.anyIt(it in a.mediaInfo and a.mediaInfo[it].duration > 60)
+  a.layoutCells(hdr, cols, a.plColumnWidths, a.cfg.playlistShowMillis and not a.plDurSeconds)
 
 proc cellText(a: App, path: string, field: PlaylistField): string =
   let m = a.mediaInfo.getOrDefault(path)
@@ -10757,6 +12501,8 @@ proc cellText(a: App, path: string, field: PlaylistField): string =
     if m.audioBitrate > 0: fmtBitrate(m.audioBitrate) else: ""
   of pfTrack:
     if m.track > 0: $m.track else: ""
+  of pfDisc:
+    if m.disc > 0: $m.disc else: ""
   of pfArtist: m.artist
   of pfYear:
     if m.year > 0: $m.year else: ""
@@ -11043,7 +12789,7 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
   for i in 0 ..< n: rects.add rect(x, top + i.float32 * rowH - a.tabScroll, w, rowH)
   let plus = rect(x, top + n.float32 * rowH - a.tabScroll, w, rowH)
   (a.tabRects, a.tabPlus, a.tabStrip) = (rects, plus, strip)
-  ui.rect(strip, colPanelRaised)
+  ui.rect(strip, colPanel)  # body-dark, under the lighter header
 
   var over = -1
   if ui.hover(strip) and not blocked:
@@ -11061,7 +12807,7 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
         a.tabRename = 0
       continue
     let target = rowDrag and over == i and t.id != a.rowDragTab
-    if shown or target: ui.rect(tr, colPanel)
+    if shown or target: ui.rect(tr, colPanelRaised)
     elif over == i and not tabDrag: ui.rect(tr, colHover)
     if target: ui.border(tr, colAccent)
     elif shown: ui.rect(rect(tr.x, tr.y, 2, tr.h), colAccent)
@@ -11155,6 +12901,7 @@ proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   a.plOverEdge = false
   ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, 30), colPanelRaised)  # the header: lighter than the body
   ui.rect(rect(r.x, r.y, 1, r.h), colBorder)
   # Dragging the left edge resizes the panel; the video frame takes the rest.
   let grip = rect(r.x, r.y, PlaylistGripW, r.h)
@@ -11286,30 +13033,11 @@ proc playlistPanel(a: App, r: Rect) =
   elif edge >= 0 and ui.pressed():
     ui.consumeClick()
     if edge < cells.high:  # the last column's edge doesn't move: it only fits
-      # Only the dragged column changes width: the ones right of it move along.
-      # A text column right of the edge keeps filling the panel and gives way;
-      # without one, the last column takes up the slack and the rightmost
-      # columns narrow once pushed against the panel's edge.
-      var filler = -1
-      for j in edge + 1 .. cells.high:
-        if filler < 0 and a.columnFills(cells[j][1]): filler = j
-      var room = 0'f32
-      if filler >= 0: room = cells[filler][0].w - a.columnMin(cells, filler)
-      else:
-        for j in edge + 1 .. cells.high: room += max(0'f32, cells[j][0].w - a.columnMin(cells, j))
       ui.activeId = "plwidth"
-      a.plWidthFrom = (edge, ui.mouse.x, cells[edge][0].w, room, filler, false)
-  if ui.activeId == "plwidth" and not a.plWidthFrom.moved and ui.mouse.x != a.plWidthFrom.x:
-    # A click leaves the widths alone: they're set from the first movement on.
-    a.plWidthFrom.moved = true
-    for j, (cr, f) in cells:
-      if j != a.plWidthFrom.filler and a.columnFills(f): a.plColumnWidths[$f] = cr.w.float
-  if ui.activeId == "plwidth" and a.plWidthFrom.moved:
-    let d = a.plWidthFrom
-    let least = -(d.left - a.columnMin(cells, d.index))
-    let dx = clamp(ui.mouse.x - d.x, least, max(least, d.room))
-    a.plColumnWidths[$cells[d.index][1]] = float(d.left + dx)
-    if ui.released(): a.saveColumns()
+      a.plWidthFrom = startColumnDrag(a.plColumnWidths, cells, edge, ui.mouse.x)
+  if ui.activeId == "plwidth":
+    dragColumn(a.plColumnWidths, cells, a.plWidthFrom, ui.mouse.x)
+    if ui.released() and a.plWidthFrom.moved: a.saveColumns()
   ui.rect(colHdr, colPanelRaised)
   ui.sk.pushClipRect(colHdr)
   for i, (cr, f) in cells:
@@ -11338,10 +13066,9 @@ proc playlistPanel(a: App, r: Rect) =
       let from0 = a.plColumnFrom.index
       if not a.plColumnFrom.moved: a.sortPlaylist(cells[from0][1])
       else:
-        var shown = a.plColumns
-        shown.delete(from0)
-        shown.insert(cells[from0][1], if to > from0: to - 1 else: to)
-        a.plColumns = shown
+        var (order, shown) = (a.plColumnOrder, a.plColumns)
+        moveColumn(order, shown, cells[from0][1], if to > from0: to - 1 else: to)  # the menu follows
+        (a.plColumnOrder, a.plColumns) = (order, shown)
         a.saveColumns()
   ui.sk.popClipRect()
   ui.rect(rect(colHdr.x, colHdr.y + colHdr.h - 1, colHdr.w, 1), colBorder)
@@ -11395,6 +13122,7 @@ proc playlistPanel(a: App, r: Rect) =
     if a.plIsSelected(i): ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
     elif a.plFindOpen and a.plFindHits.binarySearch(i) >= 0: ui.rect(row, colFindHit)
+    if a.plArrows and i == a.plSelected: ui.border(row, colAccent)  # where Up/Down go from
     let current = i == a.plIndex
     var shift = 0'f32  # the first column's text moves past a long queue label
     if current: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
@@ -11452,7 +13180,6 @@ proc playlistPanel(a: App, r: Rect) =
     # The boundary the rows would drop on, as for files dropped on the list.
     let gap = clamp(int((ui.mouse.y - list.y + a.plScroll) / rowH + 0.5), 0, n)
     if a.plRowFrom.moved:
-      a.plArrows = false
       # Near or past the list's top or bottom edge it scrolls, faster further out.
       let t = now()
       let dt = min(0.1, t - a.plRowFrom.at)
@@ -11497,10 +13224,677 @@ proc playlistPanel(a: App, r: Rect) =
   a.probeNext(first .. last)
   a.infoNext(first .. last)
 
+
+# --- the Library panel --------------------------------------------------------
+
+proc pollLibrary(a: App) =
+  ## Follows the libraries as set (Options edits them live), tells the
+  ## workers whether something plays, and takes in what they found.
+  let ix = a.library
+  if a.cfg.libraries != a.libConfigured:
+    a.libConfigured = a.cfg.libraries
+    ix.configure(a.cfg.libraries)
+  let p = a.player
+  let busy = p.loaded and not p.stopped and not (p.paused and p.eofReached)
+  if busy != a.libBusy:
+    a.libBusy = busy
+    ix.setBusy(busy)
+  if ix.poll(a.libVisible) and (a.cfg.showLibrary or a.overlay == ovOptions):
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+  if ix.dropGen != a.libRowsDrop:
+    # Files left the index (a rescan not finding them, a path no library
+    # lists anymore) and the last ones took their places, so the rows'
+    # indices are stale: they're made again now, before the keys and the
+    # right-click menu (both read them ahead of the panel) can reach past
+    # the end of the index.
+    if a.cfg.showLibrary: a.refreshLibraryRows(force = true)
+    else:
+      # Made again once the panel shows.
+      a.libRows.setLen 0
+      a.libView.setLen 0
+      a.libGroups.setLen 0
+      a.libRowsKey = ""
+      a.libRowsDrop = ix.dropGen
+  ix.maybeSave(busy)
+
+proc libSuggestions(a: App): seq[tuple[label, insert: string, value: bool]] =
+  ## What the search's suggestions offer for the tag the caret is in: the
+  ## libraries for in: and exclude: (hidden ones with the hidden tag), the
+  ## tag names for a tag being started. value: the insert replaces what's
+  ## typed after the colon, else the whole tag.
+  if a.ui.focusId != "lib-search": return
+  let text = a.cfg.librarySearch
+  let (key, value, start) = completing(text, a.ui.caret)
+  if start >= 0:
+    if key notin ["in", "exclude"]: return
+    let hidden = parseQuery(text).hidden
+    let v = unicode.toLower(value.strip)
+    for l in a.cfg.libraries:
+      if l.hidden and not hidden: continue
+      let n = unicode.toLower(l.name)
+      if v.len == 0 or n.startsWith(v) or v in n:
+        if n != v: result.add (l.name, l.name, true)
+  elif key.len > 0:
+    for t in LibrarySearchTags:
+      if t.squash.startsWith(key) and t.squash != key: result.add (t, t, false)
+
+proc libTakeSuggestion(a: App, s: tuple[label, insert: string, value: bool]) =
+  ## Puts a suggestion in the search, the caret after it (and after a comma
+  ## when it ends the tag), the field keeping the keyboard.
+  var text = a.cfg.librarySearch
+  let caret = clamp(a.ui.caret, 0, text.len)
+  let (_, _, start) = completing(text, caret)
+  var a0 = caret
+  while a0 > 0 and text[a0 - 1] != ',': dec a0
+  while a0 < caret and text[a0] == ' ': inc a0
+  var b = caret
+  while b < text.len and text[b] != ',': inc b
+  let from0 = if s.value and start >= 0: start else: a0
+  let ends = s.value or not s.insert.endsWith(":")
+  let ins = s.insert & (if ends and b >= text.len: ", " else: "")
+  text = text[0 ..< from0] & ins & text[b .. ^1]
+  a.cfg.librarySearch = text
+  let at = from0 + ins.len
+  a.libSuggestKeep = at
+  a.libSuggest = 0
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc libraryKeys(a: App): bool =
+  ## The Library panel's keys: its search field's while it's typed in
+  ## (Up/Down/Enter/Tab for the suggestions, Escape to clear it), and while
+  ## the pointer stays where its list was clicked, Up/Down/Page Up/Page Down/
+  ## Home/End, Enter to play, Ctrl+A, Ctrl+F for the search.
+  let w = a.window
+  let pressed = w.buttonPressed
+  if a.ui.focusId == "lib-search":
+    let sugg = a.libSuggestions
+    if pressed[KeyEscape]:
+      if sugg.len > 0 and not a.libSuggestOff: a.libSuggestOff = true
+      elif a.cfg.librarySearch.len > 0:
+        a.clearLibrarySearch()
+        a.libSuggestKeep = a.cfg.librarySearch.len  # stays in the field, at the end
+      else:
+        a.ui.focusId = ""
+        a.libSuggestKeep = -2
+    elif sugg.len > 0 and not a.libSuggestOff and (pressed[KeyUp] or pressed[KeyDown]):
+      a.libSuggest = (a.libSuggest + (if pressed[KeyUp]: sugg.len - 1 else: 1)) mod sugg.len
+    elif sugg.len > 0 and not a.libSuggestOff and
+        (pressed[KeyEnter] or pressed[NumpadEnter] or pressed[KeyTab]):
+      a.libTakeSuggestion(sugg[clamp(a.libSuggest, 0, sugg.high)])
+    elif pressed[KeyDown] or pressed[KeyEnter] or pressed[NumpadEnter]:
+      # Into the list.
+      a.ui.focusId = ""
+      a.libFocused = true
+      a.libArrows = true
+      a.libCatKeys = false
+      if a.libCursorRow < 0: a.libSelectRow(a.libFileRow(0, 1))
+    return true
+  if not (a.libFocused and a.cfg.showLibrary): return
+  let ctrlOnly = w.ctrl and not w.alt
+  if ctrlOnly and pressed[KeyF]:
+    a.ui.focusId = "lib-search"
+    a.ui.focusFresh = true
+    return true
+  if ctrlOnly and not w.shiftDown and pressed[KeyA] and a.libArrows:
+    a.libSelectShown()
+    return true
+  let plain = not (w.ctrl or w.alt or w.shiftDown)
+  # F2 renames the library listed, from its column only: elsewhere in the
+  # panel it does nothing (not Rename Playlist either).
+  if plain and pressed[KeyF2]:
+    if a.libCatKeys: a.startLibRename()
+    return true
+  # The libraries' column: Up/Down/Home/End pick a library, Enter goes on
+  # to its files.
+  if a.libCatKeys and plain:
+    let names = a.libColumnNames
+    let at = max(0, names.find(a.cfg.libraryShown))
+    var to = -1
+    if pressed[KeyUp]: to = max(0, at - 1)
+    elif pressed[KeyDown]: to = min(names.high, at + 1)
+    elif pressed[KeyHome]: to = 0
+    elif pressed[KeyEnd]: to = names.high
+    elif pressed[KeyEnter] or pressed[NumpadEnter]:
+      a.focusPanel(psFiles)
+      if a.libCursorRow < 0: a.libSelectRow(a.libFileRow(0, 1))
+      return true
+    if to >= 0:
+      a.libPick(names[to])
+      a.libCatReveal = true
+      return true
+  if not a.libArrows or w.ctrl or w.alt: return
+  let n = a.libView.len
+  let page = max(1, int(a.libListRect.h / PlaylistRowH) - 1)
+  let cur = a.libCursorRow
+  var to = -2
+  if pressed[KeyUp]: to = a.libFileRow(cur - 1, -1)
+  elif pressed[KeyDown]: to = a.libFileRow(cur + 1, 1)
+  elif pressed[KeyPageUp]: to = a.libFileRow(cur - page, -1)
+  elif pressed[KeyPageDown]: to = a.libFileRow(cur + page, 1)
+  elif pressed[KeyHome]: to = a.libFileRow(0, 1)
+  elif pressed[KeyEnd]: to = a.libFileRow(n - 1, -1)
+  elif pressed[KeyEnter] or pressed[NumpadEnter]:
+    if w.shiftDown: a.libPlayNew(a.libSelectedPaths)
+    else: a.libPlay(a.libSelectedPaths)
+    return true
+  else: return
+  if n > 0: a.libSelectRow(max(0, to), w.shiftDown)
+  true
+
+proc libraryStatus(a: App): tuple[text: string, color: ColorRGBX] =
+  ## The panel's bottom line: what the scan is doing, what doesn't answer.
+  let ix = a.library
+  for p, r in ix.roots:
+    if r.state == rsStuck: return (p.extractFilename & " is not responding", colWarning)
+  if ix.scanning:
+    var found = 0
+    for r in ix.roots.values: found += r.found
+    return ("Scanning... " & countLabel(max(found, ix.files.len), "file"), colTextDim)
+  let left = ix.unread
+  if left > 0: return ("Reading tags... " & $left & " left", colTextDim)
+  var total = 0.0
+  for id in a.libRows: total += ix.files[id].duration
+  result.text = countLabel(a.libRows.len, "file")
+  if total > 0: result.text.add ", " & fmtTime(total, dur = total)
+  result.color = colTextDim
+
+proc libCellText(a: App, f: LibFile, field: PlaylistField): string =
+  ## A library row's text in a column, from the index alone (never the disk).
+  case field
+  of pfName: f.displayName
+  of pfFilename: f.path.extractFilename
+  of pfDuration:
+    let millis = a.cfg.libraryShowMillis
+    if not f.probed or f.duration <= 0: ""
+    elif a.libDurSeconds:
+      let ms = int(f.duration * 1000)
+      if millis: &"{ms div 1000}.{ms mod 1000:03}" else: $(ms div 1000)
+    else: fmtTime(f.duration, millis, f.duration)
+  of pfSize: fmtSize(f.size)
+  of pfDimensions:
+    if f.width > 0: &"{f.width}×{f.height}" else: ""
+  of pfAudioBitrate:
+    if f.bitrate > 0: fmtBitrate(f.bitrate) else: ""
+  of pfTrack:
+    let t = f.trackOf
+    if t > 0: $t else: ""
+  of pfDisc:
+    let d = f.discOf
+    if d > 0: $d else: ""
+  of pfArtist: f.artist
+  of pfYear:
+    let y = f.yearOf
+    if y > 0: $y else: ""
+  of pfAlbum: f.album
+
+proc libFitColumn(a: App, cells: seq[(Rect, PlaylistField)], i: int, ids: seq[int32]) =
+  ## Column i as wide as the values of the files in view (as the playlist's
+  ## fitColumn), taking the width from a column filling the panel, else the next.
+  let ui = a.ui
+  if cells.len < 2: return
+  let sized = a.cfg.libraryColumnWidths
+  let field = cells[i][1]
+  var want = 0'f32
+  for id in ids:
+    let text = a.libCellText(a.library.files[id], field)
+    if text.len > 0: want = max(want, ui.textSize(text, field.cellFont).x)
+  if want == 0: want = ui.textSize(field.columnTitle, FontSmall).x
+  want += 18
+  if i == 0: want += PlaylistIconW
+  var other = if i < cells.high: i + 1 else: i - 1
+  for j, (_, f) in cells:
+    if j != i and sized.fillsIn(f):
+      other = j
+      break
+  let was = cells[i][0].w
+  let room = cells[other][0].w - sized.minIn(cells, other)
+  let otherFills = sized.fillsIn(cells[other][1])
+  let w = clamp(want, sized.minIn(cells, i), max(sized.minIn(cells, i), was + room))
+  a.cfg.libraryColumnWidths[$field] = w.float
+  if not otherFills:
+    a.cfg.libraryColumnWidths[$cells[other][1]] = float(cells[other][0].w + was - w)
+  a.cfg.save()
+
+proc libraryPanel(a: App, r: Rect, under: bool) =
+  ## The libraries on the left (All first), the files of the one picked on
+  ## the right, a search above both. under: below the playlist, its top
+  ## edge dragged to share the column.
+  let ui = a.ui
+  let ix = a.library
+  let w = a.window
+  ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, 30), colPanelRaised)  # the header: lighter than the body
+  ui.rect(rect(r.x, r.y, 1, r.h), colBorder)
+  # Edges: the left one widens the column (when it's the library's alone),
+  # the top one moves the line between it and the playlist.
+  let grip = rect(r.x, r.y, PlaylistGripW, r.h)
+  if ui.hover(grip) and ui.pressed():
+    ui.activeId = "plresize"
+    a.plResizeFrom = (ui.mouse.x, r.w)
+    ui.consumeClick()
+  if not a.cfg.showPlaylist:  # else the playlist follows the drag
+    if ui.activeId == "plresize":
+      let (x0, w0) = a.plResizeFrom
+      a.cfg.playlistWidth = clamp(w0 + x0 - ui.mouse.x, PlaylistMinWidth,
+        max(PlaylistMinWidth, ui.size.x - MinWindow.x.float32 / 2))
+  let split = rect(r.x, r.y - 2, r.w, LibrarySplitGrip)
+  if under:
+    ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
+    if ui.hover(split) and ui.pressed():
+      ui.activeId = "libsplit"
+      a.libSplitFrom = (ui.mouse.y, r.h)
+      ui.consumeClick()
+    if ui.activeId == "libsplit":
+      let (y0, h0) = a.libSplitFrom
+      a.cfg.libraryHeight = h0 + y0 - ui.mouse.y  # clamped by the layout
+      if ui.released(): a.cfg.save()
+  a.libOverEdge = ui.hover(grip) or (under and ui.hover(split))
+
+  # Header.
+  let header = rect(r.x, r.y, r.w, 30)
+  ui.icon("library16", vec2(r.x + 18, header.y + 15), colAccent)
+  a.refreshLibraryRows()
+  let titleW = r.w - 32 - 60
+  var title = "Library (" & $a.libRows.len & ")"
+  if ui.textSize(title).x > titleW: title = "(" & $a.libRows.len & ")"
+  ui.textIn(ui.ellipsize(title, titleW), rect(r.x + 32, header.y, titleW, 30), colText)
+  if ui.iconButton("lib-rescan", rect(r.x + r.w - 56, header.y + 3, 24, 24), "refresh16",
+      "Rescan the libraries", enabled = a.cfg.libraries.len > 0 and not ix.scanning):
+    ix.activate()
+    ix.rescan()
+  if ui.iconButton("lib-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", a.closeTip(kaLibrary)):
+    a.setLibraryShown(false)
+    return
+  ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
+
+  # The search, with its suggestions.
+  let bar = rect(r.x + 1, header.y + 30, r.w - 1, LibrarySearchH)
+  let field = rect(bar.x + 26, bar.y + 3, bar.w - 58, 24)
+  ui.icon("search16", vec2(bar.x + 14, bar.y + bar.h / 2), colTextDim)
+  # The clear button, at the field's end; the field keeps the keyboard so a
+  # new search can be typed straight away.
+  let clearTip =
+    if a.cfg.libraryShown.len == 0: "Clear the search (Esc)"
+    elif a.libSearchIsLibraryOnly: "Clear the search, back to All (Esc)"
+    else: "Clear the search to in:" & a.cfg.libraryShown & " (Esc again: All)"
+  if ui.iconButton("lib-search-clear", rect(field.x + field.w + 2, field.y, 24, 24), "close16",
+      clearTip, enabled = a.cfg.librarySearch.len > 0):
+    a.clearLibrarySearch()
+    a.libFocused = true
+    a.libArrows = false
+    a.libCatKeys = false
+    a.libSuggestKeep = a.cfg.librarySearch.len
+  # The suggestions hang under the field, over the list; a click on one is
+  # taken before the field sees it (it would end the typing).
+  let sugg = if a.libSuggestOff: @[] else: a.libSuggestions
+  a.libSuggestBox = Rect()
+  if sugg.len > 0:
+    let shown = min(sugg.len, 8)
+    a.libSuggest = clamp(a.libSuggest, 0, sugg.high)
+    let top = clamp(a.libSuggest - shown + 1, 0, max(0, sugg.len - shown))
+    let box = rect(field.x, field.y + field.h + 2, field.w, shown.float32 * 22 + 4)
+    a.libSuggestBox = box
+    ui.sk.pushLayer(PopupsLayer)
+    ui.rect(rect(box.x + 2, box.y + 3, box.w, box.h), colShadow)
+    ui.rect(box, colPopup)
+    ui.border(box, colBorder)
+    for k in 0 ..< shown:
+      let s = sugg[top + k]
+      let row = rect(box.x + 2, box.y + 2 + k.float32 * 22, box.w - 4, 22)
+      let hov = ui.hover(row)
+      if top + k == a.libSuggest or hov: ui.rect(row, if hov: colHover else: colPressed)
+      ui.textIn(ui.ellipsize(s.label, row.w - 16), rect(row.x + 8, row.y, row.w - 16, 22), colText)
+      if hov and ui.pressed():
+        ui.consumeClick()
+        a.libTakeSuggestion(s)
+    ui.sk.popLayer()
+    if ui.mouse.inside(box) and ui.pressed(): ui.consumeClick()
+  let before = a.cfg.librarySearch
+  let ev = ui.textField("lib-search", field, a.cfg.librarySearch,
+    "Search: words, artist:x, in:Music, size biggerthan:1GB, ...")
+  if a.libSuggestKeep >= -2 and a.libSuggestKeep != -1:
+    # A suggestion taken, or Escape: the field keeps the keyboard.
+    ui.focusId = "lib-search"
+    if a.libSuggestKeep >= 0:
+      ui.caret = a.libSuggestKeep
+      ui.selAnchor = a.libSuggestKeep
+    a.libSuggestKeep = -1
+  if eeFocused in ev:
+    a.libFocused = true
+    a.libArrows = false
+    a.libCatKeys = false
+  if a.cfg.librarySearch != before:
+    a.libSuggestOff = false
+    a.libSuggest = 0
+    a.libScroll = 0
+  if eeCommitted in ev: a.cfg.save()
+  ui.tip(field, "Tags between commas: in:Library, exclude:Library, hidden, format:mkv, " &
+    "filename contains:x, size biggerthan:1GB, artist:x...")
+  ui.rect(rect(bar.x, bar.y + bar.h - 1, bar.w, 1), colBorder)
+
+  let body = rect(r.x + 1, bar.y + bar.h, r.w - 1, r.h - (bar.y + bar.h - r.y) - LibraryStatusH)
+  # The libraries' column; its right edge resizes it.
+  let most = max(LibraryListMinW, body.w - LibraryListRest)
+  let cw = clamp(round(a.cfg.libraryListWidth).float32, LibraryListMinW, most)
+  let colEdge = rect(body.x + cw - 2, body.y, 5, body.h)
+  let overColEdge = ui.hover(colEdge) and not ui.hover(grip)
+  if overColEdge and ui.pressed():
+    ui.activeId = "libcol"
+    a.libCatFrom = (ui.mouse.x, cw)
+    ui.consumeClick()
+  if ui.activeId == "libcol":
+    let (x0, w0) = a.libCatFrom
+    a.cfg.libraryListWidth = clamp(w0 + ui.mouse.x - x0, LibraryListMinW, most)
+    if ui.released(): a.cfg.save()
+  a.libOverEdge = a.libOverEdge or overColEdge
+  let cats = rect(body.x, body.y, cw, body.h)
+  ui.rect(cats, colPanel)
+  ui.rect(rect(cats.x + cats.w, body.y, 1, body.h), colBorder)
+  a.libCatRect = cats
+  let names = a.libColumnNames
+  if a.libraryIndexOf(a.cfg.libraryShown) < 0: a.cfg.libraryShown = ""
+  let catRowH = 24'f32
+  let catMax = max(0'f32, names.len.float32 * catRowH - cats.h)
+  if ui.hover(cats) and ui.scroll() != 0:
+    a.libCatScroll += ui.wheelNotches * catRowH
+    ui.scrollConsumed = true
+  if a.libCatReveal:  # picked or renamed from the keyboard: into view
+    a.libCatReveal = false
+    let ty = max(0, names.find(a.cfg.libraryShown)).float32 * catRowH
+    a.libCatScroll = clamp(a.libCatScroll, ty + catRowH - cats.h, ty)
+  a.libCatScroll = clamp(a.libCatScroll, 0, catMax)
+  # A library being renamed (F2) that's gone, or with a window over the panel: left as it was.
+  if a.libRename.len > 0 and (a.libraryIndexOf(a.libRename) < 0 or a.overlay != ovNone):
+    a.libRename = ""
+    if ui.focusId == "lib-rename": ui.focusId = ""
+  ui.sk.pushClipRect(cats)
+  var onCat = false
+  for k, name in names:
+    let row = rect(cats.x, cats.y + k.float32 * catRowH - a.libCatScroll, cats.w, catRowH)
+    # Out of view, but not the one being renamed: its field keeps the keyboard.
+    if (row.y + catRowH < cats.y or row.y > cats.y + cats.h) and
+        (name.len == 0 or name != a.libRename): continue
+    let i = a.libraryIndexOf(name)
+    if name.len > 0 and name == a.libRename:
+      # F2: its name typed over; Enter or a click elsewhere keeps it, Escape doesn't.
+      let ev = ui.textField("lib-rename", rect(row.x + 3, row.y + 1, row.w - 6, row.h - 2), a.libRenameText)
+      if eeCommitted in ev: a.endLibRename()
+      continue
+    let hov = ui.hover(row) and ui.hover(cats) and not overColEdge
+    let hidden = i >= 0 and a.cfg.libraries[i].hidden
+    if name == a.cfg.libraryShown: ui.rect(row, colPressed)
+    elif hov: ui.rect(row, colHover)
+    let label = if name.len == 0: "All" else: name
+    let fg = if name == a.cfg.libraryShown: colAccent elif hidden: colTextDim else: colText
+    ui.textIn(ui.ellipsize(label, row.w - 14), rect(row.x + 8, row.y, row.w - 10, catRowH), fg)
+    if hov:
+      onCat = true
+      if i >= 0:
+        let l = a.cfg.libraries[i]
+        ui.tip(row, l.name & (if hidden: " (hidden)" else: "") & ": " &
+          (if l.paths.len == 0: "no folders yet" else: ui.ellipsize(
+            l.paths.mapIt(it.lastPathPart).join(", "), 400, FontSmall)) & ". Right-click to edit or hide")
+      else: ui.tip(row, "Every library" & (if a.cfg.libraries.anyIt(it.hidden): " not hidden" else: ""))
+      if ui.pressed():
+        ui.consumeClick()
+        a.libPick(name)
+      if ui.released(MouseRight):
+        a.libCtx = lcLibrary
+        a.libCtxName = name
+        a.ctxMenu = cmLibrary
+        a.menus.openContext(ui.mouse)
+  ui.sk.popClipRect()
+  if not onCat and ui.hover(cats) and not overColEdge and ui.released(MouseRight):
+    a.libCtx = lcBlank
+    a.ctxMenu = cmLibrary
+    a.menus.openContext(ui.mouse)
+
+  # The files: column headers as the playlist's (a click sorts, a drag moves
+  # the column, its right edge resizes it, a double-click there fits it),
+  # then the rows.
+  let fx = cats.x + cats.w + 1
+  let fw = body.x + body.w - fx
+  let hdr = rect(fx, body.y, fw, PlaylistHeaderH)
+  let list = rect(fx, hdr.y + hdr.h, fw, body.h - hdr.h)
+  let rowH = PlaylistRowH
+  let n = a.libView.len
+  let maxScroll = max(0'f32, n.float32 * rowH - list.h)
+  let barW = if maxScroll > 0: LibraryBarW else: 0'f32
+  let rows = rect(list.x, list.y, list.w - barW, list.h)
+  let sortKey = try: parseEnum[PlaylistField](a.cfg.librarySort) except ValueError: pfName
+  let cells = a.layoutCells(rect(hdr.x, hdr.y, hdr.w - barW, hdr.h), a.cfg.libraryColumns,
+    a.cfg.libraryColumnWidths, a.cfg.libraryShowMillis and not a.libDurSeconds)
+  let sized = a.cfg.libraryColumnWidths
+  let first = int(a.libScroll / rowH)
+  let last = min(n, first + int(list.h / rowH) + 2) - 1
+  let dragging = ui.activeId == "libcolumn"
+  var edge = -1
+  if not ui.hover(grip) and not overColEdge:
+    for i, (cr, f) in cells:
+      if ui.hover(rect(cr.x + cr.w - PlaylistColumnGrip, cr.y, PlaylistColumnGrip * 2, cr.h)): edge = i
+  a.libOverEdge = a.libOverEdge or edge >= 0
+  if edge >= 0 and w.buttonPressed[DoubleClick]:  # on the press or, on X11, its release
+    ui.consumeClick()
+    var shownIds: seq[int32]
+    for i in first .. last:
+      if a.libView[i] >= 0: shownIds.add a.libView[i]
+    a.libFitColumn(cells, edge, shownIds)
+  elif edge >= 0 and ui.pressed():
+    ui.consumeClick()
+    if edge < cells.high:  # the last column's edge doesn't move: it only fits
+      ui.activeId = "libwidth"
+      a.libWidthFrom = startColumnDrag(sized, cells, edge, ui.mouse.x)
+  if ui.activeId == "libwidth":
+    dragColumn(a.cfg.libraryColumnWidths, cells, a.libWidthFrom, ui.mouse.x)
+    if ui.released() and a.libWidthFrom.moved: a.cfg.save()
+  ui.rect(hdr, colPanelRaised)
+  ui.sk.pushClipRect(hdr)
+  for i, (cr, f) in cells:
+    let label = PlaylistFields[f].label
+    if dragging:
+      if i == a.libColumnFrom.index: ui.rect(cr, colPressed)
+    elif edge >= 0:
+      if edge == i: ui.tip(cr, "Drag to resize the column. Double-click to fit it to the rows shown")
+    elif ui.hover(cr) and not ui.hover(grip) and not overColEdge:
+      ui.rect(cr, colHover)
+      ui.tip(cr, &"Sort by {label} (again: the other way). Drag to move the column")
+      if ui.pressed():
+        ui.consumeClick()
+        ui.activeId = "libcolumn"
+        a.libColumnFrom = (i, ui.mouse.x, false)
+    if i > 0: ui.rect(rect(cr.x, cr.y + 4, 1, cr.h - 8), colBorder)
+    let sorted = f == sortKey
+    # The sorted column shows which way, at its right end, its title left of it.
+    let tr = if sorted: rect(cr.x, cr.y, max(0'f32, cr.w - 14), cr.h) else: cr
+    a.playlistCell(f.columnTitle, tr, f, i == 0, if sorted: colText else: colTextDim, FontSmall)
+    if sorted:
+      ui.icon(if a.cfg.librarySortDescending: "chevdown16" else: "chevup16",
+        vec2(cr.x + cr.w - 10, cr.y + cr.h / 2), colTextDim)
+  if ui.activeId == "libcolumn":
+    if abs(ui.mouse.x - a.libColumnFrom.x) >= PlaylistColumnDrag: a.libColumnFrom.moved = true
+    # The gap the column would drop into: past every column whose middle it passed.
+    let to = cells.countIt(ui.mouse.x > it[0].x + it[0].w / 2)
+    if a.libColumnFrom.moved:
+      let gap = if to < cells.len: cells[to][0].x else: cells[^1][0].x + cells[^1][0].w
+      ui.rect(rect(clamp(gap - 1, hdr.x, hdr.x + hdr.w - 2), hdr.y, 2, hdr.h), colAccent)
+    if ui.released():
+      let from0 = a.libColumnFrom.index
+      if from0 < cells.len:
+        let f = cells[from0][1]
+        if not a.libColumnFrom.moved:
+          if sortKey == f: a.cfg.librarySortDescending = not a.cfg.librarySortDescending
+          else: (a.cfg.librarySort, a.cfg.librarySortDescending) = ($f, false)
+        else:
+          moveColumn(a.cfg.libraryColumnOrder, a.cfg.libraryColumns, f,
+            if to > from0: to - 1 else: to)  # the menu follows
+        a.cfg.save()
+  ui.sk.popClipRect()
+  ui.rect(rect(hdr.x, hdr.y + hdr.h - 1, hdr.w, 1), colBorder)
+  if ui.hover(hdr) and ui.released(MouseRight):
+    a.libCtxColumn = cells[0][1]
+    for (cr, f) in cells:
+      if ui.hover(cr): a.libCtxColumn = f
+    a.libCtx = lcHeader
+    a.ctxMenu = cmLibrary
+    a.menus.openContext(ui.mouse)
+
+  a.libListRect = list
+  if n == 0:
+    let msg =
+      if a.cfg.libraries.len == 0: "No libraries. Right-click on the left to create one"
+      elif not ix.active or ix.scanning: "Scanning..."
+      elif a.cfg.librarySearch.strip.len > 0: "Nothing found"
+      else: "No media found. Right-click a library to edit it"
+    ui.textIn(ui.ellipsize(msg, list.w - 16, FontSmall), list, colTextDim, FontSmall, h = CenterAlign)
+  if a.libReveal:
+    let row = a.libCursorRow
+    if row >= 0:
+      let y = row.float32 * rowH
+      a.libScroll = clamp(a.libScroll, y + rowH - list.h, y)
+    a.libReveal = false
+  if ui.hover(list) and ui.scroll() != 0:
+    a.libScroll += ui.wheelNotches * rowH * PlaylistWheelRows
+    ui.scrollConsumed = true
+  a.libScroll = clamp(a.libScroll, 0, maxScroll)
+  if barW > 0:
+    # A plain thumb: drag it or click the track.
+    let track = rect(rows.x + rows.w + 3, list.y + 3, barW - 6, list.h - 6)
+    let thumbH = max(28'f32, track.h * list.h / (n.float32 * rowH)).min(track.h)
+    let span = track.h - thumbH
+    if ui.hover(rect(rows.x + rows.w, list.y, barW, list.h)) and ui.pressed():
+      ui.consumeClick()
+      ui.activeId = "libscroll"
+      let ty = track.y + span * a.libScroll / maxScroll
+      if not (ui.mouse.y >= ty and ui.mouse.y <= ty + thumbH) and span > 0:
+        a.libScroll = clamp((ui.mouse.y - track.y - thumbH / 2) / span * maxScroll, 0, maxScroll)
+      a.libThumbFrom = (ui.mouse.y, a.libScroll)
+    if ui.activeId == "libscroll" and span > 0:
+      let (y0, s0) = a.libThumbFrom
+      a.libScroll = clamp(s0 + (ui.mouse.y - y0) / span * maxScroll, 0, maxScroll)
+    let ty = track.y + span * a.libScroll / maxScroll
+    ui.pill(rect(track.x, track.y, track.w, track.h), colPanelRaised, colPanelRaised)
+    let lit = ui.activeId == "libscroll" or ui.hover(rect(rows.x + rows.w, list.y, barW, list.h))
+    ui.pill(rect(track.x, ty, track.w, thumbH), if lit: colAccentHover else: colTextDisabled,
+      if lit: colAccent else: colTextDisabled)
+  ui.sk.pushClipRect(rows)
+  let first2 = int(a.libScroll / rowH)
+  let last2 = min(n, first2 + int(list.h / rowH) + 2) - 1
+  var visible: seq[int]
+  let playing = if a.player.loaded: a.player.path else: ""
+  var toggle = ""  # the folder header clicked
+  var toggled = false
+  for i in first2 .. last2:
+    let id = a.libView[i]
+    let row = rect(rows.x, rows.y + i.float32 * rowH - a.libScroll, rows.w, rowH)
+    if id < 0:
+      # A folder's header (Group by Folder): a click collapses or expands it.
+      let g = a.libGroups[-id - 1]
+      let shut = a.libGroupCollapsed(g.label)
+      let hovH = ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and
+        not ui.mouse.inside(a.libSuggestBox) and ui.activeId != "librow"
+      ui.rect(row, if hovH: colHover else: colPanelRaised)
+      ui.icon(if shut: "arrow16" else: "expand16", vec2(row.x + 12, row.y + rowH / 2), colTextDim)
+      ui.icon("folder16", vec2(row.x + 30, row.y + rowH / 2), colTextDim)
+      let count = $g.count
+      let cw = ui.textSize(count, FontSmall).x + 12
+      ui.textIn(ui.ellipsize(g.label, row.w - 50 - cw, FontSmall),
+        rect(row.x + 44, row.y, row.w - 48 - cw, rowH), colTextDim, FontSmall)
+      ui.textIn(count, rect(row.x + row.w - cw, row.y, cw - 8, rowH), colTextDisabled, FontSmall,
+        h = RightAlign)
+      if hovH:
+        ui.tip(row, g.label & ": " & countLabel(g.count, "file") &
+          (if shut: ". Click to expand" else: ". Click to collapse"))
+        if ui.pressed():
+          ui.consumeClick()
+          a.libFocused = true
+          a.libArrows = true
+          a.libCatKeys = false
+          if a.ui.focusId == "lib-search": a.ui.focusId = ""
+          (toggle, toggled) = (g.label, true)  # after the loop: the rows it draws change
+      continue
+    visible.add id.int
+    let f = ix.files[id].addr
+    let hov = ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and
+      not ui.mouse.inside(a.libSuggestBox) and not (ui.activeId == "librow" and a.libDrag.moved)
+    let sel = f.path in a.libSel
+    if sel: ui.rect(row, colPressed)
+    elif hov: ui.rect(row, colHover)
+    if a.libArrows and f.path == a.libCursor: ui.border(row, colAccent)  # where Up/Down go from
+    let cur = f.path == playing
+    if cur: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
+    for j, (cr, fld) in cells:
+      a.playlistCell(a.libCellText(f[], fld), rect(cr.x, row.y, cr.w, rowH), fld, j == 0,
+        if cur: colAccent elif fld.cellFont == FontMain: colText else: colTextDim, fld.cellFont)
+    if hov:
+      var facts = @[f.path]
+      if f.title.len > 0:
+        facts.add f.title & (if f.artist.len > 0: " - " & f.artist else: "")
+      if f.width > 0: facts.add &"{f.width}×{f.height}"
+      if f.bitrate > 0: facts.add fmtBitrate(f.bitrate)
+      facts.add fmtBytes(f.size.float)
+      ui.tip(row, facts.join("  ·  "))
+    if hov and ui.pressed():
+      ui.consumeClick()
+      a.libFocused = true
+      a.libArrows = true
+      a.libCatKeys = false
+      if a.ui.focusId == "lib-search": a.ui.focusId = ""
+      if w.ctrl:
+        if a.libSel.containsOrIncl(f.path): a.libSel.excl f.path
+        a.libAnchor = f.path
+        a.libCursor = f.path
+      elif w.shiftDown: a.libSelectRow(i, true)
+      elif not sel: a.libSelectRow(i)
+      else: a.libCursor = f.path
+      # A press on a selected row may drag the selection to the playlist.
+      if f.path in a.libSel:
+        ui.activeId = "librow"
+        a.libDrag = (ui.mouse.y, false, i, not (w.ctrl or w.shiftDown) and sel)
+    if hov and w.buttonPressed[DoubleClick]:
+      a.libPlay(@[f.path])
+    if hov and ui.pressed(MouseRight):
+      a.libFocused = true
+      if not sel: a.libSelectRow(i)
+  ui.sk.popClipRect()
+  if toggled: a.libToggleGroup(toggle)
+  if ui.hover(list) and ui.released(MouseRight):
+    a.libCtx = lcFiles
+    a.ctxMenu = cmLibrary
+    a.menus.openContext(ui.mouse)
+  if ui.hover(list) and ui.pressed() and not ui.clickConsumed:
+    a.libFocused = true
+    a.libArrows = true
+    a.libCatKeys = false
+  # Rows dragged onto the playlist go in where they're dropped.
+  if ui.activeId == "librow":
+    if (ui.mouse.y - a.libDrag.y).abs >= PlaylistRowDrag or not ui.mouse.inside(list):
+      a.libDrag.moved = true
+    let pl = a.plListRect
+    let overPl = a.cfg.showPlaylist and pl.w > 0 and ui.mouse.inside(pl) and not a.editLocked
+    var gap = 0
+    if a.libDrag.moved and overPl:
+      gap = clamp(int((ui.mouse.y - pl.y + a.plScroll) / PlaylistRowH + 0.5), 0, a.playlist.len)
+      let y = clamp(pl.y + gap.float32 * PlaylistRowH - a.plScroll - 1, pl.y, pl.y + pl.h - 2)
+      ui.sk.pushLayer(PopupsLayer)
+      ui.rect(rect(pl.x, y, pl.w, 2), colAccent)
+      ui.sk.popLayer()
+    if ui.released():
+      if a.libDrag.moved and overPl: a.libAddToPlaylist(a.libSelectedPaths, gap)
+      elif not a.libDrag.moved and a.libDrag.reselect: a.libSelectRow(a.libDrag.row)
+  a.libVisible = visible
+
+  # The bottom line.
+  let st = rect(r.x + 1, r.y + r.h - LibraryStatusH, r.w - 1, LibraryStatusH)
+  ui.rect(rect(st.x, st.y, st.w, 1), colBorder)
+  let (text, col) = a.libraryStatus
+  ui.textIn(ui.ellipsize(text, st.w - 16, FontSmall), rect(st.x + 8, st.y, st.w - 16, st.h), col, FontSmall)
+
+
 proc runLogPanel(a: App, r: Rect) =
   ## The Run menu's command lines and what they printed, newest at the bottom.
   let ui = a.ui
   ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, RunLogHeaderH), colPanelRaised)  # the header: lighter than the body
   ui.rect(rect(r.x, r.y + r.h - 1, r.w, 1), colBorder)
   # Dragging the bottom edge resizes the panel; the video frame takes the rest.
   let grip = rect(r.x, r.y + r.h - RunLogGripH, r.w, RunLogGripH)
@@ -11782,6 +14176,121 @@ proc endDialogDraw(a: App, w: Window, sk: Silky, size: IVec2) =
     sk.endOffscreen()
     w.putPixels(size, offscreenPixels())
 
+proc libStartDir(a: App, path: string): string =
+  ## Where a file dialog for a library path starts: the path's folder once
+  ## it was found there, else home (the dialog checks the folder it's
+  ## given, which a silent share would hold up).
+  let r = a.library.roots.getOrDefault(path.normPath)
+  if path.len == 0 or r.state != rsReady: getHomeDir()
+  elif r.isFile: path.normPath.parentDir
+  else: path.normPath
+
+proc libAskFolder(a: App, purpose, title: string) =
+  a.ask(dkOpenDir, purpose, title, a.libStartDir(a.optionsDlg.libItemPath(a.cfg)))
+
+proc libAskFiles(a: App, purpose, title: string) =
+  let start = a.optionsDlg.libItemPath(a.cfg)
+  let lib = a.optionsDlg.selectedLibrary(a.cfg)
+  let exts = if lib >= 0: a.cfg.libraries[lib].libraryExts else: MediaExtensions
+  let dir = a.libStartDir(start)
+  a.ask(if purpose == "libchange": dkOpenFile else: dkOpenFiles, purpose, title, dir,
+    exts = exts, filterName = "Media files")
+
+proc libAskChange(a: App) =
+  ## Change...: another folder, or another file, for the selected one.
+  let path = a.optionsDlg.libItemPath(a.cfg)
+  if path.len == 0: return
+  if a.optionsDlg.libItemInfo(path).isFile: a.libAskFiles("libchange", "Change File")
+  else: a.libAskFolder("libchange", "Change Folder")
+
+proc buildOptMenu(a: App): MenuNode =
+  ## Options > Libraries' menu on its folders and files (or under them).
+  result = newMenuRoot()
+  let d = a.optionsDlg
+  let lib = d.selectedLibrary(a.cfg)
+  if lib < 0 or d.page != opLibraries: return
+  let n = a.cfg.libraries[lib].paths.len
+  let j = d.libItem
+  if j in 0 ..< n:
+    let move = proc (m: ItemMove) = a.optionsDlg.libMoveItem(a.cfg, m)
+    result.item("Change...", "F2", action = proc () = a.libAskChange())
+    result.sep()
+    result.item("Move To Top", "Ctrl+Shift+Home", enabled = j > 0, action = bindAct(move, imTop))
+    result.item("Move Up", "Ctrl+Shift+Up", enabled = j > 0, action = bindAct(move, imUp))
+    result.item("Move Down", "Ctrl+Shift+Down", enabled = j < n - 1, action = bindAct(move, imDown))
+    result.item("Move To Bottom", "Ctrl+Shift+End", enabled = j < n - 1, action = bindAct(move, imBottom))
+    result.sep()
+    result.item("Remove", "Delete", action = proc () = a.optionsDlg.libRemoveItem(a.cfg))
+  else:
+    result.item("Add Folder...", "Insert", action = proc () = a.libAskFolder("libaddfolder", "Add Folder"))
+    result.item("Add Files...", action = proc () = a.libAskFiles("libaddfiles", "Add Files"))
+
+proc openTypes(a: App) =
+  ## Options > Libraries > Custom...: the selected library's types, in a
+  ## window over Options.
+  let lib = a.optionsDlg.selectedLibrary(a.cfg)
+  if lib < 0: return
+  a.optMenus.close()
+  let l = a.cfg.libraries[lib]
+  if a.typesDlg == nil: a.typesDlg = TypesDialog()
+  if a.typesWin == nil:
+    (a.typesWin, a.typesSk, a.typesUi) = a.newDialogWindow("Custom File Types", TypesSize,
+      parent = a.optWin)
+  var mimes = initTable[string, seq[string]]()
+  for it in loadAssocItems(): mimes[it.ext] = it.mimes
+  # Starting from the types the library lists now, whichever kind it is.
+  a.typesDlg.open(lib, l.name, l.libraryExts, mimes)
+  a.typesBefore = (l.kind, l.exts)
+  a.typesUi.focusId = ""
+  let size = a.px(TypesSize)
+  let pos = a.optWin.framePos + (a.optWin.size - size) div 2
+  a.typesWin.placeDialog(pos, size)
+  a.typesWin.visible = true
+  a.typesWin.activate()
+
+proc closeTypes(a: App, ok: bool) =
+  ## OK: the library lists the types checked, as Custom.
+  let d = a.typesDlg
+  if ok and d.library in 0 ..< a.cfg.libraries.len:
+    a.cfg.libraries[d.library].kind = lkCustom
+    a.cfg.libraries[d.library].exts = d.chosen
+  a.typesUi.focusId = ""
+  a.typesWin.visible = false
+  if a.optWin != nil and a.optWin.visible: a.optWin.activate()
+
+proc renderTypes(a: App, shot: string) =
+  ## Draws the Custom File Types window; like the others, after the main
+  ## window's swap.
+  let w = a.typesWin
+  if w == nil or not w.visible: return
+  if a.overlay != ovOptions:
+    w.visible = false
+    return
+  let ui = a.typesUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.closeTypes(false)
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  if not a.beginDialogDraw(w, a.typesSk, size): return
+  ui.beginFrame()
+  a.typesSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let action = a.typesDlg.draw(ui, rect(vec2(0, 0), ui.size))
+  ui.drawTooltip()
+  a.typesSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-types.png")
+  a.endDialogDraw(w, a.typesSk, size)
+  case action
+  of taOk: a.closeTypes(true)
+  of taCancel: a.closeTypes(false)
+  of taNone: discard
+
 proc renderOptions(a: App, shot: string) =
   ## Draws the Options window. Like the menu popups, call after the main
   ## window's swap.
@@ -11795,8 +14304,11 @@ proc renderOptions(a: App, shot: string) =
   a.applyUiScale()
   let size = w.size
   if size.x <= 0 or size.y <= 0: return
-  # A text field being edited takes Escape itself.
-  let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0 and not a.optionsDlg.searching
+  # A text field being edited takes Escape itself; the Custom... window, over
+  # it, takes everything.
+  let typesUp = a.typesWin != nil and a.typesWin.visible
+  let esc = w.buttonPressed[KeyEscape] and ui.focusId.len == 0 and not a.optionsDlg.searching and
+    not typesUp and not a.optMenus.isOpen
   if not a.beginDialogDraw(w, a.optSk, size): return  # retried next frame
   ui.beginFrame()
   a.optSk.beginUi(w, size)
@@ -11806,12 +14318,25 @@ proc renderOptions(a: App, shot: string) =
   glClear(GL_COLOR_BUFFER_BIT)
   # The Media Cache page's list follows links being saved.
   if a.optionsDlg.page == opWeb and now() - a.webInfoAt > 2: a.refreshWebInfo()
-  let action = a.optionsDlg.draw(ui, a.cfg, a.cfgBefore, rect(vec2(0, 0), ui.size))
-  ui.drawTooltip()
+  # Libraries: the paths are checked (and walked) to say which are missing.
+  if a.optionsDlg.page == opLibraries: a.library.activate()
+  if typesUp:
+    if ui.pressed() or ui.pressed(MouseRight): a.typesWin.activate()
+    ui.captured = true
+  else: a.optMenus.captureInput(ui)
+  let action = if typesUp: (discard a.optionsDlg.draw(ui, a.cfg, a.cfgBefore, rect(vec2(0, 0), ui.size)); oaNone)
+               else: a.optionsDlg.draw(ui, a.cfg, a.cfgBefore, rect(vec2(0, 0), ui.size))
+  ui.captured = false
+  if not typesUp: a.optMenus.updatePopups(ui, newMenuRoot(), a.buildOptMenu())
+  if not a.optMenus.isOpen: ui.drawTooltip()
   a.optSk.endUi()
   ui.endFrame()
   if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-options.png")
   a.endDialogDraw(w, a.optSk, size)
+  a.optMenus.renderPopups(ui, if shot.len == 0: nil else:
+    proc (level: int, image: Image) =
+      image.writeFile(shot.changeFileExt("") & &"-optmenu{level}.png"),
+    main = a.window)
   case action
   of oaOk: a.closeOptions(true)
   of oaCancel: a.closeOptions(false)
@@ -11841,6 +14366,11 @@ proc renderOptions(a: App, shot: string) =
     a.ask(dkOpenFile, "optsoundfont", "SoundFont",
       if f.len > 0 and fileExists(f): f.parentDir else: a.startDir,
       exts = @["sf2", "sf3"], filterName = "SoundFonts")
+  of prLibAddFolder: a.libAskFolder("libaddfolder", "Add Folder")
+  of prLibAddFiles: a.libAskFiles("libaddfiles", "Add Files")
+  of prLibChange: a.libAskChange()
+  of prLibCustom: a.openTypes()
+  of prLibContext: a.optMenus.openContext(a.optionsDlg.ctxPos)
   of prBrowseWeb:
     let d = a.cfg.webDir.expandPath
     a.ask(dkOpenDir, "optwebdir", "Media Cache Folder",
@@ -12230,6 +14760,7 @@ proc renderAvsList(a: App, shot: string) =
   a.avsMenus.captureInput(ui)
   (d.beatThreshold, d.beatSensitivity) = (a.cfg.avsBeatThreshold, a.cfg.avsBeatSensitivity)  # Options may have changed them
   let action = d.draw(ui, rect(vec2(0, 0), ui.size), a.avs)
+  if d.nudgeUntil > now(): a.dirtyUntil = max(a.dirtyUntil, d.nudgeUntil + 0.05)
   ui.captured = false
   a.avsMenus.updatePopups(ui, newMenuRoot(), a.buildAvsMenu())
   if not a.avsMenus.isOpen: ui.drawTooltip()
@@ -12253,6 +14784,7 @@ proc renderAvsList(a: App, shot: string) =
     a.cfg.avsColumnWidths = d.colWidths
     (a.cfg.avsSort, a.cfg.avsSortDescending) = (d.sortKey, d.sortDesc)
     a.cfg.avsAddSubfolders = d.subfolders
+    a.cfg.avsShowHidden = d.showHidden
     a.cfg.save()
   of aaRate:
     a.cfg.avsStarRatings = d.ratings
@@ -12657,8 +15189,14 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Confirm / cancel", "Enter / Esc"),
       ("Move by one pixel", "Arrows")]),
     ("Run log", @[("Copy selected text", "Ctrl+C")]),
-    ("Playlist (after clicking it)", @[
-      ("Select previous / next entry (pointer still over it)", "Up / Down"),
+    ("Playlist (after clicking it or Tab)", @[
+      ("Keyboard to the next / previous column or list shown", "Tab / Shift+Tab"),
+      ("Side column: show the previous / next playlist", "Up / Down"),
+      ("Side column: show the first / last playlist", "Home / End"),
+      ("Side column: on to the playlist's entries", "Enter"),
+      ("Select previous / next entry", "Up / Down"),
+      ("Play the selected entry", "Enter"),
+      ("Give the keys back to their commands (volume...)", "Esc"),
       ("Select all entries", "Ctrl+A"),
       ("Duplicate selected entries", "Ctrl+D"),
       ("Move selected entries up / down", "Ctrl+Shift+Up / Down"),
@@ -12684,12 +15222,41 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Highlight several / a range", "Ctrl+Click / Shift+Click"),
       ("Search by name, author, file name or rating", "Ctrl+F"),
       ("Search: go to the presets found", "Enter / Down"),
-      ("Clear the search, then close the window", "Esc")])]
+      ("Clear the search, then close the window", "Esc")]),
+    ("Library (after clicking it or Tab)", @[
+      ("Keyboard to the next / previous column or list shown", "Tab / Shift+Tab"),
+      ("Libraries' column: pick the previous / next library", "Up / Down"),
+      ("Libraries' column: pick All / the last library", "Home / End"),
+      ("Libraries' column: on to the library's files", "Enter"),
+      ("Libraries' column: rename the library picked (Enter keeps, Esc doesn't)", "F2"),
+      ("Select previous / next file", "Up / Down"),
+      ("Select a page up / down, first / last file", "Page Up / Page Down, Home / End"),
+      ("Extend the selection", "Shift+Up / Down"),
+      ("Play the selected files", "Enter"),
+      ("Play the selected files in a new player", "Shift+Enter"),
+      ("Select all files", "Ctrl+A"),
+      ("Search the libraries", "Ctrl+F"),
+      ("Clear the search to the library selected, then to All, then give the keys back", "Esc")]),
+    ("Library search", @[
+      ("Highlight the next / previous suggestion", "Down / Up"),
+      ("Take the suggestion", "Enter / Tab"),
+      ("Go to the files found", "Enter / Down"),
+      ("Hide suggestions, clear to the library selected, then to All, then leave", "Esc")]),
+    ("Options > Libraries", @[
+      ("Create / remove / rename library", "Insert / Delete / F2"),
+      ("Select the previous / next library or folder", "Up / Down"),
+      ("Change the selected folder or file", "F2 / Enter"),
+      ("Add a folder / remove the selected one", "Insert / Delete"),
+      ("Move it up / down", "Ctrl+Shift+Up / Down"),
+      ("Move it to the top / bottom", "Ctrl+Shift+Home / End")])]
   var view = a.keyRows("View", [
     ("Compact mode", @[kaCompact], ""),
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
-    ("Status", @[kaStatus], ""), ("Playlist", @[kaPlaylist], ""),
+    ("Status", @[kaStatus], ""),
+    ("Cycle seek bar / controls / status combinations", @[kaCycleBars], ""),
+    ("Cycle them in reverse", @[kaCycleBarsBack], ""), ("Playlist", @[kaPlaylist], ""),
     ("Find in playlist", @[kaFindPlaylist], ""),
+    ("Library", @[kaLibrary], ""), ("Search library", @[kaSearchLibrary], ""),
     ("Run log", @[kaRunLog], ""), ("Show OSD", @[kaShowOsd], ""),
     ("Full screen", @[kaFullScreen], "")])
   view.rows.add ("Leave full screen / close dialog", "Esc")
@@ -12705,7 +15272,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Highlight a page further / back", "Page Down / Page Up"),
       ("Run it (a check or radio item keeps the palette open)", "Enter / Click"),
       ("Open a submenu / go back from it", "Enter / Backspace"),
-      ("Close the palette", "Esc" & paletteKey)]),
+      ("Close the palette", "Esc" & paletteKey),
+      ("Change Visualizer: play the next / previous preset", "Down / Up"),
+      ("Change Visualizer: put back the preset it opened on", "Esc")]),
     a.keyRows("Pan, Rotate & Zoom", [
       ("Center", @[kaCenter], ""), ("Move up / down", @[kaMoveUp, kaMoveDown], "Numpad 8 / 2"),
       ("Move left / right", @[kaMoveLeft, kaMoveRight], "Numpad 4 / 6"),
@@ -12726,26 +15295,27 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Clear the selected value", "Delete"),
       ("Copy / paste the selected value", "Ctrl+C / Ctrl+V")]),
     ("Mouse", @[
-      ("Play / Pause", "Click video"), ("Full screen", "Double-click video"),
+      ("Play / Pause", "Click video"), ("Full screen", "Double-click / Middle-click video"),
       ("Move window", "Drag video or empty controls bar"), ("Context menu", "Right-click"),
       ("Context menu with the menu bar's menus", "Shift+Right-click video"),
-      ("Move playlist column", "Drag column header"),
-      ("Resize playlist column", "Drag column edge"),
-      ("Fit playlist column to the rows shown", "Double-click column edge"),
+      ("Move playlist or library column", "Drag column header"),
+      ("Resize playlist or library column", "Drag column edge"),
+      ("Fit playlist or library column to the rows shown", "Double-click column edge"),
+      ("Collapse / expand library folder", "Click folder header"),
       ("Resize window (compact mode)", "Drag window edge"),
       ("Quick cover (music, video track off)", "Drop picture on video"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
-      ("Restore zoom / panning", "Middle-click video"),
+      ("Restore zoom / panning", "Ctrl+Middle-click video"),
       ("Pan zoomed video", "Ctrl+Drag video"),
       ("Rotate frame (Shift: in Rotate steps)", "Alt+Middle-drag video"),
       ("Reset rotation", "Alt+Middle-click video"),
       ("Rotate around cursor (Shift: in steps)", "Ctrl+Alt+Middle-drag video"),
       ("360° video: look around / move window", "Drag / Ctrl+Drag video"),
       ("360° video: field of view", "Ctrl+Wheel"),
-      ("360° video: reset view", "Middle-click video"),
+      ("360° video: reset view", "Ctrl+Middle-click video"),
       ("Tracker chart: zoom at cursor", "Ctrl+Wheel"),
       ("Tracker chart: pan", "Ctrl+Drag video"),
-      ("Tracker chart: fit to the frame", "Middle-click video"),
+      ("Tracker chart: fit to the frame", "Ctrl+Middle-click video"),
       ("Toggle seek snapping", "Shift+Drag seek bar"),
       ("Repeat options", "Right-click loop button"),
       ("Select word / all in a text field", "Double / Triple-click"),
@@ -12762,6 +15332,15 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move playlist tab", "Drag tab"),
       ("New playlist", "Double-click beside tabs"),
       ("Next / previous playlist", "Wheel over tabs"),
+      ("Keyboard to the playlists' or libraries' column", "Click the column"),
+      ("Play a library file", "Double-click library file"),
+      ("Add library files to the playlist there", "Drag library file onto playlist"),
+      ("Add or remove a library file from the selection", "Ctrl+Click library"),
+      ("Select library files up to the clicked one", "Shift+Click library"),
+      ("Resize the library under the playlist", "Drag library's top edge"),
+      ("Resize the libraries' column", "Drag its right edge"),
+      ("Rename a library (Options > Libraries)", "Double-click library"),
+      ("Change a folder or file (Options > Libraries)", "Double-click it"),
       ("Select word / whole run log", "Double / Triple-click run log"),
       ("Draw on video / keep value (Run window)", "Click / Right-click rectangle icon"),
       ("Draw, resize or move the rectangle", "Drag video / its side / inside it")])]
@@ -12880,7 +15459,7 @@ proc frame(a: App) =
   let menuH = a.menuBarHeight
   let W = ui.size.x
   let H = ui.size.y
-  let plW = if a.cfg.showPlaylist: min(a.playlistWidth, W) else: 0
+  let plW = if a.sideShown: min(a.playlistWidth, W) else: 0
   # The run log spans the window's width under the menu bar (in full screen,
   # over the top of the video).
   let rlH = if a.cfg.showRunLog: min(a.runLogHeight, max(0'f32, H - menuH - bottomH)) else: 0
@@ -12896,9 +15475,20 @@ proc frame(a: App) =
     a.seekDragging or ui.activeId == "volume" or a.tkOpen or
     a.menus.contextOpen and a.ctxMenu in {cmQuality, cmReplayGain}  # over their buttons
   let bottomRect = rect(0, H - bottomH, W, bottomH)
-  let plRect =
+  # The column right of the video: the playlist, the library under it, or
+  # either alone.
+  let sideRect =
     if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
     else: rect(W - plW, top, plW, H - top - bottomH)
+  let both = a.cfg.showPlaylist and a.cfg.showLibrary
+  let libH =
+    if both: clamp(round(a.cfg.libraryHeight).float32, min(LibraryMinH, sideRect.h / 2),
+                   max(min(LibraryMinH, sideRect.h / 2), sideRect.h - LibraryPlaylistMinH))
+    elif a.cfg.showLibrary: sideRect.h
+    else: 0
+  let plRect = rect(sideRect.x, sideRect.y, sideRect.w, sideRect.h - libH)
+  let libRect = rect(sideRect.x, sideRect.y + sideRect.h - libH, sideRect.w, libH)
+  let sideOn = a.sideShown
 
   # Input capture order: overlays and a Run window rectangle being drawn >
   # menus > everything else.
@@ -12930,7 +15520,7 @@ proc frame(a: App) =
   # A Run window rectangle being drawn over the video.
   let overVideo = ui.mouse.inside(videoArea) and
     not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
-    not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
+    not (sideOn and ui.mouse.inside(sideRect)) and
     not (a.cfg.showRunLog and ui.mouse.inside(rlRect))
   if a.rectEdit != nil:
     let err = a.rectBlocker
@@ -12952,7 +15542,7 @@ proc frame(a: App) =
 
   # Video-frame mouse handling: click = play/pause, drag = move window.
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
-     not (a.cfg.showPlaylist and ui.mouse.inside(plRect)) and
+     not (sideOn and ui.mouse.inside(sideRect)) and
      not (a.cfg.showRunLog and ui.mouse.inside(rlRect)):
     if ui.pressed() and w.ctrl and a.chartShown and a.rectEdit == nil:
       a.chartPanDrag = true
@@ -12972,7 +15562,7 @@ proc frame(a: App) =
       a.ctxMenu = if a.ctxShift: cmVideoShift else: cmVideo
       a.ctxShift = false
       a.menus.openContext(ui.mouse)
-    if ui.scroll() != 0 and not (a.cfg.showPlaylist and ui.mouse.inside(plRect)):
+    if ui.scroll() != 0 and not (sideOn and ui.mouse.inside(sideRect)):
       # Unfocused, the keyboard (and Ctrl) goes elsewhere: ask the system.
       let ctrl = w.ctrl or (not w.focused and ctrlHeld())
       if ctrl and a.player.isSpherical: a.changeFov(ui.wheelNotches)
@@ -12987,14 +15577,20 @@ proc frame(a: App) =
       elif ctrl: a.zoomAt(a.px(videoArea), ui.mouse * a.sk.uiScale, ui.wheelNotches)
       else: a.volumeStep(ui.scroll() < 0)
       ui.scrollConsumed = true
-    if ui.pressed(MouseMiddle) and a.player.isSpherical:
-      a.resetLook(); a.osd("View reset")
-    elif ui.pressed(MouseMiddle) and a.chartShown:
-      if a.chart.zoomed: a.chart.resetView(); a.osd("Zoom: fit")
-    elif ui.pressed(MouseMiddle) and w.alt:
+    # Middle-click: full screen. Alt turns the frame (Ctrl+Alt: around the
+    # cursor); Ctrl resets the 360° view, the chart's zoom or the frame's.
+    let sphereOrChart = a.player.isSpherical or a.chartShown
+    if ui.pressed(MouseMiddle) and w.alt and not sphereOrChart:
       a.beginRotate(a.px(videoArea), ui.mouse * a.sk.uiScale, w.ctrl)
-    elif ui.pressed(MouseMiddle) and (a.xf.zoom != 1 or a.xf.pan != vec2(0, 0)):
-      a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
+    elif ui.pressed(MouseMiddle) and (w.ctrl or w.alt):
+      if a.player.isSpherical:
+        a.resetLook(); a.osd("View reset")
+      elif a.chartShown:
+        if a.chart.zoomed: a.chart.resetView(); a.osd("Zoom: fit")
+      elif a.xf.zoom != 1 or a.xf.pan != vec2(0, 0):
+        a.xf.zoom = 1; a.xf.pan = vec2(0, 0); a.xfChanged("Zoom: 100%")
+    elif ui.pressed(MouseMiddle):
+      a.setFullscreen(not a.fullscreen)
   if a.rotDrag:
     if not ui.down(MouseMiddle):
       a.rotDrag = false
@@ -13031,14 +15627,34 @@ proc frame(a: App) =
   # Chrome
   # Chrome
   if w.buttonPressed[MouseLeft] or w.buttonPressed[MouseRight]:
+    # A click in a panel's column of playlists or libraries gives the
+    # keyboard to that column, elsewhere in it to its list.
     a.plFocused = a.cfg.showPlaylist and ui.mouse.inside(plRect)
-    a.plArrows = a.plFocused
-  if not (a.cfg.showPlaylist and ui.mouse.inside(plRect)): a.plArrows = false
+    a.plSideKeys = a.plFocused and a.cfg.playlistTabsSide and ui.mouse.inside(a.tabStrip)
+    a.plArrows = a.plFocused and not a.plSideKeys
+    a.libFocused = a.cfg.showLibrary and ui.mouse.inside(libRect)
+    a.libCatKeys = a.libFocused and ui.mouse.inside(a.libCatRect)
+    if not a.libFocused or a.libCatKeys: a.libArrows = false
+  if a.cfg.showLibrary and libRect.h > 0: a.libraryPanel(libRect, both)
+  else:
+    a.libListRect = Rect()
+    a.libCatRect = Rect()
+    a.libVisible.setLen 0
+    a.libOverEdge = false
   if a.cfg.showPlaylist: a.playlistPanel(plRect)
   else:
     a.plListRect = Rect()
     (a.tabStrip, a.tabRects, a.tabPlus) = (Rect(), newSeq[Rect](), Rect())
     if a.plFindOpen: a.closePlaylistFind()
+  # The list or column holding the arrow keys (until Escape) shows it at its edge.
+  if a.plArrows and a.cfg.showPlaylist and a.plListRect.w > 0:
+    ui.border(a.plListRect, colAccentDim)
+  if a.plSideKeys and a.cfg.showPlaylist and a.cfg.playlistTabsSide and a.tabStrip.w > 0:
+    ui.border(a.tabStrip, colAccentDim)
+  if a.libArrows and a.cfg.showLibrary and a.libListRect.w > 0 and ui.focusId != "lib-search":
+    ui.border(a.libListRect, colAccentDim)
+  if a.libCatKeys and a.cfg.showLibrary and a.libCatRect.w > 0 and ui.focusId != "lib-search":
+    ui.border(a.libCatRect, colAccentDim)
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
   a.tkButton = Rect()
   if bottomVisible and bottomH > 0:
@@ -13104,8 +15720,14 @@ proc frame(a: App) =
     ui.mouse.inside(videoArea) and not a.menus.isOpen and a.overlay == ovNone and
     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
-  let resize = ui.activeId in ["plresize", "plwidth", "plside"] or a.cfg.showPlaylist and
-    (ui.hover(rect(plRect.x, plRect.y, PlaylistGripW, plRect.h)) or a.plOverEdge) and
+  let resize = ui.activeId in ["plresize", "plwidth", "plside", "libcol", "libwidth"] or sideOn and
+    (ui.hover(rect(sideRect.x, sideRect.y, PlaylistGripW, sideRect.h)) or
+     (a.cfg.showPlaylist and a.plOverEdge) or
+     (a.cfg.showLibrary and a.libOverEdge and ui.activeId != "libsplit" and
+      not ui.hover(rect(libRect.x, libRect.y - 2, libRect.w, LibrarySplitGrip)))) and
+    a.overlay == ovNone and not a.menus.isOpen
+  let libSplitHover = ui.activeId == "libsplit" or both and
+    ui.hover(rect(libRect.x, libRect.y - 2, libRect.w, LibrarySplitGrip)) and
     a.overlay == ovNone and not a.menus.isOpen
   let resizeV = ui.activeId == "rlresize" or a.cfg.showRunLog and
     ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) and
@@ -13117,9 +15739,11 @@ proc frame(a: App) =
               elif edge * {weTop, weBottom} != {}: ptResizeV
               elif edge * {weTopLeft, weBottomRight} != {}: ptResizeNWSE
               elif edge != {}: ptResizeNESW
-              elif hide: ptHidden elif resize: ptResize elif resizeV: ptResizeV
+              elif hide: ptHidden elif libSplitHover: ptResizeV elif resize: ptResize
+              elif resizeV: ptResizeV
               elif overLog: ptText
               elif ui.activeId == "plcolumn" and a.plColumnFrom.moved: ptMoving
+              elif ui.activeId == "libcolumn" and a.libColumnFrom.moved: ptMoving
               else: ptArrow
   if a.rectEdit != nil and (overVideo or w.buttonDown[MouseLeft]):
     shape = case a.rectEdit.cursorAt(a.videoMap, ui.mouse)
@@ -13168,6 +15792,7 @@ proc frame(a: App) =
   a.renderSyncProps(shot)
   a.renderTagProps(shot)
   a.renderAvsList(shot)
+  a.renderTypes(shot)
   a.renderYtdlp(shot)
   a.renderEmbed(shot)
   a.renderUpdate(shot)
@@ -13206,6 +15831,26 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " prev=", a.qcPrevVid, " vid=", p.h.getStr("vid"), " allowed=", a.quickCoverAllowed,
       " video=", p.videoW, "x", p.videoH, " anim=",
       (if a.animOn: $a.anim.len & " frames " & $a.anim.w & "x" & $a.anim.h else: "-")
+  of "palrun":  # Menu>Item: a command palette item by its labels, as running it
+    var n = a.paletteRoot()
+    for label in st.args.join(" ").split('>'):
+      let i = n.children.mapIt(it.label).find(label)
+      if i < 0: (n = nil; break)
+      n = n.children[i]
+    if n == nil or n.action == nil: stderr.writeLine "palrun: no ", st.args.join(" ")
+    elif n.enabled: n.action()
+  of "palopen":  # Label: the palette shown, its top-level submenu Label open
+    a.showPalette()
+    let label = st.args.join(" ")
+    for it in a.paletteFind():
+      if it.kind == mkSub and it.label == label:
+        a.paletteOpen(it)
+        break
+  of "paldump":  # what the palette lists, in order
+    stderr.writeLine "palette ", $a.paletteFind().mapIt(it.label)
+  of "trackdump":  # the audio, video and subtitle tracks picked (0: none)
+    stderr.writeLine "tracks aid=", a.player.selectedTrack("audio"), " vid=",
+      a.player.selectedTrack("video"), " sid=", a.player.selectedTrack("sub")
   of "ctxdump":  # the open context menu's top level, or Sub>Sub's
     var n = a.buildMenu().context
     if arg.len > 0:
@@ -13244,7 +15889,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
     a.ctxMenu = cmVideo
   of "coldump":  # the shown playlist's columns and widths, its own or shared, and the shared ones
     stderr.writeLine "columns ", (if a.ownColumns: "own " else: "shared "), $a.plColumns, " ",
-      $a.plColumnWidths, " shared=", $a.cfg.playlistColumns, " ", $a.cfg.playlistColumnWidths
+      $a.plColumnWidths, " order=", $columnOrder(a.plColumnOrder, a.plColumns),
+      " shared=", $a.cfg.playlistColumns, " ", $a.cfg.playlistColumnWidths
   of "ctxaction":  # video frame context menu item by label, Sub>Item for a submenu's
     a.ctxMenu = cmVideo
     var n = a.buildMenu().context
@@ -13271,6 +15917,53 @@ proc runScriptStep(a: App, st: ScriptStep) =
       for m in n.children:
         if m.label == "Video Track": stderr.writeLine "  menu ", $m.children.mapIt((it.label, it.checked))
   of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
+  of "libshow": a.setLibraryShown(arg != "0")  # 1 shows the Library panel, 0 hides it
+  of "libdump":  # the libraries and their paths' states, the list, the selection, the status
+    let ix = a.library
+    for l in a.cfg.libraries:
+      stderr.writeLine "library ", l.name, (if l.hidden: " [hidden]" else: ""), " ", $l.kind,
+        (if l.kind == lkCustom: " " & $l.exts else: ""), " ",
+        $l.paths.mapIt(it & "=" & $ix.rootState(it))
+    a.refreshLibraryRows(force = true)
+    stderr.writeLine "libview shown=", (if a.cfg.libraryShown.len == 0: "All" else: a.cfg.libraryShown),
+      " search=\"", a.cfg.librarySearch, "\" sort=", a.cfg.librarySort,
+      (if a.cfg.librarySortDescending: " desc" else: ""), " rows=", a.libRows.len,
+      " files=", ix.files.len, " scanning=", ix.scanning, " unread=", ix.unread,
+      " workers=", workerCount(), " status=\"", a.libraryStatus.text, "\""
+    stderr.writeLine "librows ", $a.libRows[0 ..< min(a.libRows.len, 30)].mapIt(
+      ix.files[it].path.extractFilename & (if ix.files[it].probed: "" else: "?"))
+    stderr.writeLine "libcols ", $a.cfg.libraryColumns, " ", $a.cfg.libraryColumnWidths,
+      " groups=", $a.libGroups
+    stderr.writeLine "libsel ", $a.libSelectedPaths.mapIt(it.extractFilename), " cursor=",
+      a.libCursor.extractFilename, " list=", (a.libListRect.x.int, a.libListRect.y.int,
+      a.libListRect.w.int, a.libListRect.h.int), " height=", a.cfg.libraryHeight.int
+  of "libsearch": a.cfg.librarySearch = arg  # the search's text
+  of "libpick": a.libShow(if arg == "All": "" else: arg)  # the library listed, its in: tag in the search
+  of "libselect": a.libSelectRow(parseInt(arg))  # selects row i
+  of "libctx", "libaction":  # ctx [label]: lib:NAME, blank, files or header; lists its menu or runs label
+    let c = st.args[0]
+    a.libCtx = if c.startsWith("lib"): lcLibrary elif c == "blank": lcBlank
+               elif c == "files": lcFiles else: lcHeader
+    if c.startsWith("lib:"): a.libCtxName = c[4 .. ^1]
+    let m = a.libraryMenu()
+    let label = st.args[1 .. ^1].join(" ")
+    for n in m.children:
+      if st.cmd == "libctx" and n.kind != mkSeparator:
+        stderr.writeLine "libmenu ", n.label, (if n.enabled: "" else: " [off]"),
+          (if n.checked: " [x]" else: "")
+      elif n.label == label and n.enabled and n.action != nil: n.action()
+  of "optlib": a.editLibraries(arg)  # Options > Libraries with that library selected
+  of "optlibnew": a.editLibraries(create = true)
+  of "optlibitem": a.optionsDlg.libItem = parseInt(arg)  # selects its folder or file i
+  of "optlibadd": a.optionsDlg.libAddPaths(a.cfg, st.args)  # paths, as Add Folder... would
+  of "optlibctx", "optlibaction":  # [label]: its folders' menu, listed or an item run
+    for n in a.buildOptMenu().children:
+      if st.cmd == "optlibctx" and n.kind != mkSeparator:
+        stderr.writeLine "optlibmenu ", n.label, (if n.enabled: "" else: " [off]")
+      elif n.label == arg and n.enabled and n.action != nil: n.action()
+  of "optlibmenu": a.optMenus.openContext(vec2(parseFloat(st.args[0]), parseFloat(st.args[1])))
+  of "libtypes": a.openTypes()  # Custom... for the library selected in Options
+  of "libtypesclose": a.closeTypes(arg == "ok")
   of "tabdump":  # every playlist: shown *, playing >, its entries and the queue
     for i, t in a.tabs:
       let e = a.tabEntries(i)
@@ -13304,6 +15997,11 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "plautosave": a.setPlaylistAutosave(arg == "on")  # the playlist's Autosave checkbox
   of "plfiledump": stderr.writeLine "plfile ", a.plFile, " autosave=", a.playlistAutosaves,
     " writable=", a.plFileWritable, " online=", a.plOnline
+  of "panelsdump":  # which panel has the keyboard (Tab, Escape), its cursor, the volume
+    stderr.writeLine "panels pl=", a.plFocused, "/", a.plArrows, " lib=", a.libFocused, "/",
+      a.libArrows, " plsel=", a.plSelected, " libcur=", a.libCursorRow, " playing=", a.plIndex, " vol=", a.player.volume,
+      " side=", a.plSideKeys, " cat=", a.libCatKeys, " tab=", a.tabView, " shown=", a.cfg.libraryShown,
+      " libs=", $a.cfg.libraries.mapIt(it.name), " search=", a.cfg.librarySearch, " focus=", a.ui.focusId
   of "close": a.menus.close()
   of "mouse":
     a.ui.fakeMouse = if arg == "off": vec2(-1, -1)
@@ -13406,6 +16104,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     (a.lookYaw, a.lookPitch, a.lookFov) = (parseFloat(st.args[0]).float32,
       parseFloat(st.args[1]).float32, parseFloat(st.args[2]).float32)
   of "pause": a.togglePlay()
+  of "playbtn": a.playButton()  # the controls' Play button, as clicking it
   of "frame": a.frameStep(arg == "1")  # 1 forward, 0 back
   of "sync":  # all | none | add <pid> | remove <pid> | addany (first peer found)
     if arg == "addany":
@@ -13417,6 +16116,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "avsclose": a.closeAvsList()  # as its Close button does
   of "avshi": (let id = a.avs.presets[parseInt(arg)]; a.avsDlg.sel = @[id]; a.pickAvs(id))  # highlight row i
   of "avstoggle": a.toggleAvs(@[a.avs.presets[parseInt(arg)]])  # row i's checkbox
+  of "avsshowhidden": a.showHiddenAvs(arg != "0")  # 1|0: as Show hidden's checkbox
   of "avsadd": a.addAvs(st.args)  # paths: as Add... gives them
   of "avsremove": a.removeAvs(@[a.avs.presets[parseInt(arg)]])
   of "avssort":  # COLUMN [desc]: as a header click sorts
@@ -13443,7 +16143,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
     stderr.writeLine "avs current=", (if v.current >= 0: presetName(v.presets[v.current]) else: "-"),
       " count=", v.presets.len, " on=", toSeq(0 ..< v.presets.len).countIt(v.enabled(it)),
       " disabled=", $a.cfg.avsDisabled.mapIt(presetName(it)), " added=", $a.cfg.avsAdded.len,
-      " hidden=", $a.cfg.avsHidden.len, " widths=", $a.cfg.avsColumnWidths,
+      " hidden=", $a.cfg.avsHidden.len,
+      " showhidden=", a.cfg.avsShowHidden, " widths=", $a.cfg.avsColumnWidths,
       " ratings=", $toSeq(a.cfg.avsStarRatings.pairs).mapIt((presetName(it[0]), it[1])),
       " fps=", $toSeq(a.cfg.avsFrameRates.pairs).mapIt((presetName(it[0]), it[1])),
       " aslisted=", $(a.avsDlg != nil and a.avsDlg.rows == v.presets),
@@ -13518,6 +16219,20 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "rg":  # the ReplayGain button's menu, as clicking it opens it
     a.ctxMenu = cmReplayGain
     a.menus.openContext(a.rgRect.xy, sticky = true, keep = a.rgRect, above = true)
+  of "acmenu", "acaction":  # play|stop|pause [Label]: the Play, Stop or Pause button's menu, listed or an item run
+    let parts = arg.split(' ', 1)
+    a.ctxMenu = if parts[0] == "stop": cmStop elif parts[0] == "play": cmPlay else: cmPause
+    for ch in a.buildMenu().context.children:
+      if st.cmd == "acmenu": stderr.writeLine "acmenu ", ch.label, " checked=", ch.checked
+      elif parts.len > 1 and ch.label == parts[1] and ch.action != nil: ch.action()
+    a.ctxMenu = cmVideo
+  of "acdump":
+    let p = a.player
+    stderr.writeLine "acdump mode=", a.afterCurrent, " keepStop=", a.cfg.stopAfterKeep,
+      " keepPause=", a.cfg.pauseAfterKeep, " path=", p.path.extractFilename,
+      " paused=", p.paused, " stopped=", p.stopped, " eof=", p.eofReached,
+      " t=", formatFloat(p.timePos, ffDecimal, 2), " loop-file=", p.h.getStr("loop-file"),
+      " held=", a.pauseOnLoad
   of "rgaction":  # Label/Sub label...: runs a ReplayGain menu item (the button's, or with
                   # "playlist/" first, the playlist's submenu)
     var path = arg.split('/')
@@ -13629,7 +16344,7 @@ proc main() =
   a.script = loadScript()
   randomize()
   let params = commandLineParams()
-  let files = params.stripRenderArgs.filterIt(it != ResumeArg).mapIt(
+  let files = params.stripRenderArgs.filterIt(it notin [ResumeArg, NewPlayerArg]).mapIt(
     if it.contains("://"): it else: it.absolutePath)
   # Restarted into an update: what it was doing comes back.
   let (resumed, rs) = if ResumeArg in params: takeResume() else: (false, ResumeState())
@@ -13640,7 +16355,7 @@ proc main() =
   # player the user has open.
   let scripted = a.script.steps.len > 0
   if files.len > 0 and a.cfg.openMode == omSamePlayer and not scripted and
-     forwardToRunning(files):
+     NewPlayerArg notin params and forwardToRunning(files):
     return
   a.scripted = scripted
   if not scripted: a.instance = startServer()
@@ -13718,6 +16433,12 @@ proc main() =
   a.window.setAspectHints(0, ivec2(0, 0), a.minWindow)
   a.menus = newMenuSystem()
   a.avsMenus = newMenuSystem()
+  a.optMenus = newMenuSystem()
+  a.library = newLibIndex()
+  a.cfg.seedLibraries()
+  a.libConfigured = a.cfg.libraries
+  a.library.configure(a.cfg.libraries)
+  if a.cfg.showLibrary: a.library.activate()
   a.quad = newQuadRenderer()
 
   a.player = newPlayer(a.cfg.volume, a.cfg.muted, a.cfg.showOsd)
@@ -13843,6 +16564,7 @@ proc main() =
       a.dirtyUntil = now() + 0.5
     if a.menus.pollInput(): a.dirtyUntil = now() + 1.2
     if a.avsMenus.pollInput(): a.dirtyUntil = now() + 1.2
+    if a.optMenus.pollInput(): a.dirtyUntil = now() + 1.2
     if takeFrameReady(): a.frameFlag = true
     if takePreviewReady(): a.previewFlag = true
     if takeOsdReady(): a.osdFlag = true
@@ -13853,6 +16575,8 @@ proc main() =
     a.loopSound()
     a.placeLoopEnd()
     a.pingPong()
+    a.keepLoneLoop()
+    a.turnTick()
     a.loopFrames()
     a.stepFrames()
     a.releaseStandby()
@@ -13913,13 +16637,18 @@ proc main() =
       if a.stopOnLoad:  # gone online at Stop
         a.stopOnLoad = false
         a.player.stop()
+      let held = a.pauseOnLoad  # Pause after current
+      if held:
+        a.pauseOnLoad = false
+        a.player.h.setProp("pause", true)
       a.resetLook()
       a.lookDragging = false
       a.updateTitle()
       # The master moved to another file: the group follows to its start time.
       if not a.isSlave:
         a.syncSend("seek", $a.resumedAt, "true")
-        a.syncSend("play")
+        if held: a.syncSend("pause", $a.resumedAt)
+        else: a.syncSend("play")
       if a.resumedAt > 0:
         a.osd("Resumed at " & fmtTime(a.resumedAt, dur = a.player.duration))
         a.resumedAt = 0
@@ -13951,6 +16680,15 @@ proc main() =
        not (pointerButtonsDown() and a.avsMenus.pointerOverPopup(a.avsUi)):
       a.avsMenus.close()
       a.dirtyUntil = now() + 0.5
+    # Options' menus: the same, for its window.
+    if not a.optMenus.isOpen: a.optMenuOpenedAt = 0
+    elif a.optMenuOpenedAt == 0: a.optMenuOpenedAt = now()
+    if a.optMenus.isOpen and a.optWin != nil and not a.optWin.focused and
+       now() - a.optMenuOpenedAt > 0.15 and
+       not (pointerButtonsDown() and a.optMenus.pointerOverPopup(a.optUi)):
+      a.optMenus.close()
+      a.dirtyUntil = now() + 0.5
+    a.pollLibrary()
     a.applyOnTop()
     a.applyKeepAwake()
     a.syncMediaControls()
@@ -14018,7 +16756,13 @@ proc main() =
   a.savePosition()
   a.autosavePlaylist(force = true)
   a.rememberState()
+  # Ping-Pong goes off with Repeat off when Majestic closes, so the next
+  # session doesn't start with it on unseen; a restart (an update, another
+  # renderer) keeps the session as it was.
+  if not a.cfg.repeatForever and not (a.upRestart or a.rdRestart.len > 0):
+    a.cfg.repeatPingPong = false
   a.cfg.save()
+  a.library.save()
   if a.upRestart or a.rdRestart.len > 0: a.saveResume()
   a.instance.close()
   a.peers.close()
@@ -14035,6 +16779,13 @@ proc main() =
   if a.osdLayer != nil:
     mpv_render_context_free(a.osdLayer.render)
     mpv_terminate_destroy(a.osdLayer.h)
+  # The windows go now, not when the process is gone: a library thread
+  # waiting on a share that never answers keeps the process (and the
+  # windows with it, frozen) around until the share does.
+  for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
+            a.upWin, a.eqWin, a.tagWin, a.avsWin, a.typesWin]:
+    if w != nil and w.visible: w.visible = false
+  pollEvents()
   if a.upRestart: relaunch()
   elif a.rdRestart.len > 0: relaunch(RenderArg & a.rdRestart)
 

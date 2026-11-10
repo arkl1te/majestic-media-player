@@ -20,11 +20,13 @@
         12. Exit (Alt+X)
     * View
         * Compact mode (hides the window frames and navigation bar) (Ctrl+1)
-        * Seek Bar (Ctrl+2)
-        * Controls (Ctrl+3)
-        * Status (Ctrl+4)
-        * Playlist (Ctrl+5)
-        * Run Log (Ctrl+6)
+        * Seek Bar
+        * Controls
+        * Status
+        * (Ctrl+2 cycles through every show/hide combination of Seek Bar, Controls and Status; Ctrl+Shift+2 goes in reverse)
+        * Playlist (Ctrl+3)
+        * Library (Ctrl+4)
+        * Run Log (Ctrl+5)
         * (separator)
         * Show OSD
         * Full Screen

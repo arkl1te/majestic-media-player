@@ -1,5 +1,17 @@
+diff --git a/src/silky/atlas.nim b/src/silky/atlas.nim
+index 75fd9f2..6b695de 100644
+--- a/src/silky/atlas.nim
++++ b/src/silky/atlas.nim
+@@ -35,6 +35,7 @@ type
+     boundsHeight*: float32
+     advance*: float32
+     kerning*: Table[string, float32]
++    colored*: bool  ## a color glyph (emoji): drawn as is, only the text's alpha applied
+ 
+   GlyphEntries* = ref object
+     ## Runtime reference to the stored variants for one glyph.
 diff --git a/src/silky/contexts.nim b/src/silky/contexts.nim
-index aa6bf25..052f836 100644
+index aa6bf25..6f699ec 100644
 --- a/src/silky/contexts.nim
 +++ b/src/silky/contexts.nim
 @@ -80,6 +80,9 @@ type
@@ -12,7 +24,16 @@ index aa6bf25..052f836 100644
      ## Multiplies 9-patch borders for a denser atlas.
      sliceScale*: int = 1
      layoutStack*: seq[LayoutScope]
-@@ -278,7 +281,11 @@ proc getImageSize*(sk: Silky, image: string): Vec2 =
+@@ -108,6 +111,8 @@ type
+     image*: Image
+     ## Live packer for runtime atlas extension; nil until first add.
+     builder*: AtlasBuilder
++    ## The atlasSyncHook's mark of the atlas this context last uploaded.
++    atlasVersion*: int
+     drawer*: Drawer
+     clipStack: ClipStack
+     vertexClips: array[2, seq[int]]
+@@ -278,7 +283,11 @@ proc getImageSize*(sk: Silky, image: string): Vec2 =
      echo "[Warning] Image not found in atlas: " & image
      return vec2(0, 0)
    let uv = sk.atlas.entries[image]
@@ -25,7 +46,7 @@ index aa6bf25..052f836 100644
  
  proc nextRune(text: string, i: var int): Rune {.inline.} =
    ## Reads one UTF-8 rune and advances the byte index.
-@@ -531,7 +538,8 @@ proc drawText*(
+@@ -531,7 +540,8 @@ proc drawText*(
      layer = sk.drawer.currentLayer
      needsHAlign = hAlign != LeftAlign
      needsVAlign = vAlign != TopAlign
@@ -35,7 +56,7 @@ index aa6bf25..052f836 100644
  
    if clip:
      sk.pushClipRect(rect(pos, vec2(maxWidth, maxHeight)))
-@@ -550,9 +558,9 @@ proc drawText*(
+@@ -550,9 +560,9 @@ proc drawText*(
          of LeftAlign:
            0.0'f
          of CenterAlign:
@@ -47,7 +68,7 @@ index aa6bf25..052f836 100644
        if dx != 0:
          for j in lineStartIdx ..< sk.drawer.layers[layer].len:
            sk.drawer.layers[layer][j].pos.x += dx
-@@ -569,7 +577,7 @@ proc drawText*(
+@@ -569,7 +579,7 @@ proc drawText*(
      if rune == LineFeedRune:
        alignLine(currentPos.x - pos.x)
        currentPos.x = pos.x
@@ -56,7 +77,7 @@ index aa6bf25..052f836 100644
        hasPreviousRune = false
        continue
  
-@@ -588,15 +596,15 @@ proc drawText*(
+@@ -588,15 +598,15 @@ proc drawText*(
              break
            var wordEntry: ptr LetterEntry
            if fontData.lookupLetter(wordRune, 0, wordEntry):
@@ -75,7 +96,7 @@ index aa6bf25..052f836 100644
          (frac * fontData.subpixelSteps.float32).int mod
            fontData.subpixelSteps
        else:
-@@ -612,7 +620,7 @@ proc drawText*(
+@@ -612,7 +622,7 @@ proc drawText*(
        if wordWrap:
          alignLine(currentPos.x - pos.x)
          currentPos.x = pos.x
@@ -84,7 +105,7 @@ index aa6bf25..052f836 100644
        elif glyphClip:
          while i < text.len:
            var next: Rune
-@@ -621,26 +629,26 @@ proc drawText*(
+@@ -621,26 +631,26 @@ proc drawText*(
            discard text.nextRune(i)
          continue
  
@@ -105,7 +126,8 @@ index aa6bf25..052f836 100644
 +        vec2(entry.boundsWidth, entry.boundsHeight) * k,
          vec2(entry.x.float32, entry.y.float32),
          vec2(entry.boundsWidth, entry.boundsHeight),
-         color
+-        color
++        if entry.colored: rgbx(color.a, color.a, color.a, color.a) else: color
        )
  
 -    currentPos.x += entry.advance
@@ -117,7 +139,7 @@ index aa6bf25..052f836 100644
  
      previousRune = rune
      hasPreviousRune = true
-@@ -650,15 +658,15 @@ proc drawText*(
+@@ -650,15 +660,15 @@ proc drawText*(
    if needsVAlign:
      let
        textHeight =
@@ -136,7 +158,7 @@ index aa6bf25..052f836 100644
      if dy != 0:
        for j in textStartIdx ..< sk.drawer.layers[layer].len:
          sk.drawer.layers[layer][j].pos.y += dy
-@@ -670,10 +678,12 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+@@ -670,10 +680,12 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
    if font notin sk.atlas.fonts:
      return vec2(0, 0)
  
@@ -151,7 +173,7 @@ index aa6bf25..052f836 100644
      maxWidth = 0.0'f
  
    while i < text.len:
-@@ -681,17 +691,17 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+@@ -681,17 +693,17 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
      if rune == LineFeedRune:
        maxWidth = max(maxWidth, currentPos.x)
        currentPos.x = 0
@@ -172,7 +194,7 @@ index aa6bf25..052f836 100644
  
    maxWidth = max(maxWidth, currentPos.x)
    vec2(maxWidth, currentPos.y)
-@@ -763,8 +773,8 @@ proc drawImage*(
+@@ -763,8 +775,8 @@ proc drawImage*(
      mPos = vec2(m.x.float32, m.y.float32)
      mSize = vec2(m.width.float32, m.height.float32)
    sk.drawQuad(
@@ -183,6 +205,21 @@ index aa6bf25..052f836 100644
      vec2(uv.x.float32, uv.y.float32),
      vec2(uv.width.float32, uv.height.float32),
      color,
+@@ -956,8 +968,14 @@ proc clearScreen*(sk: Silky, color: ColorRGBX) {.measure.} =
+   ## Clears or updates the frame clear color through the drawer.
+   sk.drawer.clearScreen(color)
+ 
++var atlasSyncHook*: proc (sk: Silky) {.nimcall.}
++  ## Called by endUi before it draws: lets the app upload an atlas that
++  ## grew during the frame (glyphs added on demand) while sk's GL context
++  ## is current.
++
+ proc endUi*(sk: Silky) =
+   ## Flushes the queued draws through the active drawer.
++  if atlasSyncHook != nil: atlasSyncHook(sk)
+   for i in 1 ..< sk.drawer.layers.len:
+     sk.drawer.layers[NormalLayer].add(sk.drawer.layers[i])
+ 
 diff --git a/src/silky/drawers/ogl.nim b/src/silky/drawers/ogl.nim
 index 254300f..dc2ff31 100644
 --- a/src/silky/drawers/ogl.nim

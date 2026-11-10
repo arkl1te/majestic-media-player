@@ -32,6 +32,7 @@ let
   colLoop* = c("#4dd2ff")
   colEqualizer* = c("#4f9dff")  ## the controls' equalizer button while it's on
   colError* = c("#ff6b6b")
+  colGreen* = c("#5fd068")      ## adds something: Options > Libraries' new library
   colWarning* = c("#ffc857")    ## needs attention, not an error: a key on two commands
   colCardValue* = c("#9d8cff", 0.28)
   colCardRef* = c("#ffc857", 0.24)
@@ -40,6 +41,10 @@ let
   colRect* = c("#2ec4b6")       ## rectangle drawn over the video
   colOutline* = c("#9aa0ab", 0.5)  ## compact mode's window edge
   colShadow* = c("#000000", 0.45)
+  colSearchBg* = c("#18191e")      ## the command palette's ground
+  colSearchField* = c("#2a2c34")   ## its search field
+  colSearchSel* = c("#5b4bc4")     ## its highlighted row, under white text
+  colSearchSelDim* = c("#cdc6ff")  ## a menu path on that row
   colScrim* = c("#000000", 0.55)
   colOverlayBg* = c("#121317", 0.92)
   colWhite* = c("#ffffff")

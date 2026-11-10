@@ -24,7 +24,7 @@ type
     audio*: string      ## the audio file it describes, "" when not found
     exact*: bool        ## audio is the file FILE names (not one found by name)
     title*, performer*, genre*: string
-    year*: int
+    year*, disc*: int  ## REM DATE, REM DISCNUMBER; 0 when absent
     tracks*: seq[CueTrack]
 
 var cache: Table[string, tuple[stamp: Time, sheet: CueSheet]]
@@ -130,6 +130,9 @@ proc parseCue*(path, text: string): CueSheet =
         let d = w[1].unquote
         if d.len >= 4 and d[0 .. 3].allCharsInSet(Digits): result.year = d[0 .. 3].parseInt
       of "GENRE": result.genre = w[1].unquote
+      of "DISCNUMBER":
+        try: result.disc = w[1].unquote.strip.split('/')[0].parseInt
+        except ValueError: discard
       else: discard
     else: discard
   var kept: seq[CueTrack]

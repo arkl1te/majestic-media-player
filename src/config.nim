@@ -16,7 +16,7 @@ type
   PlaylistField* = enum
     ## A playlist column, and what sorting by it goes by.
     pfName, pfFilename, pfDuration, pfSize, pfDimensions, pfAudioBitrate,
-    pfTrack, pfArtist, pfYear, pfAlbum
+    pfTrack, pfDisc, pfArtist, pfYear, pfAlbum
 
   OpenMode* = enum
     omSamePlayer, omNewPlayer
@@ -38,6 +38,19 @@ type
   AfterPlayback* = enum
     apNothing, apNextInFolder, apMonitorOff, apExit, apSleep, apHibernate,
     apShutdown, apLogOff, apLock
+
+  LibraryKind* = enum
+    ## Options > Libraries: the file types a library lists.
+    lkAudio = "audio", lkVideo = "video", lkAll = "all", lkCustom = "custom"
+
+  Library* = object
+    ## A library of the Library panel: folders (walked with their subfolders)
+    ## and files, in the order Options lists them.
+    name*: string
+    paths*: seq[string]
+    kind*: LibraryKind = lkAll
+    exts*: seq[string]             # lkCustom's types, lower case, no dot
+    hidden*: bool                  # left out of the panel's list, of All and of searches
 
   SavedTransform* = object
     ## Pan, rotate & zoom state, kept when "Remember last pan, rotation
@@ -66,6 +79,7 @@ type
     playlistSideWidth*: float = 150 # pixels, that column's width, changed by dragging its right edge
     playlistColumns*: seq[PlaylistField]   # shown, left to right; set by loadConfig when empty
     playlistColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
+    playlistColumnOrder*: seq[PlaylistField]  # every column, hidden ones too, as the header's menu lists them
     playlistShowSize*: bool = false        # older versions' columns, read once into playlistColumns
     playlistShowDimensions*: bool = false
     playlistCursorFollows*: bool = true    # the selection moves to the entry that plays
@@ -73,6 +87,22 @@ type
     showRunLog*: bool = false
     seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
+    libraries*: seq[Library]       # Options > Libraries, in its order
+    librariesSeeded*: bool         # the default libraries were added once
+    showLibrary*: bool = false
+    libraryHeight*: float = 280    # pixels, the panel's height under the playlist, dragged by its top edge
+    libraryListWidth*: float = 110 # pixels, the libraries' column, dragged by its right edge
+    libraryShowHidden*: bool = false
+    libraryShown*: string = ""     # the library listed ("" = All)
+    librarySort*: string = "pfName"  # the PlaylistField the Library panel is sorted by
+    libraryColumns*: seq[PlaylistField]  # its columns, left to right; set by loadConfig when empty
+    libraryColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
+    libraryColumnOrder*: seq[PlaylistField]  # every column, hidden ones too, as the header's menu lists them
+    libraryShowMillis*: bool = false # its Duration column as HH:MM:SS.mmm
+    libraryGroupFolders*: bool = false  # its files under a header per folder
+    libraryCollapsed*: seq[string]  # the folder groups shown collapsed, by their headers' labels
+    librarySortDescending*: bool = false
+    librarySearch*: string = ""
     showOsd*: bool = true
     frameMode*: FrameMode = fmFit
     aspectOverride*: string = ""   # "" = original, else "4:3", "16:9", ...
@@ -80,7 +110,10 @@ type
     onTop*: OnTopMode = otDefault
     repeatForever*: bool = false
     repeatPingPong*: bool = false  # loops turn around at either end
+    reversePlayback*: bool = false # the Play button turns playback around while playing
     repeatMode*: RepeatMode = rmPlaylist
+    stopAfterKeep*: bool = false   # Stop after current stays on once it has stopped
+    pauseAfterKeep*: bool = false  # Pause after current stays on once it has paused
     # Options > Player
     uiScale*: float = 100          # percent
     openMode*: OpenMode = omSamePlayer
@@ -154,6 +187,7 @@ type
     avsAdded*: seq[string]         # preset files listed where they are: ones Add... couldn't copy
                                    # into the presets folder (and, before it copied, every one)
     avsHidden*: seq[string]        # the folder's preset files removed from the list
+    avsShowHidden*: bool = false   # Visualizers' Show hidden: presets turned off listed too
     avsColumnWidths*: Table[string, float]  # Visualizers' columns resized by hand, by column
     avsStarRatings*: Table[string, int]  # Visualizers' Rating column, by preset: quarters
     avsFrameRates*: Table[string, int]  # Visualizers' Frame Rate column: presets stepped
@@ -175,8 +209,9 @@ type
                                    # stretching); off, they play as written, only the
                                    # tempo following the speed (modstream)
     coverNames*: string = "folder\nalbum"  # pictures beside an audio file taken as its
-                                   # cover when it has none in it: names without the
-                                   # extension, one per line, first found wins
+                                   # cover when it has none in it: foobar2000-style
+                                   # patterns, one per line, the first line finding
+                                   # a picture wins (folderpics)
     shortAudioDelay*: bool = true  # silence after a very short audio file, before the next
     shortAudioMs*: float = 500     # how short, and how much silence: milliseconds
     # Options > Playback > ReplayGain
@@ -237,6 +272,44 @@ const
   OsdScaleMin* = 0.25             ## range of osdScale
   OsdScaleMax* = 8.0
 
+proc columnOrder*(order, shown: seq[PlaylistField]): seq[PlaylistField] =
+  ## Every column, as a header's menu lists them: the shown ones left to right,
+  ## each hidden one after the column it followed when last shown (`order`).
+  result = shown
+  var all = order
+  for f in PlaylistField:
+    if f notin all: all.add f
+  for i, f in all:
+    if f in result: continue
+    var at = 0
+    for j in countdown(i - 1, 0):
+      let k = result.find(all[j])
+      if k >= 0:
+        at = k + 1
+        break
+    result.insert(f, at)
+
+proc toggleColumn*(order, shown: var seq[PlaylistField], f: PlaylistField) =
+  ## Hides a shown column, keeping its place in `order`, or shows a hidden one
+  ## back where it was.
+  order = columnOrder(order, shown)
+  let at = shown.find(f)
+  if at >= 0: shown.delete(at)
+  else:
+    let i = order.find(f)
+    shown.insert(f, shown.countIt(order.find(it) < i))
+
+proc moveColumn*(order, shown: var seq[PlaylistField], f: PlaylistField, to: int) =
+  ## A shown column dragged to `to` in `shown`: moved in `order` too, before
+  ## the column it now precedes, the hidden ones staying where they are.
+  order = columnOrder(order, shown)
+  shown.delete(shown.find(f))
+  shown.insert(f, to)
+  order.delete(order.find(f))
+  let at = if to + 1 < shown.len: order.find(shown[to + 1])
+           elif to > 0: order.find(shown[to - 1]) + 1
+           else: 0
+  order.insert(f, at)
 proc validColor*(hex: string): bool =
   ## "#RRGGBB" (or "RRGGBB") as typed in Options.
   let h = hex.strip.strip(trailing = false, chars = {'#'})
@@ -312,6 +385,7 @@ proc loadConfig*(): Config =
       result = readFile(path).fromJson(Config)
     except CatchableError as e:
       stderr.writeLine "config: ignoring unreadable ", path, ": ", e.msg
+  if result.libraryColumns.len == 0: result.libraryColumns = @[pfName, pfDuration]
   if result.playlistColumns.len == 0:
     result.playlistColumns = @[pfName, pfDuration]
     if result.playlistShowSize: result.playlistColumns.add pfSize

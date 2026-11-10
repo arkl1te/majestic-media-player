@@ -78,6 +78,8 @@ type
     kaSeekBar = "seek-bar"
     kaControls = "controls"
     kaStatus = "status"
+    kaCycleBars = "cycle-bars"
+    kaCycleBarsBack = "cycle-bars-back"
     kaPlaylist = "playlist"
     kaFindPlaylist = "find-in-playlist"
     kaNewPlaylist = "new-playlist"
@@ -92,6 +94,8 @@ type
     kaQueue = "queue"
     kaUnqueue = "unqueue"
     kaRunLog = "run-log"
+    kaLibrary = "library"
+    kaSearchLibrary = "search-library"
     kaShowOsd = "show-osd"
     kaFullScreen = "full-screen"
     kaOptions = "options"
@@ -183,10 +187,12 @@ const
     (kgSubtitles, "Bigger", "Bigger Subtitles", "Shift+Numpad +"),
     (kgSubtitles, "Smaller", "Smaller Subtitles", "Shift+Numpad -"),
     (kgView, "Compact mode", "Compact Mode", "Ctrl+1"),
-    (kgView, "Seek bar", "Seek Bar", "Ctrl+2"),
-    (kgView, "Controls", "Controls", "Ctrl+3"),
-    (kgView, "Status", "Status", "Ctrl+4"),
-    (kgView, "Playlist", "Playlist", "Ctrl+5"),
+    (kgView, "Seek bar", "Seek Bar", ""),
+    (kgView, "Controls", "Controls", ""),
+    (kgView, "Status", "Status", ""),
+    (kgView, "Next bar combination", "Next Bars", "Ctrl+2"),
+    (kgView, "Previous bar combination", "Previous Bars", "Ctrl+Shift+2"),
+    (kgView, "Playlist", "Playlist", "Ctrl+3"),
     (kgView, "Find in playlist", "Find in Playlist", "Ctrl+F"),
     (kgPlaylist, "New playlist", "New Playlist", "Ctrl+N"),
     (kgPlaylist, "Close playlist", "Close Playlist", "Ctrl+W"),
@@ -199,7 +205,9 @@ const
     (kgPlaylist, "Redo playlist change", "Redo", "Ctrl+Y|Ctrl+Shift+Z"),
     (kgPlaylist, "Add selection to playback queue", "Queue", "Q"),
     (kgPlaylist, "Remove selection from playback queue", "Unqueue", "Shift+Q"),
-    (kgView, "Run log", "Run Log", "Ctrl+6"),
+    (kgView, "Run log", "Run Log", "Ctrl+5"),
+    (kgView, "Library", "Library", "Ctrl+4"),
+    (kgView, "Search library", "Search Library", "Ctrl+Shift+F"),
     (kgView, "Show OSD", "Show OSD", ""),
     (kgView, "Full screen", "Fullscreen", "Alt+Enter"),
     (kgView, "Options", "Options", "O"),

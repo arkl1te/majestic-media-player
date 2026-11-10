@@ -1,7 +1,9 @@
 ## The video frame menu's Visualizer Preset > Visualizers...: every preset in
 ## a grid, with a checkbox each (presets turned off leave the menu's list and
 ## are never stepped to: Next, Previous, Random) and what the preset holds in
-## columns resized by their header edges, and a rating of up to five stars
+## columns resized by their header edges (the header's checkbox turns every
+## preset off, or on with a triple-click, so a stray click can't lose which
+## were off), and a rating of up to five stars
 ## set a quarter of a star at a time. A header click sorts by its column
 ## (again: the other way); by Added, oldest first, is the order presets were
 ## listed in. Right-clicks ask the app for a context menu (aaContext).
@@ -11,7 +13,9 @@
 ## the list (built-in ones can only be turned off). Frame Rate is how many
 ## times a second a preset steps (the context menu sets it). Beat threshold and
 ## Sensitivity, at the bottom, are Options' (how loud the sound must be for
-## beats, how readily they come). The search field (Ctrl+F)
+## beats, how readily they come). Presets turned off are hidden from the
+## grid unless Show hidden is ticked (and never in the command palette's
+## Change Visualizer). The search field (Ctrl+F)
 ## shows only the presets matching it: by name, author or file name, or by
 ## rating ("4 stars", ">=3.5", "***", "unrated"; see `parseSearch`). The app
 ## does the changes (`AvsAction`), so this only draws and reports.
@@ -49,6 +53,7 @@ type
     sortDesc*: bool
     search*: string           ## the search field's text: only presets matching it are shown
     subfolders*: bool         ## Add Folder... looks into subfolders too
+    showHidden*: bool         ## presets turned off listed too (aaPrefs when changed here)
     beatThreshold*: float     ## the level beats need, % of Winamp's (the app's
                               ## avsBeatThreshold); aaBeat when changed here
     beatSensitivity*: float   ## how readily beats come, % of Winamp's (avsBeatSensitivity)
@@ -63,6 +68,9 @@ type
     resizeCursor: bool
     dragBar: bool
     dragBarFrom: (float32, float32)
+    allOnFired: float         ## when the header's triple-click turned every preset on
+    nudgeUntil*: float        ## until when the header checkbox says to triple-click
+                              ## (the app draws until then)
     meta: Table[string, PresetMeta]
 
   SearchTerm* = object
@@ -74,7 +82,7 @@ type
 
 const
   AvsSize* = ivec2(920, 580)
-  AvsMinSize* = ivec2(720, 320)  ## the smallest the window can be resized to
+  AvsMinSize* = ivec2(860, 320)  ## the smallest the window can be resized to: the toolbar fits
   RowH = 24'f32
   CheckW = 30'f32
   MinCol = 50'f32
@@ -98,8 +106,8 @@ var registered: bool
 
 proc newAvsDialog*(widths: Table[string, float], ratings: Table[string, int],
                    added: Table[string, float], sortKey: string, sortDesc: bool,
-                   subfolders: bool): AvsDialog =
-  AvsDialog(colWidths: widths, ratings: ratings, added: added, subfolders: subfolders,
+                   subfolders, showHidden: bool): AvsDialog =
+  AvsDialog(colWidths: widths, ratings: ratings, added: added, subfolders: subfolders, showHidden: showHidden,
     sortKey: if Columns.anyIt(it[0] == sortKey): sortKey else: "added", sortDesc: sortDesc)
 
 # --- metadata ------------------------------------------------------------------
@@ -408,6 +416,7 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
   let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
   let subR = rect(r.x + 256, r.y + 15, 22 + ui.textSize("Include subfolders").x, 22)
   let remR = rect(subR.x + subR.w + 12, r.y + 12, 104, 28)
+  let hidR = rect(remR.x + remR.w + 14, r.y + 15, 22 + ui.textSize("Show hidden").x, 22)
   # The search, first so what's typed shows in the rows the same frame: the
   # rest of the top row up to a third of the window, Ctrl+F to type in it.
   # Esc empties it first, then (empty) closes the window; Enter and Down go
@@ -417,7 +426,7 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
     ui.focusId = SearchId
     ui.focusFresh = true
   let wasSearching = ui.focusId == SearchId
-  let searchW = min(clamp(r.w / 3, 200, 320), r.x + r.w - 16 - (remR.x + remR.w + 16))
+  let searchW = min(clamp(r.w / 3, 200, 320), r.x + r.w - 16 - (hidR.x + hidR.w + 16))
   let clearR = rect(r.x + r.w - 16 - 28, r.y + 12, 28, 28)
   let fieldR = rect(r.x + r.w - 16 - searchW, r.y + 12, searchW - 30, 28)
   let before = d.search
@@ -438,8 +447,10 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
     d.scroll = 0
     d.reveal = true
   let terms = parseSearch(d.search)
-  let shown = if terms.len == 0: presets
-              else: presets.filterIt(terms.matches(it, d.ratings.getOrDefault(it)))
+  let listed = if d.showHidden or v.disabled.len == 0: presets
+               else: presets.filterIt(it notin v.disabled)
+  let shown = if terms.len == 0: listed
+              else: listed.filterIt(terms.matches(it, d.ratings.getOrDefault(it)))
   d.sel.keepItIf(it in shown)
   # Buttons.
   if ui.textButton("av-add", rect(r.x + 16, r.y + 12, 104, 28), "Add..."):
@@ -461,6 +472,11 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
     ui.textIn("Remove", remR, colTextDisabled, h = CenterAlign)
   ui.tip(remR, if d.sel.len > 0 and removable.len == 0: "Built-in presets can be turned off, not removed"
                else: "Take the highlighted presets out of the list (their files stay)")
+  if ui.checkbox("av-showhidden", vec2(hidR.x, hidR.y), "Show hidden", d.showHidden):
+    result = aaPrefs
+  let nOff = presets.countIt(it in v.disabled)
+  ui.tip(hidR, "List the presets turned off (unticked) too" &
+    (if nOff > 0: &" ({nOff} off)" else: ": none are"))
   let on = shown.countIt(it notin v.disabled)
 
   # The grid.
@@ -475,11 +491,35 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
   let hhov = ui.hover(rect(head.x, head.y, CheckW, RowH))
   ui.checkBox(hc, allOn and shown.len > 0, hhov)
   let every = if terms.len > 0: "every preset found" else: "every preset"
-  ui.tip(rect(head.x, head.y, CheckW, RowH), "Turn " & every & (if allOn: " off" else: " on"))
+  if d.nudgeUntil <= epochTime(): ui.tip(rect(head.x, head.y, CheckW, RowH),
+    if allOn: "Turn " & every & " off" else: "Triple-click to turn " & every & " on")
   if hhov and ui.pressed():
     ui.consumeClick()
-    d.toggled = shown.filterIt((it in v.disabled) != allOn)
-    if d.toggled.len > 0: result = aaToggle
+    let t = epochTime()
+    # Turning on wipes which were off, so it takes three clicks in quick
+    # succession; turning off (all were on) is undone by doing that. Clicks
+    # right after the third are the same burst, not a click to turn them off.
+    let n = ui.countClick("av-allon")
+    if t - d.allOnFired < 0.5: discard
+    elif allOn:
+      d.toggled = shown.filterIt(it notin v.disabled)
+      if d.toggled.len > 0: result = aaToggle
+    elif n >= 3:
+      d.toggled = shown.filterIt(it in v.disabled)
+      if d.toggled.len > 0: result = aaToggle
+      d.allOnFired = t
+      d.nudgeUntil = 0
+    else: d.nudgeUntil = t + 1.5
+  if d.nudgeUntil > epochTime() and not allOn:
+    # Shown at once (tooltips wait for the pointer to rest), beside the box.
+    let msg = "Triple-click to turn " & every & " on"
+    let sz = ui.textSize(msg, FontSmall) + vec2(14, 8)
+    let p = vec2(head.x + CheckW + 4, head.y + RowH + 4)
+    ui.sk.pushLayer(PopupsLayer)
+    ui.rect(rect(p, sz), colPopup)
+    ui.border(rect(p, sz), colBorder)
+    ui.text(msg, p + vec2(7, 4), colText, FontSmall)
+    ui.sk.popLayer()
   for i, c in cols:
     ui.rect(rect(c.x, head.y, 1, RowH), colBorder)
     let sortedBy = c.key == d.sortKey
@@ -651,7 +691,8 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
       ui.textIn(ui.ellipsize(text, tw), rect(tx, y, tw, RowH), col,
         h = if right: RightAlign else: LeftAlign)
   if rows.len == 0 and presets.len > 0:
-    ui.textIn("No presets match \"" & d.search.strip & "\"", rect(inner.x, inner.y, inner.w, RowH * 3),
+    ui.textIn(if terms.len > 0: "No presets match \"" & d.search.strip & "\""
+              else: "Every preset is turned off (Show hidden lists them)", rect(inner.x, inner.y, inner.w, RowH * 3),
       colTextDim, h = CenterAlign)
   if not rightClicked and ui.hover(inner) and w.buttonPressed[MouseRight]:
     (d.ctx, d.ctxPos) = (acEmpty, ui.mouse)
@@ -735,11 +776,14 @@ proc draw*(d: AvsDialog, ui: Ui, r: Rect, v: AvsView): AvsAction =
       "Winamp's: 200 is about twice the beats, 300 the most. Presets that pass on every Nth beat " &
       "(Custom BPM) change more often too.", d.beatSensitivity, 10, 0, 300):
     result = aaBeat
-  let count =
-    if terms.len == 0: &"{on} of {presets.len} presets on"
-    else: &"{shown.len} of {presets.len} found, {on} on"
-  let countW = ui.textSize(count, FontSmall).x
   let closeX = r.x + r.w - 108
+  var count =
+    if terms.len == 0: &"{on} of {listed.len} presets on"
+    else: &"{shown.len} of {listed.len} found, {on} on"
+  if listed.len < presets.len:  # how many are hidden, when there's room
+    let more = count & &", {presets.len - listed.len} hidden"
+    if closeX - 16 - ui.textSize(more, FontSmall).x >= beatX: count = more
+  let countW = ui.textSize(count, FontSmall).x
   ui.textIn(count, rect(closeX - 16 - countW, r.y + r.h - 40, countW, 30), colTextDim, FontSmall)
   let hintX = beatX + 2
   let hintW = closeX - 16 - countW - 16 - hintX

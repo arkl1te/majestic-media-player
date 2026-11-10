@@ -45,6 +45,7 @@ type
     columns*: seq[PlaylistField]  ## its own columns, left to right ("Override columns
                                   ## for this playlist"); empty: the config's
     columnWidths*: Table[string, float]  ## and their widths resized by hand
+    columnOrder*: seq[PlaylistField]  ## every column, hidden ones too, as the header's menu lists them
 
   SavedPlaylist* = object
     id*: int
@@ -56,6 +57,7 @@ type
     file*: string
     columns*: seq[PlaylistField]  ## its own columns; empty: the config's
     columnWidths*: Table[string, float]
+    columnOrder*: seq[PlaylistField]
 
   PlaylistStore* = object
     playlists*: seq[SavedPlaylist]
@@ -81,12 +83,12 @@ proc toTab*(s: SavedPlaylist): PlaylistTab =
   result = newTab(s.name, s.scratch, s.id)
   result.entries = s.entries
   result.selected = if s.selected in 0 ..< s.entries.len: s.selected else: -1
-  (result.columns, result.columnWidths) = (s.columns, s.columnWidths)
+  (result.columns, result.columnWidths, result.columnOrder) = (s.columns, s.columnWidths, s.columnOrder)
 
 proc toSaved*(t: PlaylistTab, entries: seq[string], index, selected: int): SavedPlaylist =
   SavedPlaylist(id: t.id, name: t.name, scratch: t.scratch, entries: entries,
     index: index, selected: selected, file: t.file, columns: t.columns,
-    columnWidths: t.columnWidths)
+    columnWidths: t.columnWidths, columnOrder: t.columnOrder)
 
 proc trimUndo*(steps: var seq[UndoStep]) =
   ## Oldest first out, past the limits.

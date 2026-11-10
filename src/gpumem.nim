@@ -129,9 +129,21 @@ proc pickCpu(mode: RenderMode): bool =
     let free = freeVram()
     free >= 0 and free < StartVram
 
+proc avoidExplicitSync() =
+  ## NVIDIA's GLX under XWayland syncs presented buffers explicitly (a
+  ## timeline per buffer) by default. glXSwapBuffers then waits for XWayland
+  ## to release a buffer, and a release that never comes froze the player for
+  ## good (driver 610.43, KWin 6, the window visible: raising it didn't help).
+  ## Without explicit sync the driver never waits on one. The user's own
+  ## setting of the variable wins; other drivers ignore it.
+  when defined(linux):
+    if not existsEnv("__NV_DISABLE_EXPLICIT_SYNC"):
+      putEnv("__NV_DISABLE_EXPLICIT_SYNC", "1")
+
 # Chosen as the program starts, before anything loads a GL library (on
 # Windows, the opengl package loads opengl32.dll as its module starts:
 # majestic.nim imports this module first).
+avoidExplicitSync()
 let
   startMode = loadConfig().renderMode
   cpuWanted* = pickCpu(startMode)

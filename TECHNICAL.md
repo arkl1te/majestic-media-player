@@ -158,13 +158,15 @@ it held, to commit.
   one menu tree, `paletteRoot`, rebuilt every frame like the menus (about 0.4 ms), so checkmarks
   and dynamic lists are always current. The tree holds the menu bar's menus; the right-click
   menu's contextual (purple) items under "Right-Click Menu"; "Controls", with every controls bar
-  button (as a wide bar shows them) and the menus their right-click opens (Repeat Options,
-  Quality, ReplayGain); "Status Bar", with the timestamp's right-click menu ("Timestamp") and the bar's own;
+  button (as a wide bar shows them) and the menus their right-click opens (Play Options, Pause Options, Stop Options,
+  Repeat Options, Quality, ReplayGain); "Status Bar", with the timestamp's right-click menu ("Timestamp") and the bar's own;
   "Playlist › Playing Item", the playlist's right-click menu on the entry playing, built with its
   playlist moved into the live fields (`stashTab`/`unstashTab`, and back) and that entry alone
   selected, each item doing `showPlaying` before its action, as right-clicking it would (left
-  out while synchronized and another playlist is shown, as showing that one is refused); and the
-  commands that only have a key (`PaletteKeyOnly`, run through `runAction`), filed under the
+  out while synchronized and another playlist is shown, as showing that one is refused);
+  "Play › Disable Audio" and "Play › Disable Video", palette-only toggles that set the track to
+  None and back to the one turned off (`palTrackBefore`, by file: in another file, the first
+  track); and the commands that only have a key (`PaletteKeyOnly`, run through `runAction`), filed under the
   menu of their key group. The right-click menus come from `buildMenu` called with `ctxMenu` set
   to each one, restored afterwards.
   Submenus are palette items too: running one opens it in the palette (`palTrail`, the label and
@@ -181,13 +183,39 @@ it held, to commit.
   tables); label matches rank first, submenus get a bonus, and the track submenus
   (`PaletteFavored`) a bigger one, so "audio" and "subtitle" find them first.
   Enter on a check or radio item runs it and keeps the palette open; any other command closes it
-  first, since it may open a dialog. The last search is kept and selected when it opens again.
+  first, since it may open a dialog.
+  "Change Visualizer" (also found as "Switch Visualizer", `PaletteAliases`) is an empty submenu in
+  the tree whose items `paletteFind` makes itself from the presets turned on (and the one
+  playing only when it's on: presets turned off never appear there), each carrying its preset id (`PaletteItem.id`, part of `paletteKey`, since two
+  folders can hold presets of the same name). While it is open (`palAvsList`), it opens on the
+  preset playing, scrolled to the middle (`palCenter`); moving the highlight plays that preset
+  without saving (`paletteAvsPreview`), a search plays its top result once typing has paused for
+  `PaletteAvsTypeDelay` (1 s, `palAvsTypedAt`), and Enter or a click keeps the preset and closes
+  the palette. Leaving any other way (Esc, F3, Backspace or the back button, a click outside,
+  the visualizer hiding) plays the preset from before it opened again (`paletteAvsCancel`). The last search is kept and selected when it opens again.
   It is drawn inside the main window (not a popup window like the menus), so its text field is
-  an ordinary `textField` taking the main window's keys; `handleKeys` hands every key to
-  `paletteKeys` while it is open.
+  an ordinary `textField` (`framed = false`, over its own rounded ground) taking the main
+  window's keys; `handleKeys` hands every key to `paletteKeys` while it is open.
+  It opens with the middle of its search field at the mouse (`palAnchor`, asked of the X server
+  by `pointerPos` in `showPalette`, since a key can open it before any motion event), kept 4 px
+  inside the window. The bottom is clamped as though all 12 rows showed, so the field doesn't
+  move as typing changes how many do; when the window is too short, the rows that fit show.
+  It is styled after Blender's menu search: rounded corners (`ui.roundRect`, which also draws
+  its soft shadow through a wide feather), a darker ground (`colSearchBg`), a magnifier in the
+  field, the highlighted row filled with `colSearchSel` under white text, and a ▸ (the
+  `arrow16` icon, as the font lacks U+25B8) after each menu of a path. A path too wide for its
+  row drops its outer menus into "…" first, then shortens the innermost one.
 - vsync is disabled on purpose: with NVIDIA under XWayland, a vsync'd
   `glXSwapBuffers` can block for seconds when the window is hidden. Video frames
   are paced from mpv's frame timing instead; the compositor prevents tearing.
+- The player starts with `__NV_DISABLE_EXPLICIT_SYNC=1` on Linux (`src/gpumem.nim`,
+  unless already set). With explicit sync, NVIDIA's `glXSwapBuffers` waits in
+  `drmSyncobjTimelineWait` for XWayland to release a buffer; one release never
+  came and the UI froze for good with the window visible (driver 610.43).
+  Without it the driver makes no syncobj calls at all (counted with gdb
+  `dprintf`s on libdrm's `drmSyncobj*`; an `LD_PRELOAD` shim sees none,
+  as the driver looks them up itself). A nested KWin never shows the
+  difference: its virtual backend offers no explicit sync.
 - On Windows, menus are never-activated popup windows sharing the main GL
   context the same way; moving the window by the video is done by the player
   itself, so playback doesn't stall during a drag.
@@ -204,6 +232,19 @@ it held, to commit.
   without hooks. Ticking it on a playlist in no file asks where to save it first. It's greyed out for
   a read-only file (`access(W_OK)`, rechecked on each check), while synchronized, and for a playlist
   in no file holding a YouTube playlist link not yet listed, until it's saved to a file.
+- Panel keyboard focus: the playlists' side column, the playlist's entries, the libraries' column
+  and the Library's files take the arrow keys (`plSideKeys`, `plArrows`, `libCatKeys`, `libArrows`;
+  `panelStop` reads which) once clicked or reached with Tab / Shift+Tab (`panelTab` cycles
+  `panelStops`: those shown, the side column only with Playlists in a Side Column, unless a command
+  is bound to that combo), and keep them wherever the pointer goes until Escape or a click elsewhere
+  (`focusPanel(psNone)`); Escape releases them before it leaves full screen. In a list Up/Down move
+  the selection (the playlist also plays it with Enter); in a column Up/Down/Home/End show another
+  playlist or pick another library (`libPick`, as a click does) and Enter goes on to its list. F2 in
+  the libraries' column types over the library's name in its row (`startLibRename`/`endLibRename`,
+  focus id `lib-rename`, checked by `validLibraryName` like Options > Libraries; the search's in: and
+  exclude: tags follow); anywhere else in the Library F2 does nothing, not even Rename Playlist. The
+  holder shows a `colAccentDim` edge round its list or column, drawn after both panels, and a
+  `colAccent` outline on the row the arrows move from. `panelsdump` (MMP_SCRIPT) prints the state.
 - Several playlists (`src/plmanager.nim`, tabs drawn by `playlistTabs`): the one shown lives in
   `App.playlist` and the `pl*` fields as before, so the editing, columns, search and Properties code
   is unchanged; the others wait in `App.tabs`, the shown one's slot there stale. `stashTab`/`unstashTab`
@@ -222,10 +263,26 @@ it held, to commit.
   id with what other players wrote meanwhile (`mergeStore`), so two running players don't undo each
   other's playlists. The config's `playlist` fields are read once into Default, then emptied.
   The column header's "Override columns for this playlist" gives the shown playlist columns and
-  widths of its own (`PlaylistTab.columns`/`columnWidths`, saved in `playlists.json`, copied by
-  Duplicate), starting as the shared ones (`playlistColumns`/`playlistColumnWidths` in the config);
-  unchecking it drops them. Column code goes through `plColumns`/`plColumnWidths`, which pick the
-  set in use, and `saveColumns`, which saves it where it's kept; Show milliseconds stays shared.
+  widths of its own (`PlaylistTab.columns`/`columnWidths`/`columnOrder`, saved in `playlists.json`,
+  copied by Duplicate), starting as the shared ones (`playlistColumns`/`playlistColumnWidths`/
+  `playlistColumnOrder` in the config); unchecking it drops them. Column code goes through
+  `plColumns`/`plColumnWidths`/`plColumnOrder`, which pick the set in use, and `saveColumns`, which
+  saves it where it's kept; Show milliseconds stays shared. The header menus (the playlist's and the
+  Library's, `libraryColumnOrder`) list every column in the header's order, a hidden one where it was
+  when last shown: the `*ColumnOrder` lists keep the hidden ones' places (`columnOrder` in config.nim
+  merges one with the shown columns), `toggleColumn` shows a column back at its place, and a header
+  drag (`moveColumn`) moves the column in the order too, before the one it now precedes, leaving
+  the hidden ones where they are.
+  Column widths (the playlist's and the Library's): `layoutCells` gives a text column nobody resized
+  what the others leave (`fillsIn`), else the last column the slack; a panel too narrow takes the
+  excess from every column, each giving the same share of what it has above its narrowest, so the
+  rightmost isn't crushed first. A header edge drag (`startColumnDrag`, `dragColumn`, state in
+  `ColumnDrag`) snapshots the widths as drawn at the press and, from the first movement, writes
+  every column's width: the dragged one follows the pointer, the ones right of it move along keeping
+  their widths, a text column right of the edge that fills the panel gives way, else the last column
+  takes the slack, and once they'd pass the panel's edge the columns right of the edge all narrow
+  evenly (computed from the snapshot, so dragging back within the drag restores them). Saved widths
+  wider than the panel thus become what's drawn on the first drag.
   The tab menu's "Playlists in a Side Column" (`playlistTabsSide`) draws the playlists as a list left
   of the entries instead (`playlistSide`), with the same clicks, drags and drops; it fills the same
   `tabRects`/`tabPlus`/`tabStrip`, so file drops, row drags and right-clicks treat both alike. The
@@ -258,6 +315,24 @@ it held, to commit.
   bar's buttons, read four times a second; commands run from the main loop.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary; the tracker
   chart's cells use IBM Plex Mono (same license).
+- The UI atlas is prebuilt with Latin and basic Cyrillic only. Any other character (kana, kanji,
+  hanzi, hangul, Greek, Thai, symbols...) is added the first time text is measured or drawn
+  (`src/glyphcache.nim`, called by `ui.nim`'s text helpers): from Plex when it has the glyph,
+  else from a system font (`src/fallbackfonts.nim`: fontconfig's fonts with that character on
+  Linux, ranked; a fixed list of `%WINDIR%\Fonts` files on Windows). Han characters take the
+  text's language: Japanese when it has kana, Korean with hangul, else the locale's CJK
+  language (Simplified Chinese when it has none), so the JP/SC/TC/HK/KR face of e.g. Noto Sans
+  CJK is picked by family name (fontconfig's `lang` doesn't tell them apart). A character keeps
+  the form it was first drawn in. All Silky contexts share the atlas; it grows up to 8192²
+  (later glyphs draw as "?") and each context re-uploads it at its next `endUi`, through the
+  `atlasSyncHook` in `patches/silky.patch`. No shaping: Arabic and Indic scripts draw unjoined.
+  Emoji (`isEmoji`: Unicode's Emoji_Presentation and the emoji planes, so ★ or ♪ stay text)
+  come from a color emoji font, which pixie can't draw (`src/emojifont.nim`): CBDT/CBLC PNG
+  strikes (Noto Color Emoji), the biggest scaled down, or COLR v0/CPAL layers filled with
+  pixie (Segoe UI Emoji, Twemoji Mozilla). They're atlas glyphs with `colored` set, which
+  Silky's drawText draws untinted (white at the text's alpha). Sequences aren't joined (no
+  GSUB): a ZWJ family draws as its people, a flag as two letters, a skin tone as a swatch.
+  A UI scaling change rebuilds the atlas and the glyphs are added again as needed.
 
 - Tracker modules (`TrackerExtensions` in `src/config.nim`) need no code of their own to play:
   mpv opens them with FFmpeg's libopenmpt demuxer (Arch's ffmpeg is built with it, and so is
@@ -377,7 +452,7 @@ it held, to commit.
   an EDL timeline of its stretch of the file (`cueSource`: `edl://!no_chapters;%len%file,start,length`,
   no length for the last), so time, duration, seeking, the seek bar and the end are the track's;
   it opens with `force-media-title` set to the track's title, and the probe takes title, artist,
-  album, track number and year from the sheet. EDL still passes on the file's chapters at the
+  album, track number, year and disc number (`REM DISCNUMBER`) from the sheet. EDL still passes on the file's chapters at the
   album's times, so `parseChapters` drops them for a track. Opening one track entry (Open Recent)
   opens its whole sheet, playing from it. Properties, Copy to Clipboard and the task bar's URL
   use the audio file (`cueFile`). Tracks are separate files to mpv: there's a short gap between
@@ -418,7 +493,10 @@ it held, to commit.
   crash on the third job under `GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0`, at random
   otherwise). `RgJob.writing` marks the album's writing, which the
   status bar shows as "Applying ReplayGain". Tagged files leave the probe cache so the playlist reads them
-  again; the open file's values change in mpv only when it's opened again. Matches ffmpeg's
+  again. mpv reads a file's values only on opening it, so the open file, when tagged, opens again
+  where it is (`reopenHere`, as the tag editor does) once the job ends (once for an album's track
+  and album gains), or right after Remove ReplayGain Values when mpv had values for it; the
+  button and the menus show mpv's values, which are the new ones from then on. Matches ffmpeg's
   `ebur128` filter (stereo, 5.1, MP3/FLAC/M4A/Ogg/Opus, and two files joined for album gain).
   Script command `plselectall` selects the whole playlist for testing it.
 - The playlist's Properties (its menu's Properties..., for the selected local files; window in
@@ -528,7 +606,7 @@ it held, to commit.
   any depth), picked from the video's right-click menu; the one in use is `avsPreset`.
   Visualizer Preset > Visualizers... (`src/avsdlg.nim`, a window beside the player like the
   Equalizer's, but resizable: `placeDialog`'s `minSize` keeps it from going below `AvsMinSize`,
-  where the toolbar and the hint still fit, and the size it was left at returns next time,
+  where the toolbar still fits with the search field at its old smallest (the hint goes first), and the size it was left at returns next time,
   `avsWindowW`/`avsWindowH` in UI units; on X11 dialog windows get `keepContentsOnResize`,
   north-west bit gravity and a panel-colored background, as X's defaults blank the whole window
   black at each resize step until the next frame is put in, and a resize draws at once)
@@ -565,8 +643,16 @@ it held, to commit.
   order presets are listed in: those listed before dates were kept share one date. Sorting only
   changes the grid; Next and Previous keep the listed order. Right-clicks open context menus: on
   rows (highlighting a row outside the highlighted ones alone first, without playing it) Play,
-  Turn On/Off, Rating, Frame Rate, Open Containing Directory, Copy Path, Add..., Remove and Sort By; on the
-  header the sorting; under the rows Add... and Sort By. They are a second `MenuSystem`
+  Turn On/Off, Rating, Frame Rate, Open Containing Directory, Copy Path, Add..., Remove, Show Hidden and Sort By; on the
+  header the sorting; under the rows Add..., Show Hidden and Sort By. Presets turned off are
+  hidden from the grid unless the toolbar's Show hidden checkbox (or the menus' Show Hidden,
+  `avsShowHidden`, off by default) is ticked, so unticking a row takes it out at once; the count
+  adds how many are hidden when there's room. The header's checkbox turns every preset shown off
+  with one click, but on only with three in quick succession (`countClick`, 0.4 s apart): that
+  would lose which were off, while turning all off is undone by turning them on. A click short of
+  three shows "Triple-click to turn every preset on" beside it at once for 1.5 s (`nudgeUntil`,
+  the app drawing until then), and clicks within 0.5 s after the third are ignored, so a fourth
+  of the same burst doesn't turn them off again. They are a second `MenuSystem`
   (`avsMenus`) on the Visualizers window, its popups drawn with the main window's GL context
   (`renderPopups`' `main`) and closed like the main ones when its window loses focus.
   The search field at the toolbar's right end (Ctrl+F; `parseSearch`/`matches`) shows only the
@@ -606,10 +692,13 @@ it held, to commit.
 
 - The end of a file: once the video runs out, mpv's `time-pos` is the sound's, behind by the audio output's latency, then wherever the sound stopped (short of the last frame or past it), and `frame-back-step` from there finds the last frame again. So `Player` ignores small steps back near the end of forward playback, and `settleEnd` pins the position to the last frame on EOF (`pinEnd`, until the next jump). The seek bar counts that frame as 100%.
 - Video track choices: a track picked or turned off (Play > Video Track, the standby's mirroring, a reopen or a resume) goes to `file-local-options/vid`, so it lasts for that file only; mpv's runtime `vid` would hold for every file opened after. Always Disable (`noVideo` in the config) never sets mpv's own `vid` either: a runtime `vid` set while a file has a file-local one is put back to the old value when that file ends. Instead `Player.noVideo` makes the `on_preloaded` hook set a file-local `vid=no` on each file before mpv picks tracks, unless the file is audio with a cover; toggling it sets the open file's to `no` or `auto`.
-- Covers: mpv finds the pictures beside an audio file itself (`cover-art-auto`: one named after it, and Options' folder names as `cover-art-whitelist`) and `pickCover` chooses among them and those inside the file in the `on_preloaded` hook (`coverTrack`): the one named after it with Show Front Cover (file) (`showFileCover`, `Player.fileCover`), else the front cover inside (picture types read by `coverart.nim`, as mpv takes the first), else the first folder picture. With Show Front Cover (file) off, the named one is never shown: if it's the only picture, the file gets `vid=no`, or mpv would take it.
+- Covers: mpv finds the picture named after an audio file itself (`cover-art-auto`, with `cover-art-whitelist` emptied). Options' folder pictures are the app's (`folderpics.nim`, `addFolderPicture` in the `on_preloaded` hook, adding the picture found as an album-art track, or taking mpv's when it's the same file): foobar2000-style patterns, one per line, tried top to bottom until one finds a picture, relative to the file's folder (`art/*front*.*`, `../folder.*`, `%album%.*`, `jk_$substr(%filename%,1,4)_5_b.png`, `[...]`). `*`/`?` are wildcards only where the line writes them (a field's value is literal, its slashes become `_`), every segment matches letter case aside, a folder's matches go in name order, and only picture files (`ImageExtensions`) count. A line naming a field the file doesn't have (from mpv's `metadata`, outside `[...]` or a `$if` branch not taken) or an unknown function is skipped, so `%album%.*` never becomes `.*`; a line whose last segment has no `.`, `*` or `?` gets `.*` (the old names, `folder`). The patterns are module state shared by every player (the standby swaps with the main one). `pickCover` chooses among the pictures in the `on_preloaded` hook (`coverTrack`): the one named after it with Show Front Cover (file) (`showFileCover`, `Player.fileCover`), else the front cover inside (picture types read by `coverart.nim`, as mpv takes the first), else the folder picture. With Show Front Cover (file) off, the named one is never shown: if it's the only picture, the file gets `vid=no`, or mpv would take it.
 - Moving covers (animated GIF, APNG, WebP): mpv shows a picture track's first frame only, so it still shows that (the window fits it, and screenshots and video filters see it) while `animpic.nim` decodes the picture and the app draws the frame due over the picture's rect (`drawAnim`), panned, rotated and sized with it. The picture comes from the file beside (track codec `gif`, `apng` or `webp`), a quick cover's own file, or for one inside the file from its ID3v2 or FLAC picture by its place among them, read only when their count matches mpv's tracks. GIFs are `gifanim.nim`'s: pixie's decoder doesn't lay frames over the one before (most GIFs store only what changed) and turns a disposal-2 frame into a blank one. APNG frames are made into PNGs of their own (the file's IHDR at the frame's size, its PLTE/tRNS, the frame's IDAT/fdAT data) for pixie's decoder, then laid on with their blend and dispose ops; 16-bit and interlaced APNGs, which pixie can't read, stay still. FFmpeg can't decode an animated WebP at all (it skips ANMF chunks, so not even the first frame), so those go through libwebp's `WebPAnimDecoder` (`libwebpdemux`, `dlopen`ed: bundled in the AppImage, not shipped on Windows yet, where an animated WebP can't be shown). Frames are decoded as they come due, at the picture's own delays (10 ms or less taken as a tenth, as browsers do), playing or paused, and kept once composed while all of them fit 64 MiB; a bigger one composes each frame again every time around (~2 ms for an 800x800 GIF). The OSD goes to the OSD layer meanwhile (`osdApart`), as mpv's own is in the picture underneath.
 - Quick covers: a picture file dropped on the video frame, or pasted with Ctrl+V (a file on the clipboard, or a picture itself: a browser's Copy Image, read with `wl-paste`, `xclip` or windy on Windows), while the file playing shows no picture of its own (`quickCoverAllowed`: sound alone, a cover, or a video with its track off) is added as an album-art track titled "Quick cover" (`addQuickCover`, a file-local `vid`; the render context is made first, as a file opened without video has none). An animated WebP is added as a PNG of its first frame (in the cache, `quickCoverStill`) and moves through `animpic`. Elsewhere, or on a playing video, a dropped or pasted picture opens as before. Show Quick Cover switches between it and what showed before (`qcPrevVid`), at once: mpv takes a moment to set a picture up again (~0.25 s for a 6000x6000 JPEG), so once the quick cover first shows the app takes it as mpv decoded it (`screenshot-raw video`, asked for in the background with `takeShot`: synchronous it deadlocks, as libmpv's video output takes it through the renderer, our main thread; shrunk to 2048 pixels a side) and draws that (`qcBridge`) from Show until 0.1 s after mpv's video is set up again (`Player.videoConfigs`); a moving one's frames are kept while it's hidden (`animStash`). `pollQuickCover` reads only the track list mpv sent: a property read every frame waits while mpv sets a picture up, and held up the very frames meant to cover that wait. The front cover settings leave it alone (`pickCover` skips a shown one, `coverPictures` never counts it). It goes once another file opens or this one opens again (`pollQuickCover`), unless Save Quick Cover keeps it in `quickcovers.json` (file -> picture, read from where it is): the `on_preloaded` hook then adds it as the file opens (`Player.quickCoverFor`), before mpv shows another picture. Pasted pictures are kept in the config folder's `quickcovers/` (named by their bytes) and deleted once nothing shows or keeps them. Clipboard bytes are read with `startProcess`, not `execCmdEx`, which rejoins lines with "\n" and breaks a PNG's signature. windy's X11 `getClipboardString` waited forever when the owner refused the text (only a picture on the clipboard): `patches/windy.patch` takes a refusal as no text and gives up after 2 s.
-- Gapless audio: `gapless-audio` stays `no` (in gapless mode mpv reports the end with ~0.25 s still queued, which opening the next file would cut off), except when mpv has the next file itself. In the last 15 s of an audio file (an audio extension or a cue track) played straight through, `queueGapless` appends the entry `afterEof` would play (the playlist's next, the first when repeating the playlist, or the folder's next with Play next file in the folder) to mpv's playlist and turns gapless on (`weak`: a change of sample rate or channels still reopens the output, with a short gap); `prefetch-playlist` opens it ahead. Videos, the queue, loops, ping-pong, a short file's delay and synchronized slaves keep the app's own path. mpv then goes on by itself; `Player.wentOn` takes the new path from the `end-file` event and `adoptGapless` runs `playIndex` without opening the file (`adopting`). `handleEof` stands aside while a file is queued, as `eof-reached` can show for a moment before mpv moves on. Gapless is turned off again only once the new file plays (`settled`): turned off while mpv changes files, the new file's audio setup would drop the sound still queued.
+- Reverse playback (the Play button, `playButton`): while `Player.backward` the button shows `playrev` (the play symbol mirrored) in cyan (`colLoop`), and a click turns forward (playing if paused). Its right-click menu (`cmPlay`) has Enable reverse playback (`reversePlayback`, saved): with it on, a click while playing forward turns backward (not in a synchronize group, whose clock only runs forward). Playing backward needs what Ping-Pong does: `backwardReady` opens local files without mpv's demuxer thread and cache (the file playing reopens in place when it's turned on), and `pingPong` keeps `hwdec` off (`softDecode`) while a ping-pong loop is on or playing backward. Links keep the demuxer thread and cache (streaming needs them), and two things let them keep up backward: YouTube sends a request left open to the file's end slowly (~0.25 MB/s, plenty forward, but each step back needs seconds of the stream at once) and a bounded one at full speed, so FFmpeg asks in 10 MiB pieces (`stream-lavf-o` `request_size`, as yt-dlp does: forward, streams buffer faster too); and once it runs out of what it has read, mpv goes back `demuxer-backward-playback-step` (60 s by default) and reads all of it before playing on, which `Player.setBackward` makes ~4 MB of a link (5–60 s, by its bitrate). Before, a link played backward stood still for 5–14 s at each step, or for good. A keyframe span's frames wait in `video-reversal-buffer`, raised from 1 GiB to an eighth of the RAM (6 GiB at most; only what a span holds is taken): a 4K60 span is ~3.7 GB, and frames that don't fit are dropped, the picture standing still and then jumping. `pingPong` turns forward only when a loop goes off, so a backward the button set lasts. Reaching the start backward outside a ping-pong loop, `handleEof` turns forward and pauses there. Playing, the button's turns are seamless (next entry), so they come a moment later (~0.65 s; a video's ~0.75 s); the button shows the way playback is about to go (`heading`), and a second click before the turn calls it off (after it's committed, it turns back right after). Script command: `playbtn` (a click); `acmenu play`/`acaction play` for the menu.
+- Seamless turns (`turnTick` and the procs before it; `Player.setTurnFades`, `Player.heardPos`): mpv turns around with a seek that drops the sound queued for its output: a 40–65 ms jump with a click, and in a ping-pong loop with video 20–40 ms of silence. While Enable reverse playback is on and a file plays (outside ping-pong loops), the standby is kept ready for the Play button (`parkTick`, `tnParking`/`tnParked`): the file open, threadless, facing the other way, paused and silent ahead of the playing player (`parkWindow`: from `TurnQuick` + `TurnParkRunUp` up to `TurnParkSpan` further, sent on again once playback comes too close). A click then sets it playing at once (`quickTurn`), the turn `TurnQuick` (0.65 s) later: `alignTurn` drops whatever extra run-up it has, to the sample. That floor is mpv's: it has ~0.44 s of the sound filtered ahead of what's heard (0.2 s `audio-buffer`, 0.1 s PulseAudio's buffer and the queues between; each 0.1 s less takes 0.1 s off), which no fade can reach any more, plus measuring the standby and a pass of the loop. A video's picture can't catch up with that much dropped (played backward it decodes keyframe span by keyframe span), so with a picture the parked standby is only kept open, facing the right way, and is sent to the turn on the click (`planTurn`, a seek: `tnPrep`, learned, ~0.03–0.1 s more). Otherwise the Play button's turns (`turnTo`: `TurnRunUpUser` plus the standby's learned preparation time ahead) and Ping-Pong's (`pingPongTurn`: at B or A, or `TurnEdge`/`TurnEdgeEnd` inside a file's start and end) go to the standby instead (`planTurn`). Opened facing the other way (threadless; `hwdec` off backward) a run-up past the turning point, it gets `@turn` in its `af`: an `afade` in centered on the turning point, silent before it (afade takes no negative times, and backward mpv's times are negated: `asetpts` shifts them by `TurnShift` around it). It's set playing that run-up ahead, less its learned start delay (`tnDelays`, by direction, picture and file edge), and `alignTurn` measures how far it is from the playing player's mirror image (the sum of both `audio-pts` stays twice the turning point; within ~0.2 ms of recordings), then moves it to the sample while it's still silent: `atrim=start_sample` when late, `adelay` + `aformat` + `asetpts` when early. (`adelay` takes planar formats only, and filters putting out another format than they get have mpv reopen its output, losing ~0.27 s with `gapless-audio=no`: hence `aformat` back to `Player.turnFormat`; files afade can't take turn the plain way. A speed change can't do it: mpv filters in ~0.1 s bursts, so how much one covers is unknown.) The playing player's fade-out goes into its `af` (`armTurn`) at least `TurnArm` before the turning point, as mpv filters ~0.3 s ahead of what's heard; changing `af` is seamless, and mpv keeps unchanged filters (the equalizer's) running. The crossfade is 5 ms once lined up, 20 ms otherwise or with the equalizer on (IIR filters on reversed sound don't give the mirror image of their forward output, ~1 ms apart: a short crossfade leaves a hole on a steady tone), 80 ms with pitch correction at another speed (scaletempo2 builds its sound from ~20 ms pieces and can skip a shorter fade). At the turning point the standby takes over the picture (`turnOver`); the old player plays on unheard until its fade-out has been heard (`heardPos`: the picture's time runs ahead at higher speeds) and waits paused as the next standby. Every seek clears a player's fades first (`clearTurnFades`), as a seek recreates the filters from `af`. At a file's end the standby can't be lined up in time (sent backward, mpv starts from the start of the packet holding that point, up to ~0.1 s short, and not from the last 60 ms), so turns there land within a PipeWire cycle behind a 20 ms crossfade. Turns go the plain way when the standby can't serve (a loop's standby or loop sound, step frames, links, a synchronize group, too close to a file's ends) or isn't ready in time; seeking, stopping or opening a file calls a turn off, and pausing makes the Play button's turn at once (silent then). `MMP_TRACE_TURNS=1` prints each turn's steps to stderr.
+- Stop / Pause after current (the Stop and Pause buttons' right-click menus, `cmStop`/`cmPause`): `afterCurrent` (session only, one of the two at a time) is read by `afterEof` before anything else. Stop runs `stop` there (no queue, no next entry, no After playback action); Pause lets the usual next entry open and pauses it right after `playIndex` (`pauseOnLoad` pauses it again when it has loaded and sends the synchronize group `pause` instead of `play`; Play clears it), and with Repeat File seeks the file back to 0, paused. While either is on, `applyLoop` leaves `loop-file` off so Repeat File reaches its end, a ping-pong file ends at its forward end, and the gapless queue and a short file's delay stand aside. Each goes off once used unless its "Preserve the above after current" (`stopAfterKeep`/`pauseAfterKeep`, saved) is on. The button shows a dot (`dot6`) at its symbol's top right while on: white, indigo (`colAccent`) when preserved. Script commands: `acmenu`, `acaction`, `acdump`.
+- Gapless audio: `gapless-audio` stays `no` (in gapless mode mpv reports the end with ~0.25 s still queued, which opening the next file would cut off), except when mpv has the next file itself. In the last 15 s of an audio file (an audio extension or a cue track) played straight through, `queueGapless` appends the entry `afterEof` would play (the playlist's next, the first when repeating the playlist, or the folder's next with Play next file in the folder) to mpv's playlist and turns gapless on (`weak`: a change of sample rate or channels still reopens the output, with a short gap); `prefetch-playlist` opens it ahead. Videos, the queue, loops, ping-pong, a short file's delay, Stop or Pause after current and synchronized slaves keep the app's own path. mpv then goes on by itself; `Player.wentOn` takes the new path from the `end-file` event and `adoptGapless` runs `playIndex` without opening the file (`adopting`). `handleEof` stands aside while a file is queued, as `eof-reached` can show for a moment before mpv moves on. Gapless is turned off again only once the new file plays (`settled`): turned off while mpv changes files, the new file's audio setup would drop the sound still queued.
 - Seek bar clicks: a click seeks exactly once, on press, so the picture never visits the keyframe before the spot; dragging seeks to keyframes between marks and exactly on a mark snapped to. `Player.landOn` keeps the time shown (seek bar, status bar, OSD) on an exact seek's target until `landingOn` sees it land: mpv's `time-pos` stays the old one for a while, and a keyframe's after an earlier seek.
 - Synchronized frame steps: the master steps and names the time it landed on; slaves go to the frame that puts them at that time plus their offset rather than stepping themselves, so they can't drift at either end of a file. A slave's press only asks the master. A slave's offset is signed: positive is ahead of the master, negative behind it (it waits at its start until the master gets that far).
 - Frame steps: mpv's `frame-back-step` decodes from the previous keyframe on every press, so
@@ -629,6 +718,70 @@ it held, to commit.
   itself (`drawMesh`). Saved parts note their `Seg.sphere`, as opening them skips yt-dlp.
   ffmpeg drops meshes when merging, and needs `-strict -2` for an `.mp4`'s sv3d: a downloaded
   mesh video, or `equi` in `.mp4`, comes out flat.
+- Library (`src/library.nim`; the panel is `libraryPanel`, Options > Libraries `librariesPage`, Custom...
+  `src/libtypes.nim`): libraries are `cfg.libraries` (name, paths, kind audio/video/all/custom with
+  `exts`, hidden), seeded once with Video, Music (the XDG folders) and Sounds (`/usr/share/sounds`,
+  `%WINDIR%\Media`). Every library feeds one index (`LibIndex`): their paths are roots, normalized
+  without touching the disk; folders inside another listed folder aren't walked again, only checked,
+  and each walk keeps the files of every library's types, so a folder is read once however many
+  libraries list it. A library's view (`members`) is a filter over the index: inside its folders and of
+  its types, or listed itself, minus paths found missing (their files stay in the index, tags and all,
+  for when the drive comes back). The index is saved to `~/.cache/majestic-media-player/library.json`
+  (saved while nothing plays, 20 s after a change, else after 10 min, and at exit), read on a thread
+  when the panel or the Options page is first shown, then every path is walked again; a file whose size
+  and time are unchanged keeps its tags.
+  Nothing touches a library path on the main thread (Options' missing/not responding comes from the
+  index, file dialogs start at home unless the path was found): a share that stops answering would
+  block any call into it. Walkers (three at work at once) and a tag reader are threads started as
+  needed and never ended (see the ReplayGain note on Nim's allocator); they post events under a lock
+  that `poll` swaps out (under 0.1 ms per call while a share hangs). A walker or reader that shows no
+  sign of life for 8 s is marked not responding, its path says so, and another thread takes the rest
+  of the work (12 threads at most, ever); a path whose walk is still going or stuck isn't walked again,
+  so rescans don't pile up threads on it. A walk posts what it found before each folder, so files
+  listed before a folder that hangs still show. Tags are read by a headless mpv with no track picked
+  (nothing decoded) in its `on_preloaded` hook, as with no track mpv gives up before `file-loaded`;
+  one that doesn't answer in 10 s is left behind (closing it would wait too) and after two such files
+  a root's others are left unread. Workers run at `SCHED_IDLE` with the idle I/O class (Windows:
+  background mode), and while a file plays (or is paused partway) the reader rests 120 ms between
+  files. The rows in view are read first. The panel's list is rebuilt when the library, sorting or
+  index changes (now and then while files and tags pour in, less often while playing); typing in the
+  search only filters the sorted libraries (each file's lower-case search text is cached). At exit the
+  windows are unmapped before the process ends: a thread stuck in a share keeps a process alive until
+  the share answers, and its windows would stay up, frozen.
+  Its columns are the playlist's (`PlaylistField`), laid out by the same `layoutCells`, `fillsIn` and
+  `minIn` with the library's own set and widths (`libraryColumns`, `libraryColumnWidths`,
+  `libraryShowMillis`): a header click sorts (again: the other way, `librarySort` keeps the field), a
+  drag moves the column, its edge resizes it, a double-click there fits it (`libFitColumn`), and the
+  header's menu picks the columns. Cell text comes from the index alone (`libCellText`; track, disc
+  and year from the tags), never the disk. Group by Folder (that menu, `libraryGroupFolders`) puts the
+  files under a header per folder, relative to the longest listed folder holding them and led by its
+  name ("Music / Album"; `groupRows`, a stable sort by that label, so the sorting holds within each):
+  the drawn rows are `libView`, a header being `-(group + 1)`; selection, Shift ranges and the arrow
+  keys skip headers (`libFileRow`). A click on a header collapses or expands its folder
+  (`libToggleGroup`), and the files area's and header's menus have Collapse All Groups and Expand
+  All Groups (`libCollapseAll`): `libraryCollapsed` keeps the collapsed headers' labels, and
+  `buildLibraryView` leaves their files out of `libView`, dropping them from the selection (Select
+  All and Ctrl+A take the files shown). Play in New Player (Shift+Enter) starts this program with
+  `--new-player` and the files, which never hands them to a running player.
+  Search tags are split at commas only (quotes are characters): `in:`/`exclude:` (a name, or every
+  name it begins), `hidden`, `size`/`bitrate`/`dimension` + `exactly`/`biggerthan`/`smallerthan`
+  (`1.5GB` covers what rounds to it; K/M/G are 1024s for sizes, 1000s for bit rates; a dimension is
+  `WxH` or one number for the shorter side, `1080p`, `4k`), `format:`, `filename contains:`, `path:`,
+  any other `field:` (the tags mpv reports, `artist` also matching album artist), free text in the
+  name, title, artist, album and folders (`foldersOf`: those below the outermost listed folder
+  holding the file, `Artist/Album`, so a search can span them; the listed folder's own name is
+  left out, as every file in it would match; a file listed alone, its folder's name). The suggestions offer library names after `in:`/`exclude:` and the
+  tag names otherwise. The library listed (`libraryShown`) and the search's `in:` tag go together:
+  a click on a library puts `in:<name>` in place of the search's `in:` tags (All takes them out,
+  `withInLibrary`), and as the search changes the column follows it (`syncLibraryShown`: an `in:`
+  naming a library lists it, none lists All; a library listed without a tag, as older versions
+  saved it, gets one). Renaming a library renames it in the search's tags (`renamedInSearch`).
+  Test kits: `tmp/lib/libtest.nim` (scanning, search, rescans, saved index),
+  `tmp/lib/hangtest.nim` with `tmp/lib/hang/hangfs` (a FUSE folder whose calls never return; kill
+  it by PID to release the test), `tmp/lib/bigtest.nim` (20 000 files), `tmp/libt/run.sh` (GUI).
+  Script commands: `libshow`, `libdump`, `libsearch`, `libpick`, `libselect`, `libctx`/`libaction`,
+  `optlib`, `optlibnew`, `optlibitem`, `optlibadd`, `optlibctx`/`optlibaction`, `optlibmenu`,
+  `libtypes`, `libtypesclose`.
 
 ## Source layout
 
@@ -647,13 +800,16 @@ it held, to commit.
 | `src/cue.nim` | Cue sheets: parsed, their audio file found, tracks as playlist entries played through EDL |
 | `src/plmanager.nim` | The playlists' data: tabs, undo steps, playlists.json and its merge between players |
 | `src/tagdlg.nim` | The playlist's Properties window: the tag grid, Autofill, Details |
+| `src/library.nim` | The libraries' index: paths walked and tags read on worker threads, the saved index, search tags, sorting |
+| `src/libtypes.nim` | Options > Libraries > Custom...: a library's file types |
 | `src/midisong.nim` | MIDI and HMI files as timed messages (HMI through SOS's sequencer), and the chart's rows |
 | `src/midichart.nim` | A MIDI song laid out for the tracker chart |
 | `src/avs/` | AVS 2.81d ported: `eel.nim` (the expression language), `core.nim` (pixels, blends, lines), `list.nim` (effect lists, presets), the effects (`render*`, `trans*`, `misc`, `text` (Render / Text and its fonts), `apes*`), `engine.nim` (audio to visdata, beats, frames) |
-| `src/avsdlg.nim` | Visualizer Preset > Visualizers...: the presets' grid, turned on or off, added and removed, searched |
+| `src/avsdlg.nim` | Visualizer Preset > Visualizers...: the presets' grid, turned on or off, hidden, added and removed, searched |
 | `src/avsview.nim`, `src/audiotap.nim` | The visualizer in the video frame (its worker thread, presets, texture); this process's sound, recorded from the sound server |
 | `src/videogl.nim` | mpv → texture rendering and the transformed video quad |
 | `src/coverart.nim`, `src/animpic.nim`, `src/gifanim.nim` | The pictures inside an audio file (their types and bytes); a moving cover's frames (GIF, APNG, WebP) |
+| `src/folderpics.nim` | Options' folder pictures: foobar2000-style patterns (fields, `$substr` and friends, wildcards, subfolders) to the picture beside an audio file |
 | `src/menutree.nim` | Menu bar / popup / context-menu system |
 | `src/options.nim` | Options window (page tree and pages) |
 | `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
@@ -663,6 +819,7 @@ it held, to commit.
 | `src/syncdlg.nim` | Synchronize ▸ Properties window (masters, slaves, offset, looping) |
 | `src/mediactl*.nim` | Task bar media controls (MPRIS / Windows thumbnail toolbar) |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
+| `src/glyphcache.nim`, `src/fallbackfonts.nim`, `src/emojifont.nim` | Characters the UI atlas lacks, rasterized on demand from Plex or a system font chosen per language; color emoji from CBDT or COLR fonts |
 | `src/xwin*.nim`, `src/win32api.nim` | X11 / Win32 helpers (drag, on-top, aspect hints, monitors, menu popup windows) |
 | `src/config.nim`, `src/dialogs*.nim`, `src/theme.nim`, `src/icons.nim` | Settings, file dialogs (kdialog/zenity/portal, Windows common dialogs), palette, vector icons |
 

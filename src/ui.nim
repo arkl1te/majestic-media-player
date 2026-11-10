@@ -3,7 +3,7 @@
 import std/[strformat, strutils, math]
 from std/times import epochTime
 import silky, vmath, bumpy, chroma, pixie, opengl
-import theme, xwin
+import theme, xwin, glyphcache
 
 type
   Ui* = ref object
@@ -243,6 +243,34 @@ proc pill*(ui: Ui, r: Rect, top, bottom: ColorRGBX, feather = 0'f32) =
     ui.sk.drawTriangle([a, faded[i], faded[j]], [uv, uv, uv], [shade(a), clear, clear])
     ui.sk.drawTriangle([a, faded[j], b], [uv, uv, uv], [shade(a), clear, shade(b)])
 
+proc roundRect*(ui: Ui, r: Rect, color: ColorRGBX, radius: float32, feather = 0'f32) =
+  ## r filled with rounded corners. The edge fades out across feather (0: one
+  ## window pixel, which antialiases it); a wide one makes a soft shadow.
+  const ArcSteps = 6
+  let f = if feather > 0: feather else: 1 / ui.scale
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let rad = clamp(radius, 0, min(r.w, r.h) / 2)
+  let (inner, outer) = (max(0'f32, rad - f / 2), rad + f / 2)
+  let center = r.xy + r.wh / 2
+  # The corners' centers, clockwise from the top left, each sweeping its quarter.
+  let corners = [vec2(r.x + rad, r.y + rad), vec2(r.x + r.w - rad, r.y + rad),
+                 vec2(r.x + r.w - rad, r.y + r.h - rad), vec2(r.x + rad, r.y + r.h - rad)]
+  var solid, faded: array[4 * (ArcSteps + 1), Vec2]
+  for k, cc in corners:
+    for i in 0 .. ArcSteps:
+      let angle = PI.float32 * (1 + k.float32 / 2 + i.float32 / (2 * ArcSteps))
+      let d = vec2(cos(angle), sin(angle))
+      solid[k * (ArcSteps + 1) + i] = cc + d * inner
+      faded[k * (ArcSteps + 1) + i] = cc + d * outer
+  let clear = rgbx(0, 0, 0, 0)
+  for i in 0 .. solid.high:
+    let j = (i + 1) mod solid.len
+    let (a, b) = (solid[i], solid[j])
+    ui.sk.drawTriangle([center, a, b], [uv, uv, uv], [color, color, color])
+    ui.sk.drawTriangle([a, faded[i], faded[j]], [uv, uv, uv], [color, clear, clear])
+    ui.sk.drawTriangle([a, faded[j], b], [uv, uv, uv], [color, clear, color])
+
 proc stripes*(ui: Ui, r: Rect, color: ColorRGBX, period = 8'f32, width = 4'f32) =
   ## r crossed by 45-degree stripes. Stripes keep their place when the rect only
   ## changes width, so one rect can fill up over another.
@@ -279,15 +307,20 @@ proc dashedBorder*(ui: Ui, r: Rect, color: ColorRGBX, dash, gap: float32, t = 1'
     ui.rect(rect(r.x + r.w - t, y, t, h), color)
     y += dash + gap
 
+# Each adds the characters the atlas lacks first (glyphcache).
+
 proc textSize*(ui: Ui, s: string, font = FontMain): Vec2 =
+  ui.sk.ensureGlyphs(font, s)
   ui.sk.getTextSize(font, s)
 
 proc text*(ui: Ui, s: string, pos: Vec2, color = colText, font = FontMain) =
+  ui.sk.ensureGlyphs(font, s)
   discard ui.sk.drawText(font, s, pos.floor, color, clip = false)
 
 proc textIn*(ui: Ui, s: string, r: Rect, color = colText, font = FontMain,
              h = LeftAlign, v = MiddleAlign) =
   ## Draws text clipped and aligned inside a rect.
+  ui.sk.ensureGlyphs(font, s)
   discard ui.sk.drawText(font, s, r.xy.floor, color, r.w, r.h, clip = true,
     hAlign = h, vAlign = v)
 
@@ -299,8 +332,10 @@ proc ellipsize*(ui: Ui, s: string, maxW: float32, font = FontMain): string =
     let mid = (lo + hi + 1) div 2
     if ui.textSize(s[0 ..< mid] & "…", font).x <= maxW: lo = mid
     else: hi = mid - 1
-  # Avoid cutting a UTF-8 sequence in half.
-  while lo > 0 and (s[lo].ord and 0xC0) == 0x80: dec lo
+  # Avoid cutting a UTF-8 sequence in half. lo can reach s.len: with invalid
+  # UTF-8 (Windows-1252 preset comments, Latin-1 file names) a lead byte
+  # swallows the bytes after it, so s & "…" can measure narrower than s.
+  while lo > 0 and lo < s.len and (s[lo].ord and 0xC0) == 0x80: dec lo
   s[0 ..< lo] & "…"
 
 proc wrapText*(ui: Ui, s: string, width: float32, maxLines: int, font = FontMain): seq[string] =
@@ -596,15 +631,16 @@ proc wordDrag*(cls: openArray[int], fromItem, toItem: int): tuple[anchor, caret:
   if w1.a >= w0.a: (w0.a, max(w0.b, w1.b)) else: (w0.b, w1.a)
 
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
-                placeholder = ""): set[EditEvent] =
+                placeholder = "", framed = true, lead = 0'f32): set[EditEvent] =
   ## Single-line text input. Focusing it (click or Tab) selects all of its
   ## text; Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
   ## Dragging or Shift+click/arrows select, a double-click selects a word and
   ## a triple-click everything; Ctrl+arrows move by words, Ctrl+A/C/X/V work
-  ## on the selection.
+  ## on the selection. Without framed the caller draws its ground; lead
+  ## leaves room left of the text (for an icon).
   let w = ui.window
   let hov = ui.hover(r)
-  let pad = 7'f32
+  let pad = 7'f32 + lead
   proc hitIndex(text: string, x: float32, nearest = true): int =
     ## Character boundary nearest to window x, or with nearest off, where
     ## the character under x starts.
@@ -717,9 +753,10 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
        w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
       ui.focusId = ""
       result.incl eeCommitted
-  ui.rect(r, colBackground)
-  ui.border(r, if focused: colAccent elif hov: colTextDim else: colBorder)
-  let inner = rect(r.x + pad, r.y, r.w - pad * 2, r.h)
+  if framed:
+    ui.rect(r, colBackground)
+    ui.border(r, if focused: colAccent elif hov: colTextDim else: colBorder)
+  let inner = rect(r.x + pad, r.y, r.w - pad - 7, r.h)
   ui.sk.pushClipRect(inner)
   if focused:
     let cx = ui.textSize(text[0 ..< ui.caret]).x
