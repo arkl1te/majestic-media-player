@@ -1,27 +1,42 @@
 ---
 name: make-changelog
-description: Turn a commit's message into a changelog for the GitHub release page, written for people who use Majestic Media Player and leaving out project technicalities. Use when asked to make, write or translate a changelog, release notes or a release page text, e.g. "make a changelog of the last commit".
+description: Turn the commits since the previous release tag into a changelog for the GitHub release page, written for people who use Majestic Media Player and leaving out project technicalities. Use when asked to make, write or translate a changelog, release notes or a release page text, e.g. "make changelog", "make a changelog of the last commit".
 ---
 
 # Make a changelog
 
-Translate a commit message into release notes that users would care to read. This is for the
+Translate commit messages into release notes that users would care to read. This is for the
 GitHub release page, so it's written for people who use the player, not for its developers.
 
 ## 1. Gather the state
 
-Always read the commit again; never reuse a message from the conversation. Unless told which one,
-take the last commit:
+Always read the commits again; never reuse a message from the conversation, not even a summary
+written for one of these commits.
+
+By default the changelog covers **every commit since the previous release tag**: the newest
+`v*` tag reachable from HEAD other than the version being released (`VERSION`). This works
+whether or not the new release is tagged yet:
 
 ```bash
-git log -1 --format='%h %ad%n%B' --date=short && cat VERSION
+cat VERSION; echo
+prev=$(git tag --merged HEAD --list 'v*' --sort=-v:refname | grep -vx "v$(cat VERSION)" | head -1)
+echo "since $prev"
+git log --reverse --format='=== %h %ad%n%B' --date=short "$prev"..HEAD
 ```
 
-If it was asked for a range of commits (for example since the last release), read them all and
-merge their items.
+- Read every commit in the range, not just the last one, and merge their items into one
+  changelog: an item a later commit changes or undoes is described as it ends up, and the same
+  feature touched by several commits is one item.
+- Some older commits put the whole message on one line; their `=== End of ... ===` markers
+  still separate Changes, New and Fixes.
+- If the user names a commit or a range ("the last commit", "since v0.21.0"), use that instead.
+- Uncommitted changes aren't part of a release: leave them out, and say after the code block
+  that there are some.
+- Under the code block, list the commits it covers (hash and first few words), so the user can
+  check the range.
 
 If an item is too vague to explain to a user, read that part of the commit with `git show` rather
-than guessing what it does. Don't describe anything the commit doesn't contain.
+than guessing what it does. Don't describe anything the commits don't contain.
 
 ## 2. Write the changelog
 
