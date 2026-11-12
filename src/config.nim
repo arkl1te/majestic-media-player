@@ -94,6 +94,8 @@ type
     libraryListWidth*: float = 110 # pixels, the libraries' column, dragged by its right edge
     libraryShowHidden*: bool = false
     libraryShown*: string = ""     # the library listed ("" = All)
+    libraryFolder*: string = ""    # of it, the folder listed (its tree's), "" for the whole library
+    libraryExpanded*: seq[string]  # the tree's nodes shown expanded: "<library>\n<folder>", folder "" for the library
     librarySort*: string = "pfName"  # the PlaylistField the Library panel is sorted by
     libraryColumns*: seq[PlaylistField]  # its columns, left to right; set by loadConfig when empty
     libraryColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
@@ -111,6 +113,7 @@ type
     repeatForever*: bool = false
     repeatPingPong*: bool = false  # loops turn around at either end
     reversePlayback*: bool = false # the Play button turns playback around while playing
+    reversePlaybackAlways*: bool = false # reversePlayback kept on at start (else off at every start)
     repeatMode*: RepeatMode = rmPlaylist
     stopAfterKeep*: bool = false   # Stop after current stays on once it has stopped
     pauseAfterKeep*: bool = false  # Pause after current stays on once it has paused
@@ -267,7 +270,8 @@ type
     playlistAutosave*: seq[string] # playlist files with Autosave on
 
 const
-  MaxRecent = 15
+  MaxRecent = 50                   ## kept; the menu shows MenuRecent, the palette all
+  MenuRecent* = 15
   LoopFramesMaxMB* = 4096          ## hard cap of loopFramesMB (4 GB)
   OsdScaleMin* = 0.25             ## range of osdScale
   OsdScaleMax* = 8.0

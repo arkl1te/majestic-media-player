@@ -94,7 +94,7 @@ proc loadEmojiFont*(path: string, index = 0): EmojiFont =
     else:
       return nil
     result = f
-  except CatchableError:
+  except CatchableError, IndexDefect, RangeDefect:  # a font pixie misreads (see glyphcache.loadFace)
     result = nil
 
 proc baseRecord(f: EmojiFont, gid: int): tuple[first, count: int] =

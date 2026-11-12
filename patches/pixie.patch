@@ -1,0 +1,183 @@
+diff --git a/src/pixie/fontformats/opentype.nim b/src/pixie/fontformats/opentype.nim
+index 14704bf..2711ef3 100644
+--- a/src/pixie/fontformats/opentype.nim
++++ b/src/pixie/fontformats/opentype.nim
+@@ -342,7 +342,7 @@ type
+     italicAngle: int
+     notice: string
+     paintType: int
+-    private: array[2, float32]
++    private: array[2, int]
+     subrs: int
+     subrsBias: int
+     subrIndex: seq[string]
+@@ -872,12 +872,19 @@ proc parseCFFIndexOffsets(
+ 
+   # Compute all of the offsets first.
+   var offsets: seq[int]
++  if start < 0:
++    failUnsupported("CFF index offset")
++  buf.eofCheck(start + 2)
+   let count = buf.readUint16(start).swap().int
+   var endOffset = 0
+   var objectOffset = 0
+   if count != 0:
++    buf.eofCheck(start + 3)
+     var offsetSize = buf.readUint8(start + 2).int
++    if offsetSize notin 1 .. 4:
++      failUnsupported("CFF index offset size")
+     objectOffset = start + ((count.int + 1) * offsetSize.int) + 2
++    buf.eofCheck(objectOffset + 1)
+     var pos = start + 3
+     for i in 0 .. count.int:
+       offsets.add(buf.getOffset(pos, offsetSize.int))
+@@ -896,6 +903,8 @@ proc parseCFFIndexOffsets(
+       b = objectOffset + offsets[i + 1]
+     if stripZero:
+       dec b # ignore 0 at the end
++    if a < objectOffset or b < a or b > buf.len:
++      failUnsupported("CFF index object")
+     result.add((a, b))
+   start = endOffset
+ 
+@@ -1315,20 +1324,24 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+   # contains binary glyphs
+   result.globalSubrIndex = buf.parseCFFIndex(indexOffset)
+ 
++  proc cffByte(data: string, at: int): uint8 =
++    data.eofCheck(at + 1)
++    data.readUint8(at)
++
+   # Parse a `CFF` DICT object.
+   # A dictionary contains key-value pairs in a compact tokenized format.
+   proc parseCFFDict(data: string, start, stop: int): seq[(int, seq[float64])] =
+     var entries: seq[(int, seq[float64])]
+     var operands: seq[float64]
+     var relativeOffset = start
+-    var size = data.len
++    var size = min(stop, data.len)
+     while relativeOffset < size:
+-      var op = data.readUint8(relativeOffset).int
++      var op = cffByte(data, relativeOffset).int
+       inc relativeOffset
+       if op <= 21:
+         # Two-byte operators have an initial escape byte of 12.
+         if op == 12:
+-          op = 1200 + data.readUint8(relativeOffset).int
++          op = 1200 + cffByte(data, relativeOffset).int
+           inc relativeOffset
+         entries.add((op, operands))
+         operands.setLen(0)
+@@ -1344,7 +1357,7 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+             ".", "E", "E-", "null", "-"
+           ]
+           while true:
+-            var b = data.readUint8(relativeOffset).int
++            var b = cffByte(data, relativeOffset).int
+             inc relativeOffset
+             var n1 = b shr 4
+             var n2 = b and 15
+@@ -1365,20 +1378,20 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+           var b3: int
+           var b4: int
+           if b0 == 28:
+-            b1 = data.readUint8(relativeOffset).int
++            b1 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+-            b2 = data.readUint8(relativeOffset).int
++            b2 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+-            return float64(b1 shl 8 or b2)
++            return float64(cast[int16](uint16(b1 shl 8 or b2)))
+ 
+           if b0 == 29:
+-            b1 = data.readUint8(relativeOffset).int
++            b1 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+-            b2 = data.readUint8(relativeOffset).int
++            b2 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+-            b3 = data.readUint8(relativeOffset).int
++            b3 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+-            b4 = data.readUint8(relativeOffset).int
++            b4 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+             return float64(cast[int32](
+               b1 shl 24 or b2 shl 16 or b3 shl 8 or b4))
+@@ -1390,19 +1403,18 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+             return float64(b0 - 139)
+ 
+           if b0 >= 247 and b0 <= 250:
+-            b1 = data.readUint8(relativeOffset).int
++            b1 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+             return float64((b0 - 247) * 256 + b1 + 108)
+ 
+           if b0 >= 251 and b0 <= 254:
+-            b1 = data.readUint8(relativeOffset).int
++            b1 = cffByte(data, relativeOffset).int
+             inc relativeOffset
+             return float64(-(b0 - 251) * 256 - b1 - 108)
+ 
+           failUnsupported("Invalid b0 " & $b0)
+ 
+         let operand = parseOperand(op)
+-        if operand == 4294965216.0: quit()
+         operands.add(operand)
+ 
+     return entries
+@@ -1467,7 +1479,7 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+         key: string,
+         default: int
+       ): int =
+-        if key in topDict:
++        if key in topDict and topDict[key].len > 0:
+           topDict[key][0].int
+         else:
+           default
+@@ -1477,7 +1489,7 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+         key: string,
+         default: string
+       ): string =
+-        if key in topDict:
++        if key in topDict and topDict[key].len > 0:
+           let index = topDict[key][0].int
+           strings.getCFFString(index)
+         else:
+@@ -1488,7 +1500,7 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+         key: string,
+         default: array[N, float32]
+       ): array[N, float32] =
+-        if key in topDict:
++        if key in topDict and topDict[key].len >= result.len:
+           for i in 0 ..< result.len:
+             result[i] = topDict[key][i].float32
+         else:
+@@ -1500,7 +1512,7 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+         default: array[N, string],
+         strings: seq[string]
+       ): array[N, string] =
+-        if key in topDict:
++        if key in topDict and topDict[key].len >= result.len:
+           for i in 0 ..< result.len:
+             let index = topDict[key][i].int
+             result[i] = getCFFString(strings, index)
+@@ -1528,10 +1540,16 @@ proc parseCFFTable(buf: string, offset: int, maxp: MaxpTable): CFFTable =
+       cffTopDict.italicAngle = topDict.getInt("isFixedPitch", 0)
+       cffTopDict.notice = topDict.getStr("notice", "")
+       cffTopDict.paintType = topDict.getInt("paintType", 0)
+-      cffTopDict.private = topDict.getArr("private", [0f, 0f])
++      if "private" in topDict and topDict["private"].len >= 2:
++        cffTopDict.private = [
++          topDict["private"][0].int, topDict["private"][1].int
++        ]
+       var privateSize = cffTopDict.private[0].int
+       var privateOffset = cffTopDict.private[1].int
+       if privateOffset != 0:
++        if privateSize < 0 or privateOffset < 0:
++          failUnsupported("CFF private dict")
++        buf.eofCheck(privateOffset + start + privateSize)
+         var privateDict = parseCFFPrivateDict(
+           buf[privateOffset + start ..< privateOffset + start + privateSize],
+           strings

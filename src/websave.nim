@@ -3,9 +3,9 @@
 ## with its subtitles and chapters. Opened again where some of it was saved,
 ## a link plays that from disk, the stream going on where it ends.
 
-import std/[os, strutils, strformat, tables, times, hashes, algorithm, sequtils, uri]
+import std/[os, strutils, strformat, tables, sets, times, hashes, algorithm, sequtils, uri]
 import jsony
-import spherical
+import spherical, mkvcues
 when not defined(windows): import std/posix
 
 type
@@ -191,6 +191,19 @@ proc timeline*(s: Saved, start, stop: float): string =
     let upTo = min(g.stop, stop)
     result.add &"%{g.file.len}%{g.file},{max(at - g.start, 0):.6f},{upTo - at:.6f};"
     at = upTo
+
+var cuesDone: HashSet[string]  ## files indexAudio has seen to this session
+
+proc indexAudioFile*(file: string) =
+  ## Gives a saved file seek entries for its sound (mkvcues), once a session:
+  ## with the video off, a seek in it would otherwise decode all the sound
+  ## from its start. Before mpv opens it: mpv reads them when it first seeks.
+  ## A file still being written is left for next time.
+  if file notin cuesDone and indexAudio(file) != cfLeft: cuesDone.incl file
+
+proc indexAudio*(s: Saved) =
+  ## indexAudioFile for each of the link's files.
+  for g in s.segs: indexAudioFile(g.file)
 
 proc formatOf(s: Saved, g: Seg): string = (if g.format.len > 0: g.format else: s.auto)
 

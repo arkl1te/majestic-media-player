@@ -27,6 +27,10 @@ let
   colFindHit* = c("#9d8cff", 0.16)  ## playlist rows matching the search
   colBuffered* = c("#473f73")   ## colAccent at 45% brightness: the seek bar's read-ahead
   colTrack* = c("#30333b")
+  colCrumb* = c("#30333b")         ## a Library folder header's breadcrumb
+  colCrumbHover* = c("#41454f")    ## one hovered
+  colCrumbCurrent* = c("#5b4bc4")  ## the folder picked in the libraries' column, under white text
+  colCrumbCurrentHover* = c("#6c5cd6")
   colMarker* = c("#ffc857")
   colBookmark* = c("#ff4d4d")
   colLoop* = c("#4dd2ff")

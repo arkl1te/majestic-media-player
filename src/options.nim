@@ -1080,12 +1080,13 @@ proc webPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float
   for it in web.items:
     if it.url in d.webPicked: picked.add it.url
   d.webPicked = picked
-  if ui.button("o-webdel", "Delete selected", rect(p.x + 8, p.y, 140, 28), picked.len > 0):
+  if ui.iconButton("o-webdel", rect(p.x + 8, p.y + 2, 26, 24), "trash20", "Delete selected",
+      enabled = picked.len > 0, toggled = true, toggledCol = colError):
     d.request = prDeleteWeb
-  if ui.textButton("o-webshow", rect(p.x + 156, p.y, 190, 28), "Open containing folder"):
+  if ui.textButton("o-webshow", rect(p.x + 42, p.y, 190, 28), "Open containing folder"):
     d.request = prOpenWebDir
   let count = &"{web.items.len} item(s)" & (if picked.len > 0: &", {picked.len} selected" else: "")
-  ui.textIn(count, rect(p.x + 354, p.y, p.w - 354, 28), colTextDim, FontSmall, h = RightAlign)
+  ui.textIn(count, rect(p.x + 240, p.y, p.w - 240, 28), colTextDim, FontSmall, h = RightAlign)
   p.y += 36
 
   const rowH = 24'f32
@@ -1624,6 +1625,7 @@ proc endLibRename(d: OptionsDialog, ui: Ui, c: var Config, keep: bool) =
       return
     if c.libraryShown == c.libraries[i].name: c.libraryShown = d.libRenameText.strip  # the panel keeps it
     c.librarySearch = renamedInSearch(c.librarySearch, c.libraries[i].name, d.libRenameText.strip)
+    c.libraryExpanded = renamedInTree(c.libraryExpanded, c.libraries[i].name, d.libRenameText.strip)
     c.libraries[i].name = d.libRenameText.strip
   d.libRenaming = false
   d.libRenameNote = ""

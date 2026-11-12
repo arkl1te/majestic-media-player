@@ -8,7 +8,7 @@ import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, playe
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
   netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
-  avsview, plmanager, cue, animpic, library, libtypes, glyphcache
+  avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog
 from coverart import pictures
 from assoc import loadAssocItems
 from std/uri import encodeUrl, decodeUrl, parseUri, decodeQuery, UriParseError
@@ -37,6 +37,7 @@ const
   CommandsSize = ivec2(880, 520)
   YtdlpSize = ivec2(460, 176)
   EmbedSize = ivec2(460, 176)
+  ConfirmSize = ivec2(460, 216)
   UpdateSize = ivec2(500, 260)
   EqualizerSize = ivec2(520, 336)
   EqMaxGain = 12.0          ## dB at the top of the equalizer's sliders
@@ -88,6 +89,8 @@ const
   LibrarySplitGrip = 5'f32  ## its top edge's draggable band
   LibrarySearchH = 30'f32   ## its search bar
   LibraryStatusH = 22'f32   ## its bottom line
+  LibraryTreeIndent = 14'f32  ## its libraries' column: a folder's step in from the one holding it
+  FoldTime = 0.16           ## seconds a Library folder takes to open or close
   LibraryListMinW = 70'f32  ## the libraries' column, narrowest, and
   LibraryListRest = 110'f32 ## at least what it leaves the files
   LibraryBarW = 10'f32      ## the files' scroll bar
@@ -95,7 +98,8 @@ const
   LibrarySearchTags = ["in:", "exclude:", "hidden", "format:", "filename contains:",
     "size exactly:", "size biggerthan:", "size smallerthan:", "bitrate exactly:",
     "bitrate biggerthan:", "bitrate smallerthan:", "dimension exactly:", "dimension biggerthan:",
-    "dimension smallerthan:", "path:", "title:", "artist:", "album:", "genre:", "year:"]
+    "dimension smallerthan:", "dc:", "dc:after:", "dc:before:", "path:", "title:", "artist:",
+    "album:", "genre:", "year:"]
   SphereFov = 75'f32        ## 360° video: vertical field of view a file opens with
   SphereFovStep = 5'f32     ## degrees per Ctrl+Wheel notch
   SphereTextureMax = 8192   ## cap on the equirectangular texture's longer side
@@ -112,7 +116,7 @@ type
 
   Overlay = enum
     ovNone, ovOptions, ovProperties, ovShortcuts, ovAbout, ovRename, ovCommands, ovSync,
-    ovYtdlp, ovEmbed, ovUpdate, ovTags, ovPalette
+    ovYtdlp, ovEmbed, ovUpdate, ovTags, ovPalette, ovConfirm
 
   YtMode = enum
     ymInstall, ymUpdate, ymBusy, ymFailed  ## what the yt-dlp window asks or shows
@@ -130,6 +134,7 @@ type
     kind: MenuKind            ## mkSub: a submenu, which running opens in the palette
     checked, enabled: bool
     action: proc ()
+    remove: proc ()           ## set: Del removes it from its list (Open Recent's files)
     trail: seq[(string, int)] ## mkSub: label and index of each submenu down to it
     id: string                ## Change Visualizer's list: the preset (two may share a name)
 
@@ -140,7 +145,26 @@ type
     acOff, acStop, acPause  ## the Stop and Pause buttons' "... after current": one at a time
 
   LibCtx = enum
-    lcLibrary, lcBlank, lcFiles, lcHeader  ## where in the Library panel its menu was opened
+    lcLibrary, lcFolder, lcBlank, lcFiles, lcHeader  ## where in the Library panel its menu was opened
+
+  FoldAnim = object
+    ## A folder of the Library opening or closing: its rows unfold under it.
+    key: string               ## a group's label, a tree node's libNodeKey; "" for none
+    opening: bool
+    start: float
+
+  FoldMap = object
+    ## Where a list's rows go while a folder in it unfolds: the rows under it
+    ## show as far as it's open, those after it follow its edge.
+    at, last: int             ## its row and the last row under it; at -1: nothing unfolds
+    open: float32             ## how far, 0..1
+
+  LibNode = object
+    ## A row of the Library panel's tree: All, a library, a folder of one.
+    lib: string               ## "" for All
+    folder: string            ## "" for the library itself
+    depth: int
+    kids, open: bool          ## it has subfolders; they're shown
 
   PointerShape = enum
     ptArrow, ptHidden, ptResize, ptResizeV, ptResizeNWSE, ptResizeNESW, ptCross, ptMove,
@@ -148,9 +172,9 @@ type
 
   TurnState = enum
     tnOff       ## no seamless turn on the way
-    tnParking   ## Enable reverse playback: the standby going to wait ahead,
-                ## facing the other way, for the Play button (parkTick)
-    tnParked    ## waiting there, silent
+    tnParking   ## Enable reverse playback, a video playing: the standby
+                ## opening it, facing the other way, for the Play button (parkTick)
+    tnParked    ## waiting with it, paused
     tnLoading   ## the standby going to its run-up, facing the other way
     tnReady     ## waiting there
     tnRolling   ## playing its run-up, silent, brought in line
@@ -371,7 +395,7 @@ type
     libRowsAt: float          ## when they were last made
     libRowsDrop: int          ## the index's dropGen they were made at (their indices hold until it moves)
     libView: seq[int32]       ## the panel's rows: files (the index's), and folder headers as -(group + 1)
-    libGroups: seq[tuple[label: string, count: int]]  ## those folders, with Group by Folder
+    libGroups: seq[tuple[label, dir: string, count: int]]  ## those folders, with Group by Folder
     libDurSeconds: bool       ## the Duration column in plain seconds: nothing listed lasts over a minute
     libColumnFrom: tuple[index: int, x: float32, moved: bool]  ## the header pressed, while "libcolumn" is active
     libWidthFrom: ColumnDrag  ## while "libwidth" is active
@@ -400,6 +424,11 @@ type
     libDrag: tuple[y: float32, moved: bool, row: int, reselect: bool]  ## while "librow" is active
     libCtx: LibCtx            ## what its right-click menu is about
     libCtxName: string        ## the library right-clicked ("" for All)
+    libCtxFolder: string      ## and its folder right-clicked (lcFolder)
+    libTrees: Table[string, FolderTree]  ## each library's folders, by its name
+    libFoldFiles, libFoldTree: FoldAnim  ## a folder opening or closing in the files' list, in the tree
+    libTreesKey, libTreesMoving: string  ## what they were made from: the libraries, the index
+    libTreesAt: float
     libSuggest: int           ## the search suggestion highlighted
     libSuggestOff: bool       ## Escape put the suggestions away (until the search changes)
     libSuggestKeep: int = -1  ## >= 0: a suggestion was taken, the caret goes there; -2: just keep the field
@@ -407,6 +436,8 @@ type
     libSearchSynced: bool     ## libSearchSeen is set
     libSuggestBox: Rect       ## where they hang, last frame
     libBusy: bool             ## something plays, as the workers were last told
+    libBarSliding: bool       ## the bottom line's bar slides (how far the scan is isn't known)
+    libBarDrawn: float        ## when it was last drawn
     typesDlg: TypesDialog     ## Options > Libraries > Custom..., its window created on first use
     typesWin: Window
     typesSk: Silky
@@ -458,6 +489,12 @@ type
     embTmp: string            ## the chapters file mkvpropedit reads
     embClear: bool            ## clear the file's bookmarks once it's done
     embMode: EmbedMode
+    cfmWin: Window            ## a Yes/Cancel question (Play button's Always), created on first use
+    cfmSk: Silky
+    cfmUi: Ui
+    cfmText: string           ## what saying Yes means
+    cfmQuestion: string       ## the question itself, under it
+    cfmYes: proc ()           ## run on Yes
     upJob: UpJob              ## Check for Updates at work: the check, then getting the release
     thumb: ThumbJob           ## the YouTube link's thumbnail, for while no video track shows
     thumbTex: GLuint          ## it, uploaded
@@ -714,6 +751,7 @@ type
     palAnchor: Vec2           ## the mouse when it opened: its search field's middle goes there
     palAvsList: bool          ## Change Visualizer's list is open: highlighting a preset plays it
     palAvsBefore: string      ## the preset playing when it opened, back on Esc
+    palBuilding: bool         ## buildMenu runs for the palette (Open Recent lists every file kept)
     palAvsTypedAt: float      ## when the search last changed there (it plays a second later), 0: done
     # mouse interaction with the video frame
     videoPress: bool
@@ -778,6 +816,9 @@ type
     tnRunUp: float            ## the standby's run-up, media seconds (none at a file's end)
     tnCenter: float           ## the crossfade's middle: tnAt, unless no run-up
     tnUser: bool              ## the Play button's (else Ping-Pong's)
+    tnInstant: bool           ## the Play button's with a picture: no run-up,
+                              ## the standby takes over as soon as it's there
+    tnOpens: bool             ## and had the file to open first
     tnJumps: int              ## the playing player's jumps as planned
     tnAsked: int              ## the standby's restarts when sent to its run-up
     tnSentAt: float           ## and when
@@ -793,14 +834,14 @@ type
     tnOverAt: float           ## when it took over
     tnOld: Player             ## tnFading: the player taken over from
     tnFadeIn: Player          ## the player whose fade-in is still in af
+    tnFadeInAt: float         ## its middle, the file's time
+    tnFadeInLen: float        ## and length, seconds
+    tnFadeInRestarts: int     ## its restarts before the fade's seek (Player.restarts)
     tnQueued: bool            ## the Play button again meanwhile: turns back after
-    tnRetried: bool           ## the Play button's turn moved on once (the standby late)
     tnFailed: string          ## a file the standby couldn't open: turned the plain way
-    tnParkX: float            ## where the standby waits for the Play button (tnParked)
-    tnParkJumps: int          ## the playing player's jumps then
-    tnParkFrom: bool          ## and its way (backward)
-    tnFast: bool              ## a turn from there (quickTurn)
     tnPrep: float = 0.3       ## how long the standby takes to get to its run-up, learned
+    tnSeekPrep: float = 0.3   ## how long the standby takes to seek a video there
+                              ## (tnInstant), learned
     tnEdge: bool              ## Ping-Pong's turn at a file's end or start
     tnSmear: bool             ## the sound's filtered (not mirrored exactly): long crossfade
     tnDelays: array[8, float] = [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]
@@ -820,6 +861,7 @@ type
     showPreview: bool
     # window management
     onTopApplied: bool
+    dialogWins: seq[Window]   ## every dialog window made, kept on top with the player
     screenInhibit: Inhibitor  # keeps the display on while video plays
     media: MediaControls      # the task bar's play/pause, previous and next
     mediaPollAt, mediaStateAt: float  # when to look at each next, see syncMediaControls
@@ -1206,6 +1248,7 @@ proc applyOnTop(a: App) =
   if want != a.onTopApplied:
     a.onTopApplied = want
     a.window.setAlwaysOnTop(want)
+    for w in a.dialogWins: w.setDialogOnTop(want)
 
 proc applyKeepAwake(a: App) =
   a.screenInhibit.set(a.cfg.keepDisplayOn and a.player.playing and a.player.hasRealVideo)
@@ -1735,6 +1778,7 @@ proc playSaved(a: App, url: string, start: float, part: tuple[start, stop: float
   ## past it; `extra`: more per-file options.
   a.entry(url).used = epochTime()
   let s = a.savedIn(url)
+  s.indexAudio()
   a.playFormat[url] = a.linkFormat(url)
   var opts = extra
   if s.chapters.len > 0 and fileExists(s.chapters): opts.add "chapters-file=" & quoted(s.chapters)
@@ -2863,7 +2907,8 @@ proc cancelTurn(a: App)
 proc playButton(a: App) =
   ## The Play button: playing in reverse goes forward again; with Enable
   ## reverse playback on, playing forward turns around. Plain Play otherwise.
-  ## Playing, a turn is seamless (turnTo): it comes a moment later.
+  ## Playing, a turn comes at once (turnTo), a video's as soon as its picture
+  ## is there going the other way.
   let p = a.player
   if p.loaded and a.heading and p.playing and not p.opening:
     a.turnTo(false)
@@ -3026,6 +3071,13 @@ proc addToPlaylist(a: App, paths: seq[string], at = -1) =
   let first = a.insertEntries(files, at)
   if not a.player.loaded: a.playIndex(first)
   else: a.osd(if files.len == 1: "Added to playlist" else: &"Added {files.len} files to playlist")
+
+proc addFromClipboard(a: App) =
+  ## Files and URLs on the clipboard, appended to the shown playlist.
+  if a.editLocked: return
+  let paths = a.clipboardPaths()
+  if paths.len == 0: a.osd("Clipboard has no file to add")
+  else: a.addToPlaylist(paths)
 
 proc removeEntries(a: App, sel: seq[int], label = "Remove") =
   ## Takes out entries sel (in order) as one undo step; the selection goes
@@ -4643,7 +4695,6 @@ proc pingPong(a: App) =
 const
   TurnRunUp = 1.2         ## Ping-Pong's run-up, seconds (at the speed playing):
                           ## time to line the standby up, and check
-  TurnRunUpUser = 0.65    ## the Play button's: once, as it delays the turn
   TurnArm = 0.45          ## the fades go in at least this long before the
                           ## turning point, seconds: mpv filters the sound up to
                           ## ~0.3 s ahead of what's heard
@@ -4659,19 +4710,13 @@ const
   TurnSettle = 0.33       ## until a change of the standby's sound is all heard, seconds
   TurnStart = 0.06        ## from setting the standby playing until its time is good
   TurnClose = 0.0004      ## in line closer than this: left as it is, seconds
-  TurnQuick = 0.65        ## a turn from the parked standby comes this long after
-                          ## the click, seconds: mpv has ~0.44 s of the sound
-                          ## filtered ahead of what's heard (its audio-buffer and
-                          ## PulseAudio's), which no fade can reach any more, plus
-                          ## measuring the standby and a pass of the loop
-  TurnParkRunUp = 0.6     ## the parked standby waits at least this far past the
-                          ## turning point, seconds: lined up once playing, mpv
-                          ## filters its sound that far ahead too
-  TurnParkSpan = 3.0      ## and up to this much further, media seconds, the
-                          ## extra dropped once playing; it moves on beyond that.
-                          ## (A video's picture couldn't catch up with that much
-                          ## played backward: its standby is sent to the turn on
-                          ## the click, quickly as it has the file open already.)
+  TurnHereFade = 0.01     ## the Play button's turn fades its new sound in over
+                          ## this long, seconds, when that can't simply carry the
+                          ## wave on (turnHere: smeared; seekTurn: two players);
+                          ## the sound before it breaks off, too late for a fade
+  TurnSeekMargin = 0.04   ## the standby's learned seek time plus this, seconds:
+                          ## where a turn with a picture is sent ahead of playback
+  TurnOpenExtra = 0.25    ## and this much more when it has the file to open
   TurnEdge = 0.04         ## Ping-Pong turns this far inside a file's start, seconds:
                           ## playing backward, mpv's sound stops ~17 ms short of it
   TurnEdgeEnd = 0.17      ## and this far inside its end: sent backward, mpv
@@ -4706,8 +4751,7 @@ proc canTurn(a: App): bool =
   ## turnFree, and the standby not busy with a turn (or waiting for one).
   a.turnFree and a.tnState == tnOff
 
-proc sendStandby(a: App, start: float, back: bool, fadeIn: float)
-proc parkWindow(a: App): tuple[lo, hi: float]
+proc sendStandby(a: App, start: float, back: bool, fadeIn: float, startIn = false)
 
 proc turnDelay(a: App): var float =
   ## The standby's learned start delay for this turn: it differs going
@@ -4716,6 +4760,16 @@ proc turnDelay(a: App): var float =
   ## too little run-up to put it in line there, it's learned turn by turn at
   ## the same place.
   a.tnDelays[ord(a.tnBack) * 2 + ord(a.tnVideo) + 4 * ord(a.tnEdge)]
+
+proc smeared(a: App): bool =
+  ## Whether the sound played backward isn't the mirror image of its own
+  ## going forward: the equalizer (filters with a phase, up to a millisecond
+  ## or so apart by frequency) or pitch correction's stretching at another
+  ## speed.
+  let p = a.player
+  let (eqOn, gains) = a.equalizer
+  eqOn and gains.anyIt(it != 0) or
+    abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no"
 
 proc planTurn(a: App, at: float, back: bool, runUp: float, user: bool): bool =
   ## Sends the standby to its run-up for a turn at `at` (the file's time),
@@ -4741,20 +4795,17 @@ proc planTurn(a: App, at: float, back: bool, runUp: float, user: bool): bool =
   (a.tnAt, a.tnBack, a.tnFrom, a.tnRunUp, a.tnUser) = (at, back, p.backward, r, user)
   a.tnEdge = not user and a.pingPongFile and not a.pingPongAb
   a.tnVideo = p.hasRealVideo
-  # The equalizer (filters with a phase), or pitch correction's stretching,
-  # don't give a sound played backward the mirror image of their own going
-  # forward: up to a millisecond or so apart by frequency, a short crossfade
-  # would leave a hole. The longest one smooths it over.
-  let (eqOn, gains) = a.equalizer
+  # Not mirrored exactly (smeared), a short crossfade would leave a hole.
+  # The longest one smooths it over.
   let stretch = abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no"
-  a.tnSmear = eqOn and gains.anyIt(it != 0) or stretch
+  a.tnSmear = a.smeared
   a.tnFadeLen = if stretch: TurnFadeStretch else: TurnFade
   # With no room (a file's end), the crossfade can't reach past the turning
   # point: it ends there, the standby's sound fading in from where it starts.
   a.tnCenter = at - dir * max(a.tnFadeLen / 2 - r, 0)
   a.tnJumps = p.jumps
   a.tnArmed = false
-  a.tnFast = false
+  a.tnInstant = false
   a.tnExpect = 1
   a.tnPass = 0
   a.tnMeasureAt = 0
@@ -4765,15 +4816,16 @@ proc planTurn(a: App, at: float, back: bool, runUp: float, user: bool): bool =
   a.turnTrace(&"plan at {at:.4f} back={back} runup={r:.3f} from {p.posNow:.4f} prep {a.tnPrep:.3f}")
   true
 
-proc sendStandby(a: App, start: float, back: bool, fadeIn: float) =
+proc sendStandby(a: App, start: float, back: bool, fadeIn: float, startIn = false) =
   ## The standby to `start` in the file playing, paused, facing backward or
-  ## not, its sound faded in at fadeIn (silent before it).
+  ## not, its sound faded in at fadeIn (silent before it), or from where it
+  ## starts (startIn).
   let (p, sb) = (a.player, a.standby)
   (a.sbPath, a.sfPath) = ("", "")  # the standby holds the file for the turn now
   sb.h.setProp("pause", true)
   sb.stopped = false
   sb.setBackward(back)
-  sb.setTurnFades(fadeIn = fadeIn, d = a.tnFadeLen)
+  sb.setTurnFades(fadeIn = fadeIn, d = a.tnFadeLen, startIn = startIn)
   sb.h.setProp("hwdec", if back or a.pingPongOn: "no" else: hwdecMode())
   sb.muted = p.muted
   sb.h.setProp("mute", p.muted)
@@ -4803,23 +4855,57 @@ proc cancelTurn(a: App) =
   a.standby.h.setProp("pause", true)
   a.standby.clearTurnFades()
   a.player.clearTurnFades()
+  a.tnInstant = false
   a.tnState = tnOff
 
-proc missedTurn(a: App) =
-  ## The standby not ready in time: the Play button's turn moves on once,
-  ## then turns the plain way; Ping-Pong's turns the plain way (pingPong,
-  ## handleEof).
+proc heardNow(p: Player): float =
+  ## Where the sound heard is now, the file's time: mpv's audio-pts as of
+  ## now; the picture's time (posNow) when that can't be had.
+  for i in 0 ..< 3:
+    let (h, at) = p.heardPos
+    if not math.isNaN(h):
+      return h + (if p.backward: -1.0 else: 1.0) * (now() - at) * p.speed
+  p.posNow
+
+proc turnHere(a: App, back: bool) =
+  ## The playing player turns around itself, at once, from the sound heard
+  ## (the Play button's turn without a picture, or when the standby can't
+  ## have it). mpv drops the sound it has queued (~0.44 s filtered ahead of
+  ## what's heard, out of a fade's reach), and with the file read without
+  ## the demuxer thread (threadless), the sound going the other way follows
+  ## with no gap, from the spot heard to a fraction of a millisecond; now and
+  ## then a PipeWire cycle (21 ms) later, as the drop lands (tmp/revsnd:
+  ## runapp.sh, exact2.py; FLAC, MP3, AAC). Set apart, the turn and its seek
+  ## race (Player.turnAt). mpv's own turn goes back from its time, ~60 ms
+  ## behind what's heard; a link, or a cue track (a part of its file), is
+  ## left to that.
   let p = a.player
+  if back == p.backward: return
+  if not p.playing or p.opening or p.seeking or p.eofReached or not p.threadless or
+     p.duration <= 0 or p.path.contains("://") or p.partEnd > 0:
+    p.setBackward(back)
+    return
+  let dir = if p.backward: -1.0 else: 1.0
+  let at = clamp(p.heardNow, 0, p.duration)
+  # Its sound going the other way from there is the mirror image of what was
+  # heard: the wave goes on unbroken, no fade wanted (one would only break it,
+  # going by a simulation on music, tmp/revsnd/clicksim.py). Unless the sound
+  # isn't mirrored exactly (smeared): it fades in then (afade takes the
+  # formats turnFormat names; others would have mpv reopen its output).
+  let center = if a.smeared and p.turnFormat.len > 0: at - dir * TurnHereFade / 2 else: NaN
+  let restarts = p.restarts
+  p.turnAt(back, at, fadeIn = center, d = TurnHereFade)
+  if not math.isNaN(center):
+    (a.tnFadeIn, a.tnFadeInAt, a.tnFadeInLen, a.tnFadeInRestarts) = (p, center, TurnHereFade, restarts)
+  a.turnTrace(&"here at {at:.4f} back={back}")
+
+proc missedTurn(a: App) =
+  ## The standby not ready in time, or not able: the Play button's turn
+  ## goes on without it (turnHere); Ping-Pong's turns the plain way
+  ## (pingPong, handleEof).
   let (user, back) = (a.tnUser, a.tnBack)
   a.cancelTurn()
-  if not user: return
-  let dir = if p.backward: -1.0 else: 1.0
-  if not a.tnRetried:
-    a.tnRetried = true
-    a.tnPrep = min(a.tnPrep * 1.5, 3)
-    if a.planTurn(p.posNow + dir * p.speed * (a.tnPrep + TurnRunUpUser + 0.1), back,
-                  TurnRunUpUser, user = true): return
-  p.setBackward(back)
+  if user: a.turnHere(back)
 
 proc turnLate(a: App): float =
   ## How much later than the playing player the standby gets to the turning
@@ -4847,9 +4933,8 @@ proc alignTurn(a: App) =
   if a.tnMeasureAt == 0 or now() < a.tnMeasureAt or sb.seeking: return
   let late = a.turnLate
   if math.isNaN(late): return  # again next pass
-  # Way off: one of them stalled (a slow disk?), nothing to mend. (From
-  # the parked standby, its extra distance is still to be dropped.)
-  if abs(late) > (if a.tnFast: a.parkWindow.hi - a.parkWindow.lo + 0.5 else: 0.25):
+  # Way off: one of them stalled (a slow disk?), nothing to mend.
+  if abs(late) > 0.25:
     a.turnTrace(&"late {late * 1000:+.1f} ms: way off")
     a.missedTurn()
     return
@@ -4857,7 +4942,7 @@ proc alignTurn(a: App) =
   a.tnMeasureAt = 0
   # The first one: how late it started, for the next turn to start it that
   # much earlier.
-  if a.tnPass == 1 and not a.tnFast: a.turnDelay = clamp(a.turnDelay + late, -0.15, 0.25)
+  if a.tnPass == 1: a.turnDelay = clamp(a.turnDelay + late, -0.15, 0.25)
   let dir = if p.backward: -1.0 else: 1.0
   let ahead = dir * (a.tnAt - p.posNow) / max(p.speed, 0.01)
   a.turnTrace(&"measure {a.tnPass}: late {late * 1000:+.2f} ms, {ahead:.3f} s ahead")
@@ -4876,9 +4961,8 @@ proc alignTurn(a: App) =
   sb.setTurnFades(fadeIn = a.tnCenter, d = d, shift = shift, fmt = a.tnFormat, rate = a.tnRate)
   if shift != 0: a.tnMeasureAt = now() + TurnSettle  # to check, once heard
 
-proc turnOver(a: App) =
-  ## At the turning point: the standby, running up, becomes the playing
-  ## player. The other one plays on unheard until its fade-out's heard.
+proc swapPlayers(a: App) =
+  ## The standby becomes the playing player, and the playing one the standby.
   let (old, sb) = (a.player, a.standby)
   a.mirrorStandby()  # anything changed meanwhile
   (sb.muted, sb.volume) = (old.muted, old.volume)
@@ -4891,17 +4975,36 @@ proc turnOver(a: App) =
   a.renderNow = true  # the new one's frame, right away
   a.sbPending = false
   a.pingPongLast = sb.timePos
-  (a.tnOld, a.tnFadeIn) = (old, sb)
+
+proc turnOver(a: App) =
+  ## At the turning point: the standby, running up, becomes the playing
+  ## player. The other one plays on unheard until its fade-out's heard.
+  let (old, sb) = (a.player, a.standby)
+  a.swapPlayers()
+  (a.tnOld, a.tnFadeIn, a.tnFadeInAt, a.tnFadeInLen) = (old, sb, a.tnCenter, a.tnFadeLen)
+  a.tnFadeInRestarts = sb.restarts - 1  # playing from there already
   a.tnOverAt = now()
   a.tnState = tnFading
   a.turnTrace(&"over at {old.posNow:.4f} (standby {sb.posNow:.4f})")
 
-proc parkWindow(a: App): tuple[lo, hi: float] =
-  ## How far ahead of the playing player the parked standby may wait, media
-  ## seconds, for a turn at TurnQuick.
-  let s = max(a.player.speed, 0.01)
-  let lo = (TurnQuick + TurnParkRunUp) * s
-  (lo, lo + TurnParkSpan)
+proc seekOver(a: App) =
+  ## The Play button's turn with a picture (tnInstant), at its turning
+  ## point: the playing player stops there, its sound breaking off, and the
+  ## standby, waiting there with its picture and its sound faded in, plays
+  ## on from it. The old one waits paused, the file open facing its way: the
+  ## standby parked for the next turn.
+  let (old, sb) = (a.player, a.standby)
+  old.h.setProp("pause", true)
+  a.swapPlayers()
+  sb.h.setProp("pause", false)
+  sb.paused = false  # mpv says so in a moment; playing now for what follows
+  if math.isNaN(a.tnCenter): a.tnFadeIn = nil
+  else:
+    (a.tnFadeIn, a.tnFadeInAt, a.tnFadeInLen) = (sb, a.tnCenter, a.tnFadeLen)
+    a.tnFadeInRestarts = sb.restarts - 1  # sought there already
+  a.tnInstant = false
+  a.tnState = tnParked
+  a.turnTrace(&"seek over at {old.posNow:.4f} (standby {sb.posNow:.4f})")
 
 proc unpark(a: App) =
   if a.tnState notin {tnParking, tnParked}: return
@@ -4909,99 +5012,90 @@ proc unpark(a: App) =
   a.tnState = tnOff
 
 proc park(a: App) =
-  ## With Enable reverse playback on, the standby waits ahead of the playing
-  ## player, facing the other way and silent, so a click on Play has it play
-  ## at once (quickTurn) without going there first.
-  let p = a.player
-  let dir = if p.backward: -1.0 else: 1.0
-  let (lo, hi) = a.parkWindow
-  var x = p.posNow + dir * hi
-  # Not from the very end backward (sendStandby), nor before the start.
-  x = if dir > 0: min(x, p.duration - TurnEdgeEnd) else: max(x, TurnEdge)
-  if dir * (x - p.posNow) < lo + 0.1:  # no room left: the plain way, if clicked
-    a.unpark()
+  ## With Enable reverse playback on and a video playing, the standby has it
+  ## open, threadless, facing the other way and paused, so the Play button's
+  ## turn only has it seek (seekTurn): opening the file would take a while
+  ## more. Already so (the player a turn took over from), it stays as it is.
+  let (p, sb) = (a.player, a.standby)
+  (a.sbPath, a.sfPath) = ("", "")  # the standby holds the file for the turn now
+  if sb.loaded and sb.threadless and not sb.opening and sb.loadError.len == 0 and
+     sb.path == p.path and sb.source == p.source and sb.backward != p.backward:
+    if not sb.paused: sb.h.setProp("pause", true)
+    a.tnState = tnParked
     return
-  a.tnFormat = p.turnFormat
-  a.tnRate = p.h.getInt("audio-params/samplerate")
-  if a.tnFormat.len == 0 or a.tnRate <= 0:  # its turns go the plain way
-    a.tnFailed = p.path
-    a.unpark()
-    return
-  a.tnFadeLen = TurnFade
+  # Where in the file doesn't matter: it's sent to the turn on the click.
+  let x = clamp(p.posNow, TurnEdge, max(p.duration - TurnEdgeEnd, TurnEdge))
   # Silent all through: its fade-in far ahead of it.
   a.sendStandby(x, not p.backward, if p.backward: 1e5 else: -1e5)
-  (a.tnParkX, a.tnParkJumps, a.tnParkFrom) = (x, p.jumps, p.backward)
   a.tnState = tnParking
-  a.turnTrace(&"park at {x:.3f}, {dir * (x - p.posNow):.3f} ahead")
+  a.turnTrace(&"park at {x:.3f}")
 
 proc parkTick(a: App) =
   ## Keeps the standby parked while Enable reverse playback is on and a
-  ## file plays (not in a ping-pong loop, which turns by itself): sent on
-  ## again once playback has come too close, or went elsewhere.
+  ## video plays (not in a ping-pong loop, which turns by itself). Without
+  ## a picture, the playing player turns itself (turnHere).
   if a.tnState notin {tnOff, tnParking, tnParked}: return
-  let p = a.player
+  let (p, sb) = (a.player, a.standby)
   if not (a.cfg.reversePlayback and not (a.pingPongFile or a.pingPongAb) and not a.tnQueued and
-          a.turnFree):
+          p.hasRealVideo and a.turnFree):
     a.unpark()
     return
-  let dir = if p.backward: -1.0 else: 1.0
-  let (lo, hi) = a.parkWindow
-  let d = dir * (a.tnParkX - p.posNow)
-  let moved = p.jumps != a.tnParkJumps or p.backward != a.tnParkFrom or a.standby.path != p.path
-  # With a picture, where it waits doesn't matter (it's sent to the turn).
-  let far = not p.hasRealVideo and (d < lo + 0.02 or d > hi + 0.3)
-  if a.tnState == tnOff or moved or a.tnState == tnParked and far:
+  if a.tnState == tnOff or sb.path != p.path or sb.source != p.source or sb.backward == p.backward:
     a.park()
 
-proc quickTurn(a: App, back: bool): bool =
-  ## The Play button's turn from the parked standby: set playing at once,
-  ## lined up by alignTurn (it's that much further than the turning point:
-  ## dropped), the turn TurnQuick later.
+proc seekTurn(a: App, back: bool): bool =
+  ## The Play button's turn with a picture: the standby goes to where
+  ## playback will be once it's there (tnSeekPrep, learned), facing the
+  ## other way, its sound fading in there, and takes over as soon as playback
+  ## gets there (seekOver). Played backward, mpv decodes from the keyframe
+  ## before the spot: a parked standby had 3 s of 1080p H.264 ready in
+  ## ~0.15 s, where the playing player turning itself stopped the sound and
+  ## picture for 0.3-0.5 s (tmp/revsnd). False if the standby can't.
   let (p, sb) = (a.player, a.standby)
-  if a.tnState != tnParked or back == p.backward or back != sb.backward or not a.turnFree or
-     p.hasRealVideo:
+  if a.tnState notin {tnOff, tnParking, tnParked} or back == p.backward or not a.turnFree:
     return false
   let dir = if p.backward: -1.0 else: 1.0
-  let s = max(p.speed, 0.01)
-  let (lo, hi) = a.parkWindow
-  let d = dir * (a.tnParkX - p.posNow)
-  if p.jumps != a.tnParkJumps or p.backward != a.tnParkFrom or sb.path != p.path or
-     d < lo - 0.02 or d > hi + 0.3:
-    return false
-  let at = p.posNow + dir * TurnQuick * s
-  (a.tnAt, a.tnBack, a.tnFrom, a.tnRunUp, a.tnUser) = (at, back, p.backward, dir * (a.tnParkX - at), true)
-  (a.tnEdge, a.tnVideo, a.tnFast) = (false, p.hasRealVideo, true)
-  let (eqOn, gains) = a.equalizer
-  let stretch = abs(p.speed - 1) > 1e-6 and p.h.getStr("audio-pitch-correction") != "no"
-  a.tnSmear = eqOn and gains.anyIt(it != 0) or stretch
-  a.tnFadeLen = if stretch: TurnFadeStretch else: TurnFade
-  a.tnCenter = at
+  # As sendStandby opens the file (a while more) or only seeks.
+  let opens = sb.path != p.path or sb.source != p.source or not sb.loaded or not sb.threadless
+  let lead = a.tnSeekPrep + TurnSeekMargin + (if opens: TurnOpenExtra else: 0)
+  var at = p.heardNow + dir * lead * p.speed
+  # Sent to a spot, mpv starts the sound with the frame holding it, up to a
+  # frame's time away (tmp/revsnd): the turn's at the start of a frame, on
+  # the grid of the one shown, the standby sent a little inside it.
+  let fps = a.frameRate(p.path)
+  var inside = 0.0
+  if fps > 0 and not p.seeking:
+    let k = (at - p.timePos) * fps
+    at = p.timePos + (if dir > 0: ceil(k) else: floor(k)) / fps
+    inside = min(0.002, 0.25 / fps)
+  if at > p.duration - TurnEdgeEnd or at < TurnEdge: return false
+  (a.tnAt, a.tnBack, a.tnFrom, a.tnRunUp, a.tnUser) = (at, back, p.backward, 0.0, true)
+  (a.tnInstant, a.tnOpens, a.tnEdge, a.tnVideo, a.tnArmed) = (true, opens, false, true, false)
+  a.tnFadeLen = TurnHereFade
+  # Its sound fades in from wherever it starts (two players can't carry the
+  # wave on unbroken), if afade takes the sound's format (Player.turnFormat).
+  let fades = p.turnFormat.len > 0
+  a.tnCenter = if fades: at - dir * TurnHereFade / 2 else: NaN
   a.tnJumps = p.jumps
-  a.tnArmed = false
-  a.tnExpect = 1
-  a.tnPass = 0
+  a.tnMeasureAt = 0
+  # mpv mustn't go on to a gapless next file once the turn's done.
   p.queueNext("")
-  # Its fade-in where the turn is (the sound it has ready is still silent).
-  sb.setTurnFades(fadeIn = at, d = a.tnFadeLen)
-  a.mirrorStandby()
-  sb.h.setProp("mute", p.muted)
-  sb.h.setProp("pause", false)
-  a.tnRolledAt = now()
-  a.tnMeasureAt = now() + TurnStart
-  a.tnState = tnRolling
-  a.turnTrace(&"quick turn at {at:.4f} from {p.posNow:.4f}, standby {d:.3f} ahead")
+  a.sendStandby(at + inside, back, NaN, startIn = fades)
+  a.tnState = tnLoading
+  a.turnTrace(&"seek turn at {at:.4f} back={back} from {p.posNow:.4f}, lead {lead:.3f}")
   true
 
 proc turnTo(a: App, back: bool) =
-  ## The Play button turning playback around: seamless when the standby can
-  ## be had (a moment later, once it's ready), at once otherwise.
+  ## The Play button turning playback around, at once: a video as soon as
+  ## the standby has its picture there (seekTurn), anything else from the
+  ## sound heard at the click (turnHere).
   let p = a.player
   case a.tnState
   of tnLoading, tnReady:
     if back == p.backward:  # asked to go on the way it goes: called off
       a.turnTrace("called off")
       a.cancelTurn()
-      return
+    return  # else on its way already
   of tnRolling:
     if back == p.backward and (not a.tnArmed or
        (if p.backward: -1.0 else: 1.0) * (a.tnAt - p.posNow) / p.speed > TurnArmAt):
@@ -5015,13 +5109,9 @@ proc turnTo(a: App, back: bool) =
     return
   of tnOff, tnParking, tnParked: discard
   if back == p.backward: return
-  a.tnRetried = false
-  if p.playing and a.quickTurn(back): return
+  if p.playing and p.hasRealVideo and a.seekTurn(back): return
   a.unpark()
-  let dir = if p.backward: -1.0 else: 1.0
-  if p.playing and a.planTurn(p.posNow + dir * p.speed * (a.tnPrep + TurnRunUpUser + 0.05),
-                              back, TurnRunUpUser, user = true): return
-  p.setBackward(back)
+  a.turnHere(back)
 
 proc pingPongTurn(a: App) =
   ## Ping-Pong's next turn, at B or A, or the file's end or start, readied
@@ -5058,10 +5148,12 @@ proc turnTick(a: App) =
   ## Each pass: a seamless turn's next step.
   let sb = a.standby
   if sb == nil: return
-  # The new playing player's fade-in, once heard, goes from af.
+  # The new playing player's fade-in, once heard, goes from af: once its
+  # seek there is made (its time before then is the old way's).
   let q = a.tnFadeIn
   if q != nil and (q != a.player or not q.playing or
-     (if q.backward: -1.0 else: 1.0) * (q.posNow - a.tnCenter) > a.tnFadeLen / 2 + 0.06):
+     q.restarts > a.tnFadeInRestarts and not q.seeking and
+     (if q.backward: -1.0 else: 1.0) * (q.posNow - a.tnFadeInAt) > a.tnFadeInLen / 2 + 0.06):
     q.clearTurnFades()
     a.tnFadeIn = nil
   if a.tnState == tnOff: a.pingPongTurn()
@@ -5105,14 +5197,39 @@ proc turnTick(a: App) =
       sb.justLoaded = false
       a.mirrorStandby()
     if sb.loaded and sb.restarts > a.tnAsked and not sb.seeking:
-      a.tnPrep = clamp(0.7 * a.tnPrep + 0.3 * 1.3 * (now() - a.tnSentAt), 0.05, 3)
+      let took = now() - a.tnSentAt
+      if not a.tnInstant:
+        a.tnPrep = clamp(0.7 * a.tnPrep + 0.3 * 1.3 * took, 0.05, 3)
+      elif not a.tnOpens:
+        # Up at once, down slowly: it varies with how far the keyframe is,
+        # and late, the turn goes back to where it's waiting.
+        a.tnSeekPrep = clamp(max(took, 0.7 * a.tnSeekPrep + 0.3 * took), 0.03, 2)
       a.mirrorStandby()
       a.tnState = tnReady
-      a.turnTrace(&"ready after {now() - a.tnSentAt:.3f} s at {sb.timePos:.4f}, {ahead:.3f} s ahead")
+      a.turnTrace(&"ready after {took:.3f} s at {sb.timePos:.4f}, {ahead:.3f} s ahead")
+    elif a.tnInstant:
+      if now() - a.tnSentAt > 2.5:  # a slow disk? Not waited on any longer
+        a.turnTrace("standby too slow")
+        a.missedTurn()
     elif ahead < TurnArm + 0.05 and not p.paused:
       a.turnTrace(&"not ready in time ({ahead:.3f} s ahead)")
       a.missedTurn()
   of tnReady:
+    if a.tnInstant:
+      if not p.playing and not p.eofReached:
+        # Paused meanwhile: it turns where it is (silent).
+        let back = a.tnBack
+        a.turnTrace("paused")
+        a.cancelTurn()
+        if p.paused and not p.stopped: p.setBackward(back)
+        return
+      # Timed by the sound heard; past it already (the standby slow), the
+      # turn goes back there.
+      let near = if p.eofReached: 0.0 else: dir * (a.tnAt - p.heardNow) / s
+      if near > 0.02: return
+      if near > 0.001: sleep(int(near * 1000))  # closer than a pass of the loop
+      a.seekOver()
+      return
     if not p.playing and not p.eofReached: return  # waits ready
     # Started a little late (a pass of the loop can take a while: the
     # visualizer drawing), alignTurn makes up for it; much later, its run-up
@@ -5166,10 +5283,10 @@ proc turnTick(a: App) =
         return
       # Once the standby's lined up (the crossfade's length known), or at
       # the latest TurnArmAt.
-      if a.tnPass > 0 or ahead <= (if a.tnFast: TurnArm + 0.04 else: TurnArmAt): a.armTurn()
+      if a.tnPass > 0 or ahead <= TurnArmAt: a.armTurn()
     # The picture goes over at the turning point (its sound's fades are in
     # place); a file's end waits a moment for its measurement.
-    let measuring = not a.tnFast and a.tnRunUp / s < TurnArm + 0.15 and a.tnMeasureAt > 0 and
+    let measuring = a.tnRunUp / s < TurnArm + 0.15 and a.tnMeasureAt > 0 and
       ahead > -0.05 / s
     if ahead <= 0.004 / s and not measuring: a.turnOver()
   of tnFading:
@@ -6091,6 +6208,7 @@ proc startSave(a: App, dest: string) =
       styled.setLen 0
       note = "plain subtitles: an .mp4 can't hold styled ones"
     if whole.len > 0:  # the media cache holds all of it
+      indexAudioFile(whole)  # the copy seeks as quickly with the video off
       if d.splitFile.ext.len == 0: d.add whole.splitFile.ext
       a.saveJob = copying(whole, d, styled)
     elif findYtdlp(a.cfg.ytdlp).len == 0:
@@ -6585,6 +6703,8 @@ proc newDialogWindow(a: App, title: string, size: IVec2, modal = true,
   makeContextCurrent(a.window)
   w.icon = appIcon()
   w.setDialogFor(if parent != nil: parent else: a.window, modal)
+  w.setDialogOnTop(a.onTopApplied)
+  a.dialogWins.add w
   w.keepContentsOnResize(colPanel)
   let sk = newSilky(w, a.atlasImg, a.atlas)
   sk.uiScale = a.sk.uiScale
@@ -6637,7 +6757,7 @@ proc applyUiScale(a: App) =
   discard a.rememberAvsWinSize()  # at the old scale
   let (img, atlas) = buildAtlas(s)
   (a.atlasImg, a.atlas) = (img, atlas)
-  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.upSk, a.eqSk,
+  for sk in [a.sk, a.optSk, a.renSk, a.cmdSk, a.pickSk, a.syncSk, a.ytSk, a.embSk, a.cfmSk, a.upSk, a.eqSk,
              a.tagSk, a.avsSk, a.typesSk]:
     if sk == nil: continue
     (sk.image, sk.atlas, sk.builder) = (img, atlas, AtlasBuilder(nil))
@@ -6646,6 +6766,7 @@ proc applyUiScale(a: App) =
     sk.uploadAtlas()
   for (w, size) in [(a.optWin, OptionsSize), (a.renWin, RenameSize), (a.cmdWin, CommandsSize),
                     (a.syncWin, SyncSize), (a.ytWin, YtdlpSize), (a.embWin, EmbedSize),
+                    (a.cfmWin, ConfirmSize),
                     (a.tagWin, TagSize),
                     (a.upWin, UpdateSize), (a.eqWin, EqualizerSize)]:
     if w != nil and w.visible: a.showDialog(w, size)
@@ -6747,6 +6868,47 @@ proc closeEmbed(a: App) =
   if a.embWin.visible:
     a.embWin.visible = false
     a.window.activate()
+
+proc showConfirm(a: App, title, text, question: string, yes: proc ()) =
+  ## Asks question (text explaining it above) with Yes and Cancel; Yes runs
+  ## yes.
+  a.menus.close()
+  if a.overlay notin {ovNone, ovConfirm}: a.closeDialogs()
+  if a.cfmWin == nil:
+    (a.cfmWin, a.cfmSk, a.cfmUi) = a.newDialogWindow(title, ConfirmSize)
+  else: a.cfmWin.title = title
+  (a.cfmText, a.cfmQuestion, a.cfmYes) = (text, question, yes)
+  if a.overlay != ovConfirm:
+    a.cfmUi.focusId = ""
+    a.showDialog(a.cfmWin, ConfirmSize)
+    a.overlay = ovConfirm
+
+proc closeConfirm(a: App) =
+  a.cfmUi.focusId = ""
+  if a.overlay == ovConfirm: a.overlay = ovNone
+  if a.cfmWin.visible:
+    a.cfmWin.visible = false
+    a.window.activate()
+
+proc confirmAnswer(a: App, yes: bool) =
+  let act = a.cfmYes
+  a.cfmYes = nil
+  a.closeConfirm()
+  if yes and act != nil: act()
+
+proc askReverseAlways(a: App) =
+  ## The Play button menu's Always: keeping Enable reverse playback on from
+  ## one session to the next costs all the time, so it asks first.
+  a.showConfirm("Always Enable Reverse Playback",
+    "With reverse playback enabled, every file opens without read-ahead (mpv's " &
+      "demuxer thread and cache), and every video playing is also kept open a " &
+      "second time, decoded and paused, facing the other way. That takes more " &
+      "memory, video memory and CPU, and big or slow-to-read files can stutter.",
+    "Enable reverse playback at every start?",
+    proc () =
+      a.cfg.reversePlaybackAlways = true
+      a.cfg.reversePlayback = true
+      a.cfg.save())
 
 proc embedChapters(a: App): seq[Bookmark] =
   ## The file's chapters and bookmarks together, by time, all named. A
@@ -7311,6 +7473,7 @@ proc closeDialogs(a: App) =
     a.ytUi.focusId = ""
     a.ytWin.visible = false
   of ovEmbed: a.closeEmbed()
+  of ovConfirm: a.confirmAnswer(false)
   of ovUpdate: a.closeUpdate()
   of ovPalette: a.closePalette()
   else: discard
@@ -8229,13 +8392,48 @@ proc libraryRows(a: App, baseKey: string): seq[int32] =
   for v in q.excludes:
     for i in libraryNamed(libs, v, true):
       for id in ix.members(libs[i]): mark[id] = false
+  # A folder of the library listed, picked in its tree: what's in it and below.
+  let folder = a.cfg.libraryFolder
+  let inFolder = folder.len > 0 and pick == @[a.libraryIndexOf(a.cfg.libraryShown)]
   for id in 0 ..< ix.files.len:
-    if mark[id]: result.add int32(id)
+    if mark[id] and (not inFolder or ix.files[id].path.under(folder)): result.add int32(id)
   let sortKey = try: parseEnum[PlaylistField](a.cfg.librarySort) except ValueError: pfName
   ix.sortRows(result, sortKey, a.cfg.librarySortDescending)
   a.libBase = result
   a.libBaseKey = key
   ix.filterRows(result, q)
+
+proc foldOpen(f: FoldAnim): float32 =
+  ## How far it's open, eased (fast, then settling): 0 closed, 1 open.
+  let k = clamp((now() - f.start) / FoldTime, 0, 1)
+  let e = 1 - (1 - k) * (1 - k) * (1 - k)
+  float32(if f.opening: e else: 1 - e)
+
+proc folding(f: FoldAnim): bool = f.key.len > 0 and now() - f.start < FoldTime
+
+proc foldArrow(open: float32): string =
+  ## The arrow of a folder that far open: turned from right to down.
+  "fold" & $int(round(clamp(open, 0, 1) * float32(FoldFrames - 1)))
+
+proc rowY(m: FoldMap, i: int, rowH: float32): float32 =
+  ## Row i's top in the list.
+  if m.at >= 0 and i > m.last: (i.float32 - (1 - m.open) * float32(m.last - m.at)) * rowH
+  else: i.float32 * rowH
+
+proc folded(m: FoldMap, i: int): bool = m.at >= 0 and i > m.at and i <= m.last
+
+proc foldBottom(m: FoldMap, rowH: float32): float32 =
+  ## Where the rows unfolding stop showing.
+  (m.at + 1).float32 * rowH + m.open * float32(m.last - m.at) * rowH
+
+proc rowAt(m: FoldMap, y, rowH: float32): int =
+  ## The row at y in the list (rows unfolding past its edge not counted).
+  if m.at < 0 or y < m.foldBottom(rowH): int(y / rowH)
+  else: int(y / rowH + (1 - m.open) * float32(m.last - m.at))
+
+proc startFold(a: App, f: var FoldAnim, key: string, opening: bool) =
+  f = FoldAnim(key: key, opening: opening, start: now())
+  a.dirtyUntil = max(a.dirtyUntil, now() + FoldTime + 0.05)
 
 proc buildLibraryView(a: App) =
   ## The rows to draw: the files, under a header per folder when grouped, a
@@ -8248,7 +8446,9 @@ proc buildLibraryView(a: App) =
     var k = 0
     for g, grp in a.libGroups:
       a.libView.add int32(-(g + 1))
-      if grp.label notin collapsed: a.libView.add a.libRows[k ..< k + grp.count]
+      # A folder closing keeps its rows until it has.
+      if grp.label notin collapsed or grp.label == a.libFoldFiles.key:
+        a.libView.add a.libRows[k ..< k + grp.count]
       k += grp.count
   else: a.libView = a.libRows
   if a.libSel.len > 0:
@@ -8264,6 +8464,7 @@ proc libToggleGroup(a: App, label: string) =
   let i = a.cfg.libraryCollapsed.find(label)
   if i >= 0: a.cfg.libraryCollapsed.delete(i)
   else: a.cfg.libraryCollapsed.add label
+  a.startFold(a.libFoldFiles, label, i >= 0)
   a.buildLibraryView()
   a.cfg.save()
 
@@ -8274,6 +8475,7 @@ proc libCollapseAll(a: App, collapse: bool) =
     for g in a.libGroups:
       if g.label notin had: a.cfg.libraryCollapsed.add g.label
   else: a.cfg.libraryCollapsed.setLen 0
+  a.libFoldFiles.key = ""
   a.buildLibraryView()
   a.cfg.save()
 
@@ -8286,18 +8488,24 @@ proc libSelectShown(a: App) =
 proc libShow(a: App, name: string) =
   ## Lists the library name ("" for All), the search's in: tags becoming
   ## its own.
-  if a.cfg.libraryShown != name: a.libScroll = 0
+  if a.cfg.libraryShown != name:
+    a.libScroll = 0
+    a.cfg.libraryFolder = ""
   a.cfg.libraryShown = name
   a.cfg.librarySearch = withInLibrary(a.cfg.librarySearch, name)
   a.libSearchSeen = a.cfg.librarySearch
   a.libSearchSynced = true
 
-proc libPick(a: App, name: string) =
-  ## A library picked in the libraries' column (a click, Up/Down): listed,
-  ## and the search's in: tag made its own again if it was changed.
-  if a.cfg.libraryShown != name or
+proc libPick(a: App, name: string, folder = "") =
+  ## A library (or a folder of its tree) picked in the libraries' column (a
+  ## click, the arrow keys): listed, and the search's in: tag made its own
+  ## again if it was changed.
+  let folder = if name.len > 0: folder else: ""
+  if a.cfg.libraryShown != name or a.cfg.libraryFolder != folder or
       parseQuery(a.cfg.librarySearch).ins != (if name.len > 0: @[unicode.toLower(name)] else: @[]):
     a.libShow(name)
+    if a.cfg.libraryFolder != folder: a.libScroll = 0
+    a.cfg.libraryFolder = folder
     a.cfg.save()
 
 proc libColumnNames(a: App): seq[string] =
@@ -8337,6 +8545,7 @@ proc endLibRename(a: App) =
       return
     if a.cfg.libraryShown == old: a.cfg.libraryShown = name
     a.cfg.librarySearch = renamedInSearch(a.cfg.librarySearch, old, name)
+    a.cfg.libraryExpanded = renamedInTree(a.cfg.libraryExpanded, old, name)
     a.libSearchSeen = a.cfg.librarySearch
     a.cfg.libraries[i].name = name
     a.cfg.save()
@@ -8374,7 +8583,10 @@ proc syncLibraryShown(a: App) =
     else: a.cfg.libraryShown = ""
   elif q.ins.len == 1:
     for l in a.cfg.libraries:
-      if unicode.toLower(l.name) == q.ins[0]: a.cfg.libraryShown = l.name
+      if unicode.toLower(l.name) == q.ins[0] and a.cfg.libraryShown != l.name:
+        a.cfg.libraryShown = l.name
+        a.cfg.libraryFolder = ""
+  if a.cfg.libraryShown.len == 0: a.cfg.libraryFolder = ""
   a.libSearchSeen = a.cfg.librarySearch
   a.libSearchSynced = true
 
@@ -8384,7 +8596,7 @@ proc refreshLibraryRows(a: App, force = false) =
   ## and tags pour in, now and then (less often while something plays).
   a.syncLibraryShown()
   let ix = a.library
-  let base = &"{a.cfg.libraryShown}\n{a.cfg.librarySort}\n{a.cfg.libraryGroupFolders}\n" &
+  let base = &"{a.cfg.libraryShown}\n{a.cfg.libraryFolder}\n{a.cfg.librarySort}\n{a.cfg.libraryGroupFolders}\n" &
     &"{a.cfg.librarySortDescending}\n{ix.dropGen}\n{a.cfg.libraries.len}\n" &
     a.cfg.libraries.mapIt(it.name & "|" & $it.hidden & "|" & $it.kind & "|" & it.paths.join("|") &
       "|" & it.exts.join(",")).join("\n")
@@ -8404,6 +8616,132 @@ proc refreshLibraryRows(a: App, force = false) =
   a.libGroups.setLen 0
   if a.cfg.libraryGroupFolders and a.libRows.len > 0: a.libGroups = ix.groupRows(a.libRows)
   a.buildLibraryView()
+
+proc refreshLibraryTrees(a: App) =
+  ## Makes the libraries' folder trees again when the libraries or the
+  ## index changed: at once for files gone, now and then while files pour in.
+  let ix = a.library
+  let settled = $ix.dropGen & "\n" & a.cfg.libraries.mapIt(it.name & "|" & $it.kind & "|" &
+    it.paths.join("|") & "|" & it.exts.join(",")).join("\n")
+  let moving = $ix.gen
+  let t = now()
+  let wait = if a.player.loaded and not a.player.stopped: 1.5 else: 0.4
+  if settled == a.libTreesKey and (moving == a.libTreesMoving or t - a.libTreesAt < wait): return
+  a.libTreesKey = settled
+  a.libTreesMoving = moving
+  a.libTreesAt = t
+  a.libTrees.clear()
+  for l in a.cfg.libraries: a.libTrees[l.name] = ix.folderTree(l)
+
+proc libNodeKey(lib, folder: string): string = lib & "\n" & folder
+
+proc libExpanded(a: App, lib, folder: string): bool =
+  libNodeKey(lib, folder) in a.cfg.libraryExpanded
+
+proc libTreeRows(a: App, drawn = false): seq[LibNode] =
+  ## The libraries' column, top to bottom: All, then each library shown
+  ## (libColumnNames) with its expanded folders under it; drawn, a folder
+  ## closing with its folders still under it.
+  a.refreshLibraryTrees()
+  let closing = if drawn and a.libFoldTree.folding and not a.libFoldTree.opening: a.libFoldTree.key
+                else: ""
+  for name in a.libColumnNames:
+    if name.len == 0:
+      result.add LibNode()
+      continue
+    let t = a.libTrees.getOrDefault(name)
+    var stack = @[("", 0)]
+    while stack.len > 0:
+      let (f, d) = stack.pop
+      let kids = t.children(f)
+      let open = kids.len > 0 and a.libExpanded(name, f)
+      result.add LibNode(lib: name, folder: f, depth: d, kids: kids.len > 0, open: open)
+      if open or (kids.len > 0 and libNodeKey(name, f) == closing):
+        for j in countdown(kids.high, 0): stack.add (kids[j], d + 1)
+
+proc libNodeIndex(a: App, nodes: seq[LibNode]): int =
+  ## The row of the library or folder listed, -1 when it isn't in view.
+  for i, n in nodes:
+    if n.lib == a.cfg.libraryShown and n.folder == a.cfg.libraryFolder: return i
+  -1
+
+proc libSetExpanded(a: App, lib, folder: string, open: bool) =
+  ## Expands a library or folder of the tree, or collapses it: a folder
+  ## listed inside it is then left for it, as it's hidden.
+  let key = libNodeKey(lib, folder)
+  let i = a.cfg.libraryExpanded.find(key)
+  if open == (i >= 0): return
+  a.startFold(a.libFoldTree, key, open)
+  if open: a.cfg.libraryExpanded.add key
+  else:
+    a.cfg.libraryExpanded.delete(i)
+    let f = a.cfg.libraryFolder
+    if a.cfg.libraryShown == lib and f.len > 0 and f != folder and (folder.len == 0 or f.under(folder)):
+      a.libPick(lib, folder)
+      a.libCatReveal = true
+  a.cfg.save()
+
+proc libCrumbs(label, dir: string): seq[tuple[name, folder: string]] =
+  ## A folder header's breadcrumbs: its label's parts ("Music / Album"),
+  ## each with the folder it names, dir's last.
+  let parts = label.split(" / ")
+  var folders = newSeq[string](parts.len)
+  var d = dir
+  for k in countdown(parts.high, 0):
+    folders[k] = d
+    d = d.parentDir
+  for k, p in parts: result.add (p, folders[k])
+
+proc libCrumbCurrent(a: App, folder: string): bool =
+  ## Whether a breadcrumb names the folder picked in the libraries' column
+  ## (a library picked: its listed folders).
+  if a.cfg.libraryFolder.len > 0: folder == a.cfg.libraryFolder
+  elif a.cfg.libraryShown.len > 0: folder in a.libTrees.getOrDefault(a.cfg.libraryShown).tops
+  else: false
+
+proc libGoToFolder(a: App, folder: string) =
+  ## A breadcrumb clicked: its folder picked in the libraries' column (in the
+  ## library listed, else the first library showing it), the ones holding
+  ## it expanded.
+  a.refreshLibraryTrees()
+  var lib = ""
+  let shown = a.cfg.libraryShown
+  if shown.len > 0 and folder in a.libTrees.getOrDefault(shown).count: lib = shown
+  else:
+    for name in a.libColumnNames:
+      if name.len > 0 and folder in a.libTrees.getOrDefault(name).count:
+        lib = name
+        break
+  if lib.len == 0: return
+  let t = a.libTrees[lib]
+  # A library of one folder shows its subfolders straight under its name.
+  let flat = t.tops.len == 1
+  let node = if flat and folder == t.tops[0]: "" else: folder
+  var open = @[libNodeKey(lib, "")]
+  if node.len > 0 and folder notin t.tops:
+    var d = folder.parentDir
+    while d.len > 0 and d in t.count and not (flat and d == t.tops[0]):
+      open.add libNodeKey(lib, d)
+      if d in t.tops: break
+      d = d.parentDir
+  for k in open:
+    if k notin a.cfg.libraryExpanded: a.cfg.libraryExpanded.add k
+  a.libPick(lib, node)
+  a.libCatReveal = true
+  a.cfg.save()
+
+proc libFolderPaths(a: App, lib, folder: string): seq[string] =
+  ## The files a library lists in a folder of it and below, sorted as the
+  ## list is.
+  let i = a.libraryIndexOf(lib)
+  if i < 0: return
+  let ix = a.library
+  var ids: seq[int32]
+  for id in ix.members(a.cfg.libraries[i]):
+    if folder.len == 0 or ix.files[id].path.under(folder): ids.add id
+  let sortKey = try: parseEnum[PlaylistField](a.cfg.librarySort) except ValueError: pfName
+  ix.sortRows(ids, sortKey, a.cfg.librarySortDescending)
+  ids.mapIt(ix.files[it].path)
 
 proc libSelectedPaths(a: App): seq[string] =
   ## The selected files, in the list's order.
@@ -8525,6 +8863,24 @@ proc libraryMenu(a: App): MenuNode =
       m.item("Show", action = proc () = a.setLibraryHidden(name, false))
     else:
       m.item("Hide", enabled = i >= 0, action = proc () = a.setLibraryHidden(name, true))
+    m.sep()
+    m.item("Rescan", enabled = a.cfg.libraries.len > 0, action = proc () =
+      a.library.activate()
+      a.library.rescan())
+  of lcFolder:
+    let (lib, folder) = (a.libCtxName, a.libCtxFolder)
+    m.item("Play", enabled = not a.editLocked, action = proc () = a.libPlay(a.libFolderPaths(lib, folder)))
+    m.item("Add to Playlist", enabled = not a.editLocked, action = proc () =
+      a.libAddToPlaylist(a.libFolderPaths(lib, folder)))
+    m.sep()
+    m.item("Play in New Player", action = proc () = a.libPlayNew(a.libFolderPaths(lib, folder)))
+    m.sep()
+    m.item("Open Folder", action = proc () =
+      when defined(windows): a.spawn("explorer.exe", folder)
+      else: a.spawn("xdg-open", folder))
+    m.item("Copy Path", action = proc () =
+      setClipboardString(folder)
+      a.osd("Copied the path"))
     m.sep()
     m.item("Rescan", enabled = a.cfg.libraries.len > 0, action = proc () =
       a.library.activate()
@@ -8701,7 +9057,9 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   let removeOne = proc (path: string) =
     a.cfg.removeRecent(path)
     if a.cfg.recentFiles.len == 0: a.menus.close()
-  for r in a.cfg.recentFiles:
+  # The menu shows the latest; the command palette's Open Recent all kept.
+  let shownRecent = if a.palBuilding: a.cfg.recentFiles.len else: MenuRecent
+  for r in a.cfg.recentFiles[0 ..< min(shownRecent, a.cfg.recentFiles.len)]:
     recent.item(a.recentName(r), action = bindAct(openOne, r),
       remove = bindAct(removeOne, r))
   if a.cfg.recentFiles.len > 0:
@@ -9162,7 +9520,14 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let m = newMenuRoot()
     m.check("Enable reverse playback", checked = cfg.reversePlayback, action = proc () =
       a.cfg.reversePlayback = not a.cfg.reversePlayback
+      if not a.cfg.reversePlayback: a.cfg.reversePlaybackAlways = false
       a.cfg.save())
+    # On from one session to the next, asked first (askReverseAlways).
+    m.check("Always", checked = cfg.reversePlaybackAlways, action = proc () =
+      if a.cfg.reversePlaybackAlways:
+        a.cfg.reversePlaybackAlways = false
+        a.cfg.save()
+      else: a.askReverseAlways())
     (root, m)
   of cmStop, cmPause:
     # The button's "... after current", and whether it stays on once done.
@@ -9351,6 +9716,10 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           a.saveReplayGain(rmAlbum, a.rgFiles))
         rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
           a.removeReplayGain(a.rgFiles))
+    # Read only when picked: the menu is rebuilt every frame.
+    pl.item("Add Clipboard to Playlist", k(kaAddClipboardPlaylist), enabled = edit,
+      action = proc () = a.addFromClipboard())
+    pl.sep()
     if hasSel:
       let path = a.playlist[a.plSelected]
       pl.item("Open Containing Directory", enabled = not path.contains("://"),
@@ -9552,7 +9921,10 @@ proc avsPaletteItem(a: App, i: int): PaletteItem =
 proc paletteRoot(a: App): MenuNode =
   ## Everything the palette lists, as one menu tree.
   let was = a.ctxMenu
-  defer: a.ctxMenu = was
+  a.palBuilding = true
+  defer:
+    a.ctxMenu = was
+    a.palBuilding = false
   proc menuOf(which: ContextMenu): seq[MenuNode] =
     a.ctxMenu = which
     a.buildMenu().context.children
@@ -9707,7 +10079,7 @@ proc paletteItems(n: MenuNode, trail: seq[(string, int)], path: seq[string],
     of mkAction, mkCheck, mkRadio:
       if c.action == nil or c.label == "Command Palette" or (c.listed and not direct): continue
       res.add PaletteItem(label: c.label, path: path, shortcut: c.shortcut, kind: c.kind,
-        checked: c.checked, enabled: on, action: c.action)
+        checked: c.checked, enabled: on, action: c.action, remove: c.remove)
 
 proc paletteFind(a: App): seq[PaletteItem] =
   ## What the palette shows, best first. With nothing typed, the open
@@ -9888,6 +10260,19 @@ proc paletteKeys(a: App) =
     return
   let n = a.palItems.len
   if n == 0: return
+  # Del removes the highlighted entry from its list (Open Recent), at once,
+  # unless the search field has something after its caret to delete.
+  let sel0 = clamp(a.palSel, 0, n - 1)
+  if pressed[KeyDelete] and a.palItems[sel0].remove != nil and
+     a.ui.caret == a.ui.selAnchor and a.ui.caret >= a.palText.len:
+    a.palItems[sel0].remove()
+    # The one below takes its place (the list is found again as it's drawn).
+    a.palSelKey = if sel0 + 1 < n: a.palItems[sel0 + 1].paletteKey
+                  elif sel0 > 0: a.palItems[sel0 - 1].paletteKey
+                  else: ""
+    a.palFollow = true
+    a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+    return
   let page = max(1, a.palRows - 1)
   var sel = a.palSel
   if pressed[KeyDown]: sel = (sel + 1) mod n
@@ -10435,6 +10820,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaUndoPlaylist, kaRedoPlaylist: a.undoRedo(act == kaRedoPlaylist)
   of kaQueue: (if a.cfg.showPlaylist: a.queueSelected())
   of kaUnqueue: (if a.cfg.showPlaylist: a.unqueueSelected())
+  of kaAddClipboardPlaylist: a.addFromClipboard()
   of kaRunLog: a.runMenuPath(@["View", "Run Log"])
   of kaLibrary: a.runMenuPath(@["View", "Library"])
   of kaSearchLibrary: a.openLibrarySearch()
@@ -10509,7 +10895,7 @@ proc handleKeys(a: App) =
     # A text field being edited takes Escape itself.
     if a.overlay == ovOptions: a.closeOptions(false)
     elif a.overlay == ovRename: a.closeRename()
-    elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovUpdate, ovTags}: discard  # their windows handle Escape
+    elif a.overlay in {ovCommands, ovSync, ovYtdlp, ovEmbed, ovConfirm, ovUpdate, ovTags}: discard  # their windows handle Escape
     elif a.overlay != ovNone: a.overlay = ovNone
     elif a.menus.isOpen: a.menus.close()
     elif a.tkOpen: a.setTrackerPanel(false)
@@ -13074,6 +13460,7 @@ proc playlistPanel(a: App, r: Rect) =
   ui.rect(rect(colHdr.x, colHdr.y + colHdr.h - 1, colHdr.w, 1), colBorder)
 
   a.plListRect = list
+  ui.rect(list, colBackground)  # the rows as dark as the search field
   if ui.hover(colHdr) and ui.released(MouseRight):
     for (cr, f) in cells:
       if ui.hover(cr): a.ctxColumn = f
@@ -13241,6 +13628,10 @@ proc pollLibrary(a: App) =
     ix.setBusy(busy)
   if ix.poll(a.libVisible) and (a.cfg.showLibrary or a.overlay == ovOptions):
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+  if a.libBarSliding and a.cfg.showLibrary:
+    # The sliding bar moves at 30 frames a second, not at the screen's rate.
+    let t = now()
+    if t - a.libBarDrawn >= 1 / 30: a.dirtyUntil = max(a.dirtyUntil, t + 0.001)
   if ix.dropGen != a.libRowsDrop:
     # Files left the index (a rescan not finding them, a path no library
     # lists anymore) and the last ones took their places, so the rows'
@@ -13344,22 +13735,36 @@ proc libraryKeys(a: App): bool =
   if plain and pressed[KeyF2]:
     if a.libCatKeys: a.startLibRename()
     return true
-  # The libraries' column: Up/Down/Home/End pick a library, Enter goes on
-  # to its files.
+  # The libraries' column: Up/Down/Home/End pick a library or folder,
+  # Right expands it (again: its first folder), Left collapses it (again:
+  # up to the one holding it), Enter goes on to its files.
   if a.libCatKeys and plain:
-    let names = a.libColumnNames
-    let at = max(0, names.find(a.cfg.libraryShown))
+    let nodes = a.libTreeRows
+    let at = max(0, a.libNodeIndex(nodes))
+    let nd = nodes[min(at, nodes.high)]
     var to = -1
     if pressed[KeyUp]: to = max(0, at - 1)
-    elif pressed[KeyDown]: to = min(names.high, at + 1)
+    elif pressed[KeyDown]: to = min(nodes.high, at + 1)
     elif pressed[KeyHome]: to = 0
-    elif pressed[KeyEnd]: to = names.high
+    elif pressed[KeyEnd]: to = nodes.high
+    elif pressed[KeyRight]:
+      if nd.kids and not nd.open: a.libSetExpanded(nd.lib, nd.folder, true)
+      elif nd.open: to = at + 1
+      return true
+    elif pressed[KeyLeft]:
+      if nd.open: a.libSetExpanded(nd.lib, nd.folder, false)
+      else:
+        for j in countdown(at - 1, 0):
+          if nodes[j].depth < nd.depth:
+            to = j
+            break
+      if to < 0: return true
     elif pressed[KeyEnter] or pressed[NumpadEnter]:
       a.focusPanel(psFiles)
       if a.libCursorRow < 0: a.libSelectRow(a.libFileRow(0, 1))
       return true
     if to >= 0:
-      a.libPick(names[to])
+      a.libPick(nodes[to].lib, nodes[to].folder)
       a.libCatReveal = true
       return true
   if not a.libArrows or w.ctrl or w.alt: return
@@ -13381,17 +13786,24 @@ proc libraryKeys(a: App): bool =
   if n > 0: a.libSelectRow(max(0, to), w.shiftDown)
   true
 
-proc libraryStatus(a: App): tuple[text: string, color: ColorRGBX] =
-  ## The panel's bottom line: what the scan is doing, what doesn't answer.
+const LibNoBar = -2.0  ## libraryStatus's progress: no bar
+
+proc libraryStatus(a: App): tuple[text: string, color: ColorRGBX, progress: float] =
+  ## The panel's bottom line: what the scan is doing, what doesn't answer;
+  ## progress: how far the scan or the tag reading is, 0..1 (-1: not known,
+  ## LibNoBar: neither under way).
   let ix = a.library
+  let scanning = ix.scanning
+  let left = if scanning: 0 else: ix.unread
+  result.progress = if scanning: ix.scanProgress elif left > 0: ix.readProgress else: LibNoBar
   for p, r in ix.roots:
-    if r.state == rsStuck: return (p.extractFilename & " is not responding", colWarning)
-  if ix.scanning:
+    if r.state == rsStuck:
+      return (p.extractFilename & " is not responding", colWarning, result.progress)
+  if scanning:
     var found = 0
     for r in ix.roots.values: found += r.found
-    return ("Scanning... " & countLabel(max(found, ix.files.len), "file"), colTextDim)
-  let left = ix.unread
-  if left > 0: return ("Reading tags... " & $left & " left", colTextDim)
+    return ("Scanning... " & countLabel(max(found, ix.files.len), "file"), colTextDim, result.progress)
+  if left > 0: return ("Reading tags... " & $left & " left", colTextDim, result.progress)
   var total = 0.0
   for id in a.libRows: total += ix.files[id].duration
   result.text = countLabel(a.libRows.len, "file")
@@ -13569,7 +13981,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     a.libScroll = 0
   if eeCommitted in ev: a.cfg.save()
   ui.tip(field, "Tags between commas: in:Library, exclude:Library, hidden, format:mkv, " &
-    "filename contains:x, size biggerthan:1GB, artist:x...")
+    "filename contains:x, size biggerthan:1GB, dc:2025-10 (created; dc:>2025, dc:<2026-05), artist:x...")
   ui.rect(rect(bar.x, bar.y + bar.h - 1, bar.w, 1), colBorder)
 
   let body = rect(r.x + 1, bar.y + bar.h, r.w - 1, r.h - (bar.y + bar.h - r.y) - LibraryStatusH)
@@ -13591,16 +14003,26 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   ui.rect(cats, colPanel)
   ui.rect(rect(cats.x + cats.w, body.y, 1, body.h), colBorder)
   a.libCatRect = cats
-  let names = a.libColumnNames
-  if a.libraryIndexOf(a.cfg.libraryShown) < 0: a.cfg.libraryShown = ""
+  if a.libraryIndexOf(a.cfg.libraryShown) < 0:
+    a.cfg.libraryShown = ""
+    a.cfg.libraryFolder = ""
+  let nodes = a.libTreeRows(drawn = true)
   let catRowH = 24'f32
-  let catMax = max(0'f32, names.len.float32 * catRowH - cats.h)
+  var cm = FoldMap(at: -1)
+  if a.libFoldTree.folding:
+    for k, nd in nodes:
+      if libNodeKey(nd.lib, nd.folder) == a.libFoldTree.key:
+        var e = k
+        while e + 1 < nodes.len and nodes[e + 1].depth > nd.depth: inc e
+        if e > k: cm = FoldMap(at: k, last: e, open: a.libFoldTree.foldOpen)
+        break
+  let catMax = max(0'f32, cm.rowY(nodes.len, catRowH) - cats.h)
   if ui.hover(cats) and ui.scroll() != 0:
     a.libCatScroll += ui.wheelNotches * catRowH
     ui.scrollConsumed = true
   if a.libCatReveal:  # picked or renamed from the keyboard: into view
     a.libCatReveal = false
-    let ty = max(0, names.find(a.cfg.libraryShown)).float32 * catRowH
+    let ty = max(0, a.libNodeIndex(nodes)).float32 * catRowH
     a.libCatScroll = clamp(a.libCatScroll, ty + catRowH - cats.h, ty)
   a.libCatScroll = clamp(a.libCatScroll, 0, catMax)
   # A library being renamed (F2) that's gone, or with a window over the panel: left as it was.
@@ -13609,27 +14031,54 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     if ui.focusId == "lib-rename": ui.focusId = ""
   ui.sk.pushClipRect(cats)
   var onCat = false
-  for k, name in names:
-    let row = rect(cats.x, cats.y + k.float32 * catRowH - a.libCatScroll, cats.w, catRowH)
+  var catPick, catToggle = -1  # after the loop: the rows change
+  # The folders unfolding show as far as it's open.
+  let catFold = if cm.at < 0: Rect() else: rect(cats.x, cats.y + (cm.at + 1).float32 * catRowH -
+    a.libCatScroll, cats.w, cm.foldBottom(catRowH) - (cm.at + 1).float32 * catRowH)
+  for k, nd in nodes:
+    let name = nd.lib
+    let isLib = name.len > 0 and nd.folder.len == 0
+    let ry = cm.rowY(k, catRowH)
+    let row = rect(cats.x, cats.y + ry - a.libCatScroll, cats.w, catRowH)
+    if cm.folded(k) and ry >= cm.foldBottom(catRowH): continue
     # Out of view, but not the one being renamed: its field keeps the keyboard.
     if (row.y + catRowH < cats.y or row.y > cats.y + cats.h) and
-        (name.len == 0 or name != a.libRename): continue
+        not (isLib and name == a.libRename): continue
     let i = a.libraryIndexOf(name)
-    if name.len > 0 and name == a.libRename:
+    let x0 = row.x + 2 + nd.depth.float32 * LibraryTreeIndent
+    if isLib and name == a.libRename:
       # F2: its name typed over; Enter or a click elsewhere keeps it, Escape doesn't.
-      let ev = ui.textField("lib-rename", rect(row.x + 3, row.y + 1, row.w - 6, row.h - 2), a.libRenameText)
+      let ev = ui.textField("lib-rename", rect(x0 + 18, row.y + 1, row.x + row.w - x0 - 21, row.h - 2),
+        a.libRenameText)
       if eeCommitted in ev: a.endLibRename()
       continue
-    let hov = ui.hover(row) and ui.hover(cats) and not overColEdge
+    let clipped = cm.folded(k)
+    if clipped: ui.sk.pushClipRect(catFold)
+    let hov = ui.hover(row) and ui.hover(cats) and not overColEdge and
+      (not clipped or ui.mouse.inside(catFold))
     let hidden = i >= 0 and a.cfg.libraries[i].hidden
-    if name == a.cfg.libraryShown: ui.rect(row, colPressed)
+    let picked = name == a.cfg.libraryShown and nd.folder == a.cfg.libraryFolder
+    if picked: ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
-    let label = if name.len == 0: "All" else: name
-    let fg = if name == a.cfg.libraryShown: colAccent elif hidden: colTextDim else: colText
-    ui.textIn(ui.ellipsize(label, row.w - 14), rect(row.x + 8, row.y, row.w - 10, catRowH), fg)
+    # The arrow: a click on it expands or collapses, as a double-click on the row does.
+    let arrow = rect(x0, row.y, 18, catRowH)
+    let onArrow = nd.kids and ui.mouse.inside(arrow)
+    if nd.kids:
+      let open = if k == cm.at: cm.open elif nd.open: 1'f32 else: 0'f32
+      ui.icon(foldArrow(open), vec2(x0 + 9, row.y + catRowH / 2),
+        if onArrow and hov: colText else: colTextDim)
+    let label = if name.len == 0: "All" elif isLib: name else: nd.folder.lastPathPart
+    let fg = if picked: colAccent elif hidden: colTextDim else: colText
+    let tx = x0 + 19
+    ui.textIn(ui.ellipsize(label, row.x + row.w - tx - 4), rect(tx, row.y, row.x + row.w - tx - 2, catRowH), fg)
     if hov:
       onCat = true
-      if i >= 0:
+      if onArrow: ui.tip(arrow, if nd.open: "Collapse" else: "Expand")
+      elif not isLib and name.len > 0:
+        ui.tip(row, nd.folder & ": " &
+          countLabel(a.libTrees.getOrDefault(name).count.getOrDefault(nd.folder), "file") &
+          ". Right-click to play it")
+      elif i >= 0:
         let l = a.cfg.libraries[i]
         ui.tip(row, l.name & (if hidden: " (hidden)" else: "") & ": " &
           (if l.paths.len == 0: "no folders yet" else: ui.ellipsize(
@@ -13637,12 +14086,21 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
       else: ui.tip(row, "Every library" & (if a.cfg.libraries.anyIt(it.hidden): " not hidden" else: ""))
       if ui.pressed():
         ui.consumeClick()
-        a.libPick(name)
+        if onArrow: catToggle = k
+        else: catPick = k
+      if nd.kids and not onArrow and w.buttonPressed[DoubleClick]: catToggle = k  # on the press or, on X11, its release
       if ui.released(MouseRight):
-        a.libCtx = lcLibrary
+        a.libCtx = if isLib or name.len == 0: lcLibrary else: lcFolder
         a.libCtxName = name
+        a.libCtxFolder = nd.folder
         a.ctxMenu = cmLibrary
         a.menus.openContext(ui.mouse)
+    if clipped: ui.sk.popClipRect()
+  if not a.libFoldTree.folding: a.libFoldTree.key = ""
+  if catPick >= 0: a.libPick(nodes[catPick].lib, nodes[catPick].folder)
+  if catToggle >= 0:
+    let nd = nodes[catToggle]
+    a.libSetExpanded(nd.lib, nd.folder, not nd.open)
   ui.sk.popClipRect()
   if not onCat and ui.hover(cats) and not overColEdge and ui.released(MouseRight):
     a.libCtx = lcBlank
@@ -13657,8 +14115,21 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   let hdr = rect(fx, body.y, fw, PlaylistHeaderH)
   let list = rect(fx, hdr.y + hdr.h, fw, body.h - hdr.h)
   let rowH = PlaylistRowH
+  # A folder opening or closing (Group by Folder): its files unfold under it.
+  if a.libFoldFiles.key.len > 0 and not a.libFoldFiles.folding:
+    let closed = not a.libFoldFiles.opening
+    a.libFoldFiles.key = ""
+    if closed: a.buildLibraryView()  # its rows go now
   let n = a.libView.len
-  let maxScroll = max(0'f32, n.float32 * rowH - list.h)
+  var fm = FoldMap(at: -1)
+  if a.libFoldFiles.key.len > 0:
+    for i, id in a.libView:
+      if id < 0 and a.libGroups[-id - 1].label == a.libFoldFiles.key:
+        var e = i
+        while e + 1 < n and a.libView[e + 1] >= 0: inc e
+        if e > i: fm = FoldMap(at: i, last: e, open: a.libFoldFiles.foldOpen)
+        break
+  let maxScroll = max(0'f32, fm.rowY(n, rowH) - list.h)
   let barW = if maxScroll > 0: LibraryBarW else: 0'f32
   let rows = rect(list.x, list.y, list.w - barW, list.h)
   let sortKey = try: parseEnum[PlaylistField](a.cfg.librarySort) except ValueError: pfName
@@ -13739,6 +14210,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     a.menus.openContext(ui.mouse)
 
   a.libListRect = list
+  ui.rect(list, colBackground)  # the rows as dark as the search field
   if n == 0:
     let msg =
       if a.cfg.libraries.len == 0: "No libraries. Right-click on the left to create one"
@@ -13750,7 +14222,9 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     let row = a.libCursorRow
     if row >= 0:
       let y = row.float32 * rowH
-      a.libScroll = clamp(a.libScroll, y + rowH - list.h, y)
+      # Grouped, the folder's header sticks to the top: the row goes under it.
+      let top = if a.libGroups.len > 0: y - rowH else: y
+      a.libScroll = clamp(a.libScroll, y + rowH - list.h, top)
     a.libReveal = false
   if ui.hover(list) and ui.scroll() != 0:
     a.libScroll += ui.wheelNotches * rowH * PlaylistWheelRows
@@ -13777,44 +14251,127 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     ui.pill(rect(track.x, ty, track.w, thumbH), if lit: colAccentHover else: colTextDisabled,
       if lit: colAccent else: colTextDisabled)
   ui.sk.pushClipRect(rows)
-  let first2 = int(a.libScroll / rowH)
-  let last2 = min(n, first2 + int(list.h / rowH) + 2) - 1
+  let first2 = max(0, min(fm.rowAt(a.libScroll, rowH), n - 1))
   var visible: seq[int]
   let playing = if a.player.loaded: a.player.path else: ""
   var toggle = ""  # the folder header clicked
   var toggled = false
-  for i in first2 .. last2:
-    let id = a.libView[i]
-    let row = rect(rows.x, rows.y + i.float32 * rowH - a.libScroll, rows.w, rowH)
-    if id < 0:
-      # A folder's header (Group by Folder): a click collapses or expands it.
-      let g = a.libGroups[-id - 1]
-      let shut = a.libGroupCollapsed(g.label)
-      let hovH = ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and
-        not ui.mouse.inside(a.libSuggestBox) and ui.activeId != "librow"
-      ui.rect(row, if hovH: colHover else: colPanelRaised)
-      ui.icon(if shut: "arrow16" else: "expand16", vec2(row.x + 12, row.y + rowH / 2), colTextDim)
-      ui.icon("folder16", vec2(row.x + 30, row.y + rowH / 2), colTextDim)
-      let count = $g.count
-      let cw = ui.textSize(count, FontSmall).x + 12
-      ui.textIn(ui.ellipsize(g.label, row.w - 50 - cw, FontSmall),
-        rect(row.x + 44, row.y, row.w - 48 - cw, rowH), colTextDim, FontSmall)
-      ui.textIn(count, rect(row.x + row.w - cw, row.y, cw - 8, rowH), colTextDisabled, FontSmall,
-        h = RightAlign)
-      if hovH:
+  var toggledRow = -1  # its row, when clicked stuck to the top
+  # The header of the folder at the top, scrolled past: it sticks to the top
+  # of the list, pushed up by the next folder's header as that comes.
+  var pinned = Rect()
+  var pinnedAt = -1
+  if a.libGroups.len > 0 and n > 0:
+    var h = min(first2, n - 1)
+    while h >= 0 and a.libView[h] >= 0: dec h
+    if h >= 0 and rows.y + fm.rowY(h, rowH) - a.libScroll < rows.y:
+      var y = rows.y
+      var nh = h + 1
+      while nh < n and a.libView[nh] >= 0: inc nh
+      if nh < n: y = min(y, rows.y + fm.rowY(nh, rowH) - a.libScroll - rowH)
+      pinned = rect(rows.x, y, rows.w, rowH)
+      pinnedAt = h
+  let underPin = pinnedAt >= 0 and ui.mouse.inside(pinned)
+  var crumbGo = ""  # the breadcrumb clicked: its folder
+  proc groupHeader(row: Rect, i: int, hovH: bool) =
+    ## A folder's header (Group by Folder): its path as breadcrumbs, the
+    ## folder picked in the libraries' column lit; a click on one goes to
+    ## its folder, elsewhere collapses or expands it.
+    let g = a.libGroups[-a.libView[i] - 1]
+    let shut = a.libGroupCollapsed(g.label)
+    let bg = if hovH: colHover else: colPanel  # a shade over the rows' colBackground
+    ui.rect(row, bg)
+    let open = if i == fm.at: fm.open elif shut: 0'f32 else: 1'f32
+    ui.icon(foldArrow(open), vec2(row.x + 12, row.y + rowH / 2), colTextDim)
+    ui.icon("folder16", vec2(row.x + 30, row.y + rowH / 2), colTextDim)
+    let count = $g.count
+    let cw = ui.textSize(count, FontSmall).x + 12
+    ui.textIn(count, rect(row.x + row.w - cw, row.y, cw - 8, rowH), colTextDisabled, FontSmall,
+      h = RightAlign)
+    # The crumbs: each pointed at its end, the next one's notch fitting it.
+    # Too many for the room: the first ones go into a "…" crumb.
+    const Pad = 6'f32
+    const Gap = 2'f32
+    let tipW = CrumbTip.float32
+    let all = libCrumbs(g.label, g.dir)
+    let room = row.x + row.w - cw - 4 - (row.x + 44) - tipW
+    var skip = 0
+    var shown: seq[tuple[name, folder: string, w: float32]]
+    while true:
+      shown.setLen 0
+      if skip > 0: shown.add ("…", all[skip - 1].folder, 0'f32)
+      for k in skip .. all.high: shown.add (all[k].name, all[k].folder, 0'f32)
+      var total = 0'f32
+      for k in 0 .. shown.high:
+        shown[k].w = ceil(ui.textSize(shown[k].name, FontSmall).x + 2 * Pad + (if k > 0: tipW else: 0))
+        total += shown[k].w + Gap
+      if total <= room or skip >= all.high: break
+      inc skip
+    let cy = floor(row.y + (rowH - CrumbH.float32) / 2)
+    var x = floor(row.x + 44)
+    var spots: seq[(Rect, int)]
+    for k, c in shown:
+      let w = floor(min(c.w, max(0'f32, row.x + row.w - cw - 4 - tipW - x)))
+      if w < 2 * Pad: break
+      spots.add (rect(x, cy, w, CrumbH.float32), k)
+      x += w + Gap
+    var over = -1
+    if hovH:
+      for (r, k) in spots:
+        if ui.mouse.inside(rect(r.x, r.y, r.w + tipW, r.h)): over = k
+    var fills: seq[ColorRGBX]
+    for (r, k) in spots:
+      # "…" is lit for the folder picked among those it stands for.
+      let cur = if skip > 0 and k == 0: toSeq(0 ..< skip).anyIt(a.libCrumbCurrent(all[it].folder))
+                else: a.libCrumbCurrent(shown[k].folder)
+      let fill = if cur: (if k == over: colCrumbCurrentHover else: colCrumbCurrent)
+                 elif k == over: colCrumbHover else: colCrumb
+      fills.add fill
+      ui.rect(r, fill)
+      if k > 0: ui.sk.drawImage("crumbtip", vec2(r.x, r.y), bg)  # the notch
+      let tx = r.x + Pad + (if k > 0: tipW else: 0)
+      let tw = r.x + r.w - tx - Pad + 4
+      ui.textIn(ui.ellipsize(shown[k].name, tw, FontSmall), rect(tx, r.y, tw, r.h),
+        if cur: colWhite elif k == over: colText else: colTextDim, FontSmall)
+    # The pointed ends last, over the next crumb's notch.
+    for j, (r, k) in spots: ui.sk.drawImage("crumbtip", vec2(r.x + r.w, r.y), fills[j])
+    if hovH:
+      if over >= 0:
+        ui.tip(row, "Go to " & shown[over].folder)
+      else:
         ui.tip(row, g.label & ": " & countLabel(g.count, "file") &
           (if shut: ". Click to expand" else: ". Click to collapse"))
-        if ui.pressed():
-          ui.consumeClick()
-          a.libFocused = true
-          a.libArrows = true
-          a.libCatKeys = false
-          if a.ui.focusId == "lib-search": a.ui.focusId = ""
-          (toggle, toggled) = (g.label, true)  # after the loop: the rows it draws change
+      if ui.pressed():
+        ui.consumeClick()
+        a.libFocused = true
+        a.libArrows = true
+        a.libCatKeys = false
+        if a.ui.focusId == "lib-search": a.ui.focusId = ""
+        if over >= 0: crumbGo = shown[over].folder
+        else: (toggle, toggled) = (g.label, true)  # after the loop: the rows it draws change
+  # The files unfolding show as far as their folder is open.
+  let fileFold = if fm.at < 0: Rect() else: rect(rows.x, rows.y + (fm.at + 1).float32 * rowH -
+    a.libScroll, rows.w, fm.foldBottom(rowH) - (fm.at + 1).float32 * rowH)
+  var i = first2 - 1
+  while i + 1 < n:
+    inc i
+    let id = a.libView[i]
+    let ry = fm.rowY(i, rowH)
+    if fm.folded(i) and ry >= fm.foldBottom(rowH):
+      i = fm.last  # past its edge: on to the rows after it
+      continue
+    if ry > a.libScroll + list.h: break
+    let row = rect(rows.x, rows.y + ry - a.libScroll, rows.w, rowH)
+    if id < 0:
+      groupHeader(row, i, ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and
+        not ui.mouse.inside(a.libSuggestBox) and ui.activeId != "librow" and not underPin)
       continue
     visible.add id.int
     let f = ix.files[id].addr
-    let hov = ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and
+    let clipped = fm.folded(i)
+    if clipped: ui.sk.pushClipRect(fileFold)
+    let hov = ui.hover(row) and ui.hover(list) and not overColEdge and edge < 0 and not underPin and
+      (not clipped or ui.mouse.inside(fileFold)) and
       not ui.mouse.inside(a.libSuggestBox) and not (ui.activeId == "librow" and a.libDrag.moved)
     let sel = f.path in a.libSel
     if sel: ui.rect(row, colPressed)
@@ -13855,8 +14412,20 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     if hov and ui.pressed(MouseRight):
       a.libFocused = true
       if not sel: a.libSelectRow(i)
+    if clipped: ui.sk.popClipRect()
+  if pinnedAt >= 0:
+    # Over the rows it covers, a line under it.
+    let before = toggled
+    groupHeader(pinned, pinnedAt, underPin and ui.hover(list) and not overColEdge and edge < 0 and
+      not ui.mouse.inside(a.libSuggestBox) and ui.activeId != "librow")
+    ui.rect(rect(pinned.x, pinned.y + rowH - 1, pinned.w, 1), colBorder)
+    if toggled and not before: toggledRow = pinnedAt
   ui.sk.popClipRect()
-  if toggled: a.libToggleGroup(toggle)
+  if crumbGo.len > 0: a.libGoToFolder(crumbGo)
+  if toggled:
+    a.libToggleGroup(toggle)
+    # Collapsed from the top: its header stays there, the next folder under it.
+    if toggledRow >= 0: a.libScroll = toggledRow.float32 * rowH
   if ui.hover(list) and ui.released(MouseRight):
     a.libCtx = lcFiles
     a.ctxMenu = cmLibrary
@@ -13886,8 +14455,27 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   # The bottom line.
   let st = rect(r.x + 1, r.y + r.h - LibraryStatusH, r.w - 1, LibraryStatusH)
   ui.rect(rect(st.x, st.y, st.w, 1), colBorder)
-  let (text, col) = a.libraryStatus
-  ui.textIn(ui.ellipsize(text, st.w - 16, FontSmall), rect(st.x + 8, st.y, st.w - 16, st.h), col, FontSmall)
+  let (text, col, progress) = a.libraryStatus
+  var textW = st.w - 16
+  a.libBarSliding = false
+  if progress != LibNoBar and st.w >= 160:
+    # How far the scan (or the tag reading) is, on the right; sliding back
+    # and forth when that isn't known (a folder never walked before).
+    let bw = clamp(st.w * 0.35, 60, 140)
+    let bar = rect(st.x + st.w - 8 - bw, st.y + st.h / 2 - 3, bw, 6)
+    textW -= bw + 10
+    ui.rect(bar, colTrack)
+    if progress < 0:
+      let seg = bw * 0.3
+      let t = now()
+      let k = (1 - cos(t mod 1.6 / 1.6 * 2 * PI)) / 2
+      ui.rect(rect(bar.x + (bw - seg) * k, bar.y, seg, bar.h), colAccent)
+      a.libBarSliding = true
+      a.libBarDrawn = t
+    else:
+      ui.rect(rect(bar.x, bar.y, bw * clamp(progress, 0, 1), bar.h), colAccent)
+      ui.tip(rect(bar.x, st.y, bar.w, st.h), $int(clamp(progress, 0, 1) * 100) & "%")
+  ui.textIn(ui.ellipsize(text, textW, FontSmall), rect(st.x + 8, st.y, textW, st.h), col, FontSmall)
 
 
 proc runLogPanel(a: App, r: Rect) =
@@ -14536,6 +15124,49 @@ proc renderEmbed(a: App, shot: string) =
   a.endDialogDraw(w, a.embSk, size)
   if (ok or clear or enter) and a.embMode in {emAsk, emInstall}: a.embAnswer(true, clear)
   elif cancel or esc or (enter and a.embMode == emFailed): a.embAnswer(false)
+
+proc renderConfirm(a: App, shot: string) =
+  ## Draws the Yes/Cancel question window: Enter says Yes, Escape and its
+  ## close button Cancel.
+  if a.overlay != ovConfirm: return
+  let w = a.cfmWin
+  let ui = a.cfmUi
+  if w.closeRequested:
+    w.closeRequested = false
+    a.confirmAnswer(false)
+    return
+  let size = w.size
+  if size.x <= 0 or size.y <= 0: return
+  let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+  let esc = w.buttonPressed[KeyEscape]
+  if not a.beginDialogDraw(w, a.cfmSk, size): return  # retried next frame
+  ui.beginFrame()
+  a.cfmSk.beginUi(w, size)
+  glViewport(0, 0, size.x, size.y)
+  glClearColor(colPanel.r.float32 / 255, colPanel.g.float32 / 255,
+    colPanel.b.float32 / 255, 1)
+  glClear(GL_COLOR_BUFFER_BIT)
+  let W = ui.size.x
+  let H = ui.size.y
+  var y = 14'f32
+  for line in ui.wrapText(a.cfmText, W - 32, 5):
+    ui.textIn(line, rect(16, y, W - 32, 22), colText)
+    y += 22
+  y += 8
+  for line in ui.wrapText(a.cfmQuestion, W - 32, 2):
+    ui.textIn(line, rect(16, y, W - 32, 22), colText)
+    y += 22
+  let bw = 100'f32
+  let br = rect(W - 16 - bw, H - 44, bw, 28)
+  let yes = ui.textButton("cfm-yes", br, "Yes", primary = true)
+  let cancel = ui.textButton("cfm-cancel", rect(br.x - bw - 8, br.y, bw, br.h), "Cancel")
+  ui.drawTooltip()
+  a.cfmSk.endUi()
+  ui.endFrame()
+  if shot.len > 0: dialogImage(size).writeFile(shot.changeFileExt("") & "-confirm.png")
+  a.endDialogDraw(w, a.cfmSk, size)
+  if yes or enter: a.confirmAnswer(true)
+  elif cancel or esc: a.confirmAnswer(false)
 
 proc renderEqualizer(a: App, shot: string) =
   ## Draws the Equalizer window: its changes are heard as they are made,
@@ -15208,7 +15839,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Next / previous playlist", @[kaNextPlaylist, kaPrevPlaylist], ""),
       ("Show playing playlist", @[kaShowPlaying], ""),
       ("Undo / redo playlist change", @[kaUndoPlaylist, kaRedoPlaylist], "Ctrl+Z / Ctrl+Y"),
-      ("Add / remove selection in playback queue", @[kaQueue, kaUnqueue], "")]),
+      ("Add / remove selection in playback queue", @[kaQueue, kaUnqueue], ""),
+      ("Add clipboard to playlist", @[kaAddClipboardPlaylist], "")]),
     ("Playlist search", @[
       ("Next / previous match", "Enter / Shift+Enter"),
       ("Next / previous match (also after clicking a row)", "F3 / Shift+F3"),
@@ -15225,9 +15857,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Clear the search, then close the window", "Esc")]),
     ("Library (after clicking it or Tab)", @[
       ("Keyboard to the next / previous column or list shown", "Tab / Shift+Tab"),
-      ("Libraries' column: pick the previous / next library", "Up / Down"),
-      ("Libraries' column: pick All / the last library", "Home / End"),
-      ("Libraries' column: on to the library's files", "Enter"),
+      ("Libraries' column: pick the previous / next library or folder", "Up / Down"),
+      ("Libraries' column: pick All / the last row", "Home / End"),
+      ("Libraries' column: expand (again: first folder) / collapse (again: up a level)", "Right / Left"),
+      ("Libraries' column: on to the files picked", "Enter"),
       ("Libraries' column: rename the library picked (Enter keeps, Esc doesn't)", "F2"),
       ("Select previous / next file", "Up / Down"),
       ("Select a page up / down, first / last file", "Page Up / Page Down, Home / End"),
@@ -15272,6 +15905,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Highlight a page further / back", "Page Down / Page Up"),
       ("Run it (a check or radio item keeps the palette open)", "Enter / Click"),
       ("Open a submenu / go back from it", "Enter / Backspace"),
+      ("Open Recent: remove the highlighted file from the list", "Delete"),
       ("Close the palette", "Esc" & paletteKey),
       ("Change Visualizer: play the next / previous preset", "Down / Up"),
       ("Change Visualizer: put back the preset it opened on", "Esc")]),
@@ -15301,7 +15935,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move playlist or library column", "Drag column header"),
       ("Resize playlist or library column", "Drag column edge"),
       ("Fit playlist or library column to the rows shown", "Double-click column edge"),
-      ("Collapse / expand library folder", "Click folder header"),
+      ("Collapse / expand library folder", "Click folder header (not a breadcrumb)"),
+      ("Go to a folder of a library folder header", "Click its breadcrumb"),
+      ("Expand / collapse a library or folder in the libraries' column", "Click its arrow / Double-click it"),
       ("Resize window (compact mode)", "Drag window edge"),
       ("Quick cover (music, video track off)", "Drop picture on video"),
       ("Volume", "Wheel"), ("Zoom at cursor", "Ctrl+Wheel"),
@@ -15694,6 +16330,8 @@ proc frame(a: App) =
       if ui.pressed(): a.ytWin.activate()
     of ovEmbed:
       if ui.pressed(): a.embWin.activate()
+    of ovConfirm:
+      if ui.pressed(): a.cfmWin.activate()
     of ovUpdate:
       if ui.pressed(): a.upWin.activate()
     of ovProperties: a.propertiesOverlay()
@@ -15795,6 +16433,7 @@ proc frame(a: App) =
   a.renderTypes(shot)
   a.renderYtdlp(shot)
   a.renderEmbed(shot)
+  a.renderConfirm(shot)
   a.renderUpdate(shot)
   a.renderEqualizer(shot)
 
@@ -15810,6 +16449,7 @@ proc keyUi(a: App): Ui =
   of ovTags: a.tagUi
   of ovYtdlp: a.ytUi
   of ovEmbed: a.embUi
+  of ovConfirm: a.cfmUi
   of ovUpdate: a.upUi
   else: (if a.pickOpen: a.pickUi else: a.ui)
 
@@ -15839,13 +16479,13 @@ proc runScriptStep(a: App, st: ScriptStep) =
       n = n.children[i]
     if n == nil or n.action == nil: stderr.writeLine "palrun: no ", st.args.join(" ")
     elif n.enabled: n.action()
-  of "palopen":  # Label: the palette shown, its top-level submenu Label open
+  of "palopen":  # Label[>Label...]: the palette shown, its top-level submenu Label open (and those in it)
     a.showPalette()
-    let label = st.args.join(" ")
-    for it in a.paletteFind():
-      if it.kind == mkSub and it.label == label:
-        a.paletteOpen(it)
-        break
+    for label in st.args.join(" ").split('>'):
+      for it in a.paletteFind():
+        if it.kind == mkSub and it.label == label:
+          a.paletteOpen(it)
+          break
   of "paldump":  # what the palette lists, in order
     stderr.writeLine "palette ", $a.paletteFind().mapIt(it.label)
   of "trackdump":  # the audio, video and subtitle tracks picked (0: none)
@@ -15926,6 +16566,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
         $l.paths.mapIt(it & "=" & $ix.rootState(it))
     a.refreshLibraryRows(force = true)
     stderr.writeLine "libview shown=", (if a.cfg.libraryShown.len == 0: "All" else: a.cfg.libraryShown),
+      (if a.cfg.libraryFolder.len > 0: " folder=" & a.cfg.libraryFolder else: ""),
       " search=\"", a.cfg.librarySearch, "\" sort=", a.cfg.librarySort,
       (if a.cfg.librarySortDescending: " desc" else: ""), " rows=", a.libRows.len,
       " files=", ix.files.len, " scanning=", ix.scanning, " unread=", ix.unread,
@@ -15939,7 +16580,20 @@ proc runScriptStep(a: App, st: ScriptStep) =
       a.libListRect.w.int, a.libListRect.h.int), " height=", a.cfg.libraryHeight.int
   of "libsearch": a.cfg.librarySearch = arg  # the search's text
   of "libpick": a.libShow(if arg == "All": "" else: arg)  # the library listed, its in: tag in the search
+  of "libnode", "libtoggle":  # Library|folder (folder optional): a tree row clicked, or its arrow
+    let bar = arg.find('|')
+    let (lib, folder) = if bar < 0: (arg, "") else: (arg[0 ..< bar], arg[bar + 1 .. ^1])
+    if st.cmd == "libnode": a.libPick(lib, folder)
+    else: a.libSetExpanded(lib, folder, not a.libExpanded(lib, folder))
+  of "libtreedump":  # the libraries' column, as drawn: depth, arrow, the row listed *
+    for n in a.libTreeRows:
+      stderr.writeLine "libtree ", repeat("  ", n.depth),
+        (if n.kids: (if n.open: "v " else: "> ") else: "  "),
+        (if n.lib.len == 0: "All" elif n.folder.len == 0: n.lib else: n.folder.lastPathPart),
+        (if n.lib == a.cfg.libraryShown and n.folder == a.cfg.libraryFolder: " *" else: "")
   of "libselect": a.libSelectRow(parseInt(arg))  # selects row i
+  of "libgroup": a.libToggleGroup(arg)  # label: a folder group's header clicked (Group by Folder)
+  of "libscroll": a.libScroll = parseFloat(arg) * PlaylistRowH  # the files list scrolled down that many rows
   of "libctx", "libaction":  # ctx [label]: lib:NAME, blank, files or header; lists its menu or runs label
     let c = st.args[0]
     a.libCtx = if c.startsWith("lib"): lcLibrary elif c == "blank": lcBlank
@@ -16028,6 +16682,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
         a.runAction(act)
         break
   of "focus": a.keyUi.focusId = arg
+  of "stall": sleep(parseInt(arg))  # ms: one slow frame; input meanwhile arrives together
   of "type": a.keyUi.typedPending.add arg
   of "overlay":
     a.showOverlay(case arg
@@ -16212,6 +16867,10 @@ proc runScriptStep(a: App, st: ScriptStep) =
       " aid=", p.selectedTrack("audio"), " sid=", p.selectedTrack("sub"),
       " loop=", a.hasLoopA, "/", a.hasLoopB, "/", a.abLoop, " ", a.loopA, "-", a.loopB,
       " fs=", a.fullscreen, " zoom=", a.xf.zoom, " size=", a.window.size
+  of "cfmdump":  # the Yes/Cancel question shown, and the reverse playback settings
+    stderr.writeLine "confirm overlay=", a.overlay, " question=", a.cfmQuestion,
+      " reverse=", a.cfg.reversePlayback, " always=", a.cfg.reversePlaybackAlways
+  of "cfmanswer": a.confirmAnswer(arg == "yes")  # yes or cancel, as clicking its button
   of "embdump":
     stderr.writeLine "embed mode=", a.embMode, " overlay=", a.overlay, " msg=", a.embMsg,
       " status=", a.mkvStatus, " exe=", findMkvpropedit(a.cfg.mkvpropedit), " marks=", a.fileBookmarks.len,
@@ -16333,13 +16992,47 @@ proc runScriptStep(a: App, st: ScriptStep) =
       stderr.writeLine "dump ", prop, " = ", a.player.h.getStr(prop)
   else: stderr.writeLine "script: unknown command ", st.cmd
 
+proc crashState(a: App): string =
+  ## What crash.log tells about the moment of a crash (see crashlog). Release
+  ## builds have no stack trace, so this is what points at the code: the
+  ## keys of the frame that crashed and the control taking them.
+  if a.player != nil: result.add "File: " & a.player.path & "\n"
+  result.add "Shown: overlay " & $a.overlay & ", playlist " & $a.cfg.showPlaylist &
+    ", library " & $a.cfg.showLibrary & ", run log " & $a.cfg.showRunLog & "\n"
+  if a.menus != nil and a.menus.isOpen: result.add "A menu was open (context menu " & $a.ctxMenu & ")\n"
+  let ui = a.keyUi
+  if ui != nil:
+    result.add "Focused control: " & ui.focusId & "\n"
+    if ui.window != nil:
+      var pressed, held: seq[string]
+      for b in Button:
+        if ui.window.buttonPressed[b]: pressed.add $b
+        elif ui.window.buttonDown[b]: held.add $b
+      result.add "Keys and buttons pressed in that frame: " & pressed.join(" ") &
+        "; held from before: " & held.join(" ") & "\n"
+
 proc main() =
+  installCrashLog(configDir(), AppName & " " & AppVersion)
   discard setlocale(LC_NUMERIC, "C")
   when defined(windows): attachStdio()
   let a = App(plIndex: -1, plSelected: -1, tabs: @[newTab(DefaultName, scratch = true)],
     optionsDlg: newOptionsDialog(),
     cmdDlg: newCmdDialog(), pickDlg: newPickDialog(), tkCorrection: true)
+  crashlog.snapshot = proc (): string = a.crashState
   a.cfg = loadConfig()
+  # Enable reverse playback starts off, whatever the last session left,
+  # unless its Always is on.
+  if not a.cfg.reversePlaybackAlways: a.cfg.reversePlayback = false
+  # Hidden libraries start out of sight: Show Hidden Libraries off, a hidden
+  # library left listed giving way to All, and the search's hidden tag and
+  # in: tags naming one dropped.
+  block:
+    let shown = a.cfg.libraries.filterIt(it.name == a.cfg.libraryShown)
+    if shown.len > 0 and shown[0].hidden:
+      a.cfg.libraryShown = ""
+      a.cfg.libraryFolder = ""
+    a.cfg.libraryShowHidden = false
+    a.cfg.librarySearch = withoutHidden(a.cfg.librarySearch, a.cfg.libraries)
   discard a.cfg.reloadRecent()
   a.script = loadScript()
   randomize()
@@ -16535,6 +17228,7 @@ proc main() =
     if a.avsWin != nil: a.avsWin.runeInputEnabled = true
     if a.ytWin != nil: a.ytWin.runeInputEnabled = true
     if a.embWin != nil: a.embWin.runeInputEnabled = true
+    if a.cfmWin != nil: a.cfmWin.runeInputEnabled = true
     if a.upWin != nil: a.upWin.runeInputEnabled = true
     if a.eqWin != nil: a.eqWin.runeInputEnabled = true
 
@@ -16727,7 +17421,7 @@ proc main() =
       discard step()
       # Handled: the main loop mustn't handle it again once pollEvents returns.
       for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
-                a.upWin, a.eqWin, a.tagWin, a.avsWin]:
+                a.cfmWin, a.upWin, a.eqWin, a.tagWin, a.avsWin]:
         if w != nil: w.clearFrameInput()
       enableRunes()
       stepping = false)
@@ -16783,7 +17477,7 @@ proc main() =
   # waiting on a share that never answers keeps the process (and the
   # windows with it, frozen) around until the share does.
   for w in [a.window, a.optWin, a.renWin, a.cmdWin, a.pickWin, a.syncWin, a.ytWin, a.embWin,
-            a.upWin, a.eqWin, a.tagWin, a.avsWin, a.typesWin]:
+            a.cfmWin, a.upWin, a.eqWin, a.tagWin, a.avsWin, a.typesWin]:
     if w != nil and w.visible: w.visible = false
   pollEvents()
   if a.upRestart: relaunch()

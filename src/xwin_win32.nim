@@ -480,6 +480,12 @@ proc setAlwaysOnTop*(window: Window, on: bool) =
   discard SetWindowPos(window.hwnd, if on: HWND_TOPMOST else: HWND_NOTOPMOST,
     0, 0, 0, 0, SWP_NOMOVE or SWP_NOSIZE or SWP_NOACTIVATE)
 
+proc setDialogOnTop*(window: Window, on: bool) =
+  ## Makes a dialog topmost while the player is (On Top). Being owned by the
+  ## player isn't enough: every topmost window ranks above every other, so a
+  ## non-topmost dialog falls behind its topmost owner. Shown or hidden alike.
+  window.setAlwaysOnTop(on)
+
 proc setAspectHints*(window: Window, aspect: float, chrome: IVec2, minSize: IVec2) =
   ## Keeps (window - chrome) at the given aspect while the user resizes, and
   ## the client area at least minSize. aspect <= 0 removes the constraint.

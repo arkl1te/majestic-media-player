@@ -696,15 +696,21 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
     let shift = w.shiftDown
-    let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    # The selection is read where it's used, never once per frame: keys
+    # pressed faster than frames (a slow frame) arrive together, and Ctrl+A
+    # then Backspace would otherwise delete the selection from before Ctrl+A.
+    template selection(): (int, int) =
+      (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
     proc deleteSelection(text: var string) =
+      let (s0, s1) = selection()
       text.delete(s0 ..< s1)
       ui.caret = s0
       ui.selAnchor = s0
     if ctrl and w.buttonPressed[KeyA]:
       ui.selAnchor = 0
       ui.caret = text.len
-    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and ui.caret != ui.selAnchor:
+      let (s0, s1) = selection()
       setClipboardString(text[s0 ..< s1])
       if w.buttonPressed[KeyX]:
         deleteSelection(text)
@@ -863,15 +869,21 @@ proc textArea*(ui: Ui, id: string, r: Rect, text: var string,
     ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
     let shift = w.shiftDown
-    let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    # The selection is read where it's used, never once per frame: keys
+    # pressed faster than frames (a slow frame) arrive together, and Ctrl+A
+    # then Backspace would otherwise delete the selection from before Ctrl+A.
+    template selection(): (int, int) =
+      (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
     proc deleteSelection(text: var string) =
+      let (s0, s1) = selection()
       text.delete(s0 ..< s1)
       ui.caret = s0
       ui.selAnchor = s0
     if ctrl and w.buttonPressed[KeyA]:
       ui.selAnchor = 0
       ui.caret = text.len
-    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and ui.caret != ui.selAnchor:
+      let (s0, s1) = selection()
       setClipboardString(text[s0 ..< s1])
       if w.buttonPressed[KeyX]:
         deleteSelection(text)

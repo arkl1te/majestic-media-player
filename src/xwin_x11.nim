@@ -295,6 +295,11 @@ proc setAlwaysOnTop*(window: Window, on: bool) =
   let above = XInternAtom(d, "_NET_WM_STATE_ABOVE", 0)
   window.sendWmMessage("_NET_WM_STATE", [clong(on), above.clong, 0, 1])
 
+proc setDialogOnTop*(window: Window, on: bool) =
+  ## Nothing to do here: the WM keeps a dialog (transient) above its parent,
+  ## even one kept above (KWin, checked with Options over an On Top player).
+  discard
+
 proc setAspectHints*(window: Window, aspect: float, chrome: IVec2, minSize: IVec2) =
   ## Asks the WM to keep (window - chrome) at the given aspect while resizing.
   ## aspect <= 0 removes the constraint.

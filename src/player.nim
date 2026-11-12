@@ -216,6 +216,21 @@ proc hwdecMode*(): string =
   ## the GPU's memory out of it.
   if cpuWanted: "no" else: "auto-safe"
 
+proc setHdrOpts(h: MpvHandle) =
+  ## How HDR video (HLG or PQ: iPhone recordings, HDR10) is brought down to
+  ## the screen's SDR. The render API draws with vo_gpu, which can't apply
+  ## Dolby Vision's per-scene mapping, and its default curve keeps HLG's
+  ## reference white (203 nits) at full white: an iPhone video's lit walls,
+  ## skies and screens all crowd near white, the picture too bright and
+  ## washed out next to the phone. Hable lowers the whole curve to make
+  ## room for the highlights; against libplacebo with the Dolby Vision
+  ## metadata applied (vo_gpu_next) on 35 iPhone 13 Pro Max frames, day and
+  ## night, it halves the difference and leaves no brightness bias (+18
+  ## levels in 255 before). Only HDR goes through the curve: SDR video comes
+  ## out the same to the byte. The peak detection it pairs with is mpv's
+  ## default (hdr-compute-peak).
+  h.setOpt("tone-mapping", "hable")
+
 proc takeFrameReady*(): bool = frameReady.exchange(0) != 0
 proc takePreviewReady*(): bool = previewReady.exchange(0) != 0
 proc takeOsdReady*(): bool = osdReady.exchange(0) != 0
@@ -263,6 +278,7 @@ proc newPlayer*(volume: float, muted, osd: bool): Player =
   h.setOpt("vo", "libmpv")
   h.setOpt("hwdec", hwdecMode())
   if cpuWanted: h.setOpt("profile", "fast")  # cheap scaling for the software renderer
+  h.setHdrOpts()
   # Direct rendering has the decoder wait on the render thread (ours) for
   # frame buffers, so any blocking mpv call from the UI could deadlock.
   h.setOpt("vd-lavc-dr", "no")
@@ -413,7 +429,7 @@ proc turnFormat*(p: Player): string =
   else: ""
 
 proc setTurnFades*(p: Player, fadeIn = NaN, fadeOut = NaN, d = 0.02, shift = 0.0,
-                   fmt = "", rate = 0) =
+                   fmt = "", rate = 0, startIn = false) =
   ## A seamless turn's fades (the app's turnTick): the sound fades in over
   ## `d` seconds centered on the file's time fadeIn, silent before it, or out
   ## centered on fadeOut, silent after it; NaN for neither. "Before" and
@@ -430,6 +446,9 @@ proc setTurnFades*(p: Player, fadeIn = NaN, fadeOut = NaN, d = 0.02, shift = 0.0
   ## decoded sound's sample format (turnFormat) and rate, as the playing
   ## player has them: asking a player playing backward could wait on its
   ## core reading the file.
+  ## `startIn` fades in over `d` from the first sample the filters get after
+  ## the next seek (they're made anew), wherever that is: for a standby whose
+  ## sound starts at its picture's frame, a frame's time off where it's sent.
   let dir = if p.backward: -1.0 else: 1.0
   let f = (proc (t: float): string = formatFloat(t, ffDecimal, 6))
   var fades: seq[string]
@@ -438,6 +457,7 @@ proc setTurnFades*(p: Player, fadeIn = NaN, fadeOut = NaN, d = 0.02, shift = 0.0
     fades.add(if shift > 0: "atrim=start_sample=" & $n
               else: "adelay=delays=" & $n & "S:all=1,aformat=sample_fmts=" & fmt &
                 ",asetpts=PTS-" & $n & "/SR/TB")
+  if startIn: fades.add "afade=t=in:ss=0:d=" & f(d) & ":curve=qsin"
   for (t, kind) in [(fadeIn, "in"), (fadeOut, "out")]:
     if not t.isNaN:
       fades.add "afade=t=" & kind & ":st=" & f(TurnShift.float + dir * t - d / 2) &
@@ -576,21 +596,23 @@ proc posNow*(p: Player): float =
   let d = min((epochTime() - p.timeAt) * p.speed, p.frameDur)
   if p.backward: p.timePos - d else: p.timePos + d
 
+proc setBackStep(p: Player) =
+  ## Run out of what it has read playing backward, mpv goes back this far and
+  ## reads up to there before playing on (60 s by default): from a link,
+  ## ~4 MB, a few tenths of a second's wait. (A file reads fast enough.)
+  var step = 60.0
+  if p.path.contains("://"):
+    let rate = p.h.getFloat("video-bitrate", 0) + p.h.getFloat("audio-bitrate", 0)  # bits/s
+    step = if rate > 0: clamp(32e6 / rate, 5, 60) else: 10.0
+  if step != p.backStep:
+    p.backStep = step
+    p.h.setProp("demuxer-backward-playback-step", step)
+
 proc setBackward*(p: Player, on: bool) =
   ## Which way playback goes; mpv turns around where it is (a seek).
   if on == p.backward: return
   p.clearTurnFades()
-  if on:
-    # Run out of what it has read, mpv goes back this far and reads up to
-    # there before playing on (60 s by default): from a link, ~4 MB, a few
-    # tenths of a second's wait. (A file reads fast enough.)
-    var step = 60.0
-    if p.path.contains("://"):
-      let rate = p.h.getFloat("video-bitrate", 0) + p.h.getFloat("audio-bitrate", 0)  # bits/s
-      step = if rate > 0: clamp(32e6 / rate, 5, 60) else: 10.0
-    if step != p.backStep:
-      p.backStep = step
-      p.h.setProp("demuxer-backward-playback-step", step)
+  if on: p.setBackStep()
   p.backward = on
   p.h.setProp("play-direction", if on: "backward" else: "forward")
 
@@ -1313,6 +1335,24 @@ proc seek*(p: Player, t: float, exact = true) =
   p.h.commandAsync("seek", formatFloat(max(t, 0), ffDecimal, 3), "absolute",
     if exact: "exact" else: "keyframes")
 
+proc turnAt*(p: Player, back: bool, at: float, fadeIn = NaN, d = 0.02) =
+  ## Turns around (setBackward) to play on from `at`, sought exactly, its
+  ## sound faded in from there (fadeIn and d as setTurnFades) or not. In
+  ## one command list: mpv makes its own seek for a turn (to its time, ~60 ms
+  ## behind what's heard) the moment the direction changes, before taking a
+  ## seek asked for after it; it then seeks again, a few tenths of a second
+  ## more with a picture, and now and then starting a packet further on (58
+  ## ms of FLAC). Waits for mpv to take it (no longer than the other calls
+  ## turns make: audio-pts).
+  if not p.loaded or p.pastPart(at): return
+  if back: p.setBackStep()
+  p.backward = back
+  p.setTurnFades(fadeIn = fadeIn, d = d)  # in before the seek makes the filters anew
+  p.noteSeek(at)
+  inc p.jumps
+  p.h.commandStr("set play-direction " & (if back: "backward" else: "forward") &
+    "; seek " & formatFloat(max(at, 0), ffDecimal, 6) & " absolute exact")
+
 proc landOn*(p: Player, t: float) =
   ## An exact seek to t was just asked for: its time is the one to show. mpv's
   ## stays the old one for a while, or that of a keyframe sought before it.
@@ -1479,6 +1519,7 @@ proc newPreview*(): Preview =
   h.setOpt("vo", "libmpv")
   h.setOpt("hwdec", hwdecMode())
   if cpuWanted: h.setOpt("profile", "fast")  # cheap scaling for the software renderer
+  h.setHdrOpts()                       # the thumbnails look like the video
   h.setOpt("vd-lavc-dr", "no")         # see newPlayer
   h.setOpt("terminal", "no")
   h.setOpt("audio", "no")

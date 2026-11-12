@@ -39,6 +39,7 @@ type
     path*: string
     size*: int64
     mtime*: int64           ## seconds since 1970
+    ctime*: int64           ## when the file was created (its birth time), seconds since 1970; 0: unknown
     probed*: bool           ## its tags were read (or reading them failed)
     duration*: float        ## seconds
     width*, height*: int    ## the first real video track's; 0 without one
@@ -61,6 +62,7 @@ type
     gen: int                ## the walk under way (or last done)
     walked: bool            ## walked (a top folder), rather than checked
     found*: int             ## files the walk found so far
+    expected: int           ## files the index had under it as the walk began (0: none known)
     error*: string
     timeouts: int           ## files that timed out while their tags were read
 
@@ -69,7 +71,7 @@ type
 
   Found = object
     path: string
-    size, mtime: int64
+    size, mtime, ctime: int64
 
   Event = object
     kind: EvKind
@@ -119,7 +121,7 @@ type
     coEq, coGt, coLt
 
   TermKind = enum
-    tkText, tkSize, tkBitrate, tkDim, tkFormat, tkFilename, tkField, tkPath
+    tkText, tkSize, tkBitrate, tkDim, tkFormat, tkFilename, tkField, tkPath, tkCreated
 
   Term = object
     kind: TermKind
@@ -128,6 +130,7 @@ type
     keys: seq[string]       ## tkField: the tag keys it reads (normalized)
     lo, hi: float           ## a number's range (tkSize, tkBitrate, single-number tkDim)
     w, h: int               ## tkDim: WxH, 0 for a single number
+    bad: bool               ## tkCreated: the date couldn't be read (matches nothing)
 
   Query* = object
     ## A search: tags separated by commas.
@@ -161,6 +164,8 @@ type
     feedAt: float           ## when to look through the index for files to read again
     unreadCount: int        ## files whose tags are to be read, as last counted
     unreadAt: float
+    runFrom: int            ## the first walk of the scan under way (or last made)
+    readDone: int           ## tags read since the reading last ran out of files
 
 var
   sh: Shared
@@ -245,6 +250,30 @@ proc busy(): bool =
 proc skipName(name: string): bool =
   name.len == 0 or name[0] == '.' or name in ["$RECYCLE.BIN", "System Volume Information", "lost+found"]
 
+when defined(linux):
+  {.localPassC: "-D_GNU_SOURCE".}
+  type
+    StatxTime {.importc: "struct statx_timestamp", header: "<sys/stat.h>", bycopy.} = object
+      tv_sec: int64
+    Statx {.importc: "struct statx", header: "<sys/stat.h>", bycopy.} = object
+      stx_mask: uint32
+      stx_btime: StatxTime
+  proc statx(dirfd: cint, path: cstring, flags: cint, mask: cuint, buf: var Statx): cint
+    {.importc, header: "<sys/stat.h>".}
+
+proc birthTime(path: string, fi: FileInfo): int64 =
+  ## When the file was created, seconds since 1970; 0 when the file system
+  ## doesn't keep it (some network shares and older ones on Linux).
+  when defined(windows): fi.creationTime.toUnix
+  elif defined(linux):
+    const AtFdCwd = -100.cint
+    const StatxBtime = 0x800.cuint
+    var st: Statx
+    if statx(AtFdCwd, path.cstring, 0, StatxBtime, st) == 0 and (st.stx_mask and StatxBtime) != 0:
+      st.stx_btime.tv_sec
+    else: 0
+  else: 0
+
 proc walk(i: int, job: Job) =
   ## Lists a top folder's media files (or checks a path is there), posting
   ## them in batches as they're found.
@@ -260,7 +289,8 @@ proc walk(i: int, job: Job) =
   if info.kind in {pcFile, pcLinkToFile}:
     done.isFile = true
     post Event(kind: evFound, root: job.path, gen: job.gen,
-      files: @[Found(path: job.path, size: info.size, mtime: info.lastWriteTime.toUnix)])
+      files: @[Found(path: job.path, size: info.size, mtime: info.lastWriteTime.toUnix,
+                     ctime: birthTime(job.path, info))])
     post done
     return
   if not job.walk:
@@ -300,7 +330,8 @@ proc walk(i: int, job: Job) =
           if path.extOf notin exts: continue
           try:
             let fi = getFileInfo(path)
-            batch.add Found(path: path, size: fi.size, mtime: fi.lastWriteTime.toUnix)
+            batch.add Found(path: path, size: fi.size, mtime: fi.lastWriteTime.toUnix,
+                            ctime: birthTime(path, fi))
           except OSError: discard
         if batch.len >= BatchSize or (batch.len > 0 and epochTime() - lastPost > 0.25):
           post Event(kind: evFound, root: job.path, gen: job.gen, files: move batch)
@@ -516,6 +547,8 @@ proc topRoots(ix: LibIndex): seq[string] =
     if not inside: result.add p
   result.sort()
 
+proc scanning*(ix: LibIndex): bool
+
 proc walkRoot(ix: LibIndex, root: string) =
   ## Walks a top folder, or checks a file or a folder inside another. One
   ## whose last walk is still going (or stuck) isn't walked again: each walk
@@ -525,10 +558,16 @@ proc walkRoot(ix: LibIndex, root: string) =
     return
   let r = ix.roots[root].addr
   if r.state in {rsScanning, rsStuck}: return
+  if not ix.scanning: ix.runFrom = ix.walkGen + 1
   inc ix.walkGen
   r.gen = ix.walkGen
   r.found = 0
   r.walked = root in ix.topRoots
+  r.expected = 0
+  if r.walked:
+    # What the last walk (or the saved index) had: how far this one is.
+    for f in ix.files:
+      if f.path.under(root): inc r.expected
   r.state = rsScanning
   ix.enqueue Job(kind: jkWalk, path: root, exts: ix.exts, gen: ix.walkGen, walk: r.walked)
 
@@ -608,19 +647,23 @@ proc addFound(ix: LibIndex, f: Found, gen: int) =
   let i = ix.byPath.getOrDefault(f.path, -1)
   if i < 0:
     ix.byPath[f.path] = ix.files.len
-    var g = LibFile(path: f.path, size: f.size, mtime: f.mtime, seen: gen)
+    var g = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime, seen: gen)
     var old: LibFile
     if ix.attic.pop(f.path, old) and old.size == f.size and old.mtime == f.mtime:
       g = old
       g.seen = gen
+      g.ctime = f.ctime
     ix.files.add g
     ix.dirty = true
   else:
     let e = ix.files[i].addr
     e.seen = gen
     if e.size != f.size or e.mtime != f.mtime:
-      e[] = LibFile(path: f.path, size: f.size, mtime: f.mtime, seen: gen)
+      e[] = LibFile(path: f.path, size: f.size, mtime: f.mtime, ctime: f.ctime, seen: gen)
       ix.queued.excl f.path
+      ix.dirty = true
+    elif e.ctime != f.ctime:  # an index saved before creation times were kept, or a file put back
+      e.ctime = f.ctime
       ix.dirty = true
 
 proc walkDone(ix: LibIndex, e: Event) =
@@ -692,6 +735,7 @@ proc applyProbed(ix: LibIndex, e: Event) =
   (x.title, x.artist, x.album, x.tags) = (f.title, f.artist, f.album, f.tags)
   ix.dirty = true
   inc ix.metaGen
+  inc ix.readDone
 
 proc wantsProbe(ix: LibIndex, i: int): bool =
   let f = ix.files[i].addr
@@ -810,6 +854,24 @@ proc scanning*(ix: LibIndex): bool =
   for r in ix.roots.values:
     if r.state == rsScanning: return true
 
+proc scanProgress*(ix: LibIndex): float =
+  ## How far the scan under way is, 0..1, against what the folders walked
+  ## held last time; -1 when that isn't known (reading the saved index, a
+  ## folder walked for the first time).
+  if ix.loading: return -1
+  var found, total = 0
+  for r in ix.roots.values:
+    if not r.walked or r.gen < ix.runFrom: continue
+    if r.state in {rsScanning, rsStuck}:
+      if r.expected == 0: return -1
+      # More files than last time: nearly done, as far as can be told.
+      found += min(r.found, r.expected)
+      total += max(r.expected, r.found + 1)
+    else:
+      found += r.found
+      total += r.found
+  if total == 0: -1.0 else: found / total
+
 proc unread*(ix: LibIndex): int =
   ## Files whose tags are still to be read (and can be), counted at most
   ## twice a second.
@@ -819,7 +881,14 @@ proc unread*(ix: LibIndex): int =
     ix.unreadCount = 0
     for i in 0 ..< ix.files.len:
       if ix.wantsProbe(i) or ix.files[i].path in ix.queued: inc ix.unreadCount
+    if ix.unreadCount == 0: ix.readDone = 0
   ix.unreadCount
+
+proc readProgress*(ix: LibIndex): float =
+  ## How far reading the tags is, 0..1: the files read since it began
+  ## against those and the ones left.
+  let left = ix.unread
+  if left == 0: 1.0 else: ix.readDone / (ix.readDone + left)
 
 proc rootState*(ix: LibIndex, path: string): RootState =
   ix.roots.getOrDefault(path.normPath).state
@@ -918,11 +987,79 @@ proc parseDim(s: string, t: var Term): bool =
   t.hi = n.float
   n > 0
 
+proc parseCreated(s: string, t: var Term): bool =
+  ## A dc: value: a date to the year, month, day, hour, minute or second,
+  ## its digits run together (`20251010`) or split by anything else
+  ## (`2025-10-10`, `2025/10/10 14:30`), local time, standing for that whole
+  ## span; after it with `after:`/`>`, before it with `before:`/`<`,
+  ## `>=`/`<=` taking the span in too.
+  var v = s.strip.toLowerAscii
+  t.op = coEq
+  var orEqual = false
+  for (word, op) in [("after", coGt), ("before", coLt)]:
+    if v.startsWith(word):
+      t.op = op
+      v = v[word.len .. ^1].strip(trailing = false, chars = {':', ' '})
+  for (sign, op, eq) in [(">=", coGt, true), ("=>", coGt, true), ("<=", coLt, true),
+                         ("=<", coLt, true), (">", coGt, false), ("<", coLt, false),
+                         ("=", coEq, false)]:
+    if v.startsWith(sign):
+      if t.op == coEq: t.op = op
+      orEqual = eq
+      v = v[sign.len .. ^1].strip(trailing = false)
+      break
+  var groups: seq[string]
+  var g = ""
+  for c in v & " ":
+    if c in Digits: g.add c
+    elif g.len > 0:
+      groups.add g
+      g = ""
+  if groups.len == 0: return false
+  # Year, month, day, hour, minute, second: a group of more digits holds
+  # several (the year's four, then two each).
+  var parts: seq[int]
+  for i, gr in groups:
+    var at = 0
+    if i == 0:
+      if gr.len < 4 or gr.len mod 2 != 0: return false
+      parts.add parseInt(gr[0 ..< 4])
+      at = 4
+    elif gr.len <= 2:
+      parts.add parseInt(gr)
+      continue
+    elif gr.len mod 2 != 0: return false
+    while at < gr.len:
+      parts.add parseInt(gr[at ..< at + 2])
+      at += 2
+  if parts.len > 6: return false
+  let given = parts.len
+  while parts.len < 6: parts.add (if parts.len < 3: 1 else: 0)
+  let (y, mo, d, h, mi, sec) = (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
+  if y < 1 or mo notin 1 .. 12 or d < 1 or d > getDaysInMonth(Month(mo), y) or
+      h > 23 or mi > 59 or sec > 59:
+    return false
+  let start = dateTime(y, Month(mo), MonthdayRange(d), HourRange(h), MinuteRange(mi),
+                       SecondRange(sec), 0, local())
+  let step = case given
+    of 1: 1.years
+    of 2: 1.months
+    of 3: 1.days
+    of 4: 1.hours
+    of 5: 1.minutes
+    else: 1.seconds
+  t.lo = start.toTime.toUnix.float
+  t.hi = (start + step).toTime.toUnix.float
+  if orEqual:
+    if t.op == coGt: t.hi = t.lo  # from the span's start
+    else: t.lo = t.hi             # up to its end
+  true
+
 proc parseQuery*(s: string): Query =
   ## Tags are what's between commas; quotes are characters like any other.
   ## `in:`/`exclude:` pick libraries, `hidden` searches hidden ones too,
   ## `size`/`bitrate`/`dimension` `exactly`/`biggerthan`/`smallerthan:`
-  ## compare, `format:` takes a file type, `filename contains:` part of a
+  ## compare, `dc:` a creation date (`parseCreated`), `format:` takes a file type, `filename contains:` part of a
   ## name, any other `field:` a tag holding the text; the rest is looked for
   ## in the name, title, artist, album and folders.
   result.empty = true
@@ -958,6 +1095,12 @@ proc parseQuery*(s: string): Query =
       continue
     of "path", "folder", "pathcontains":
       result.terms.add Term(kind: tkPath, text: lval)
+      result.empty = false
+      continue
+    of "dc", "datecreated", "created", "creationdate":
+      var t = Term(kind: tkCreated)
+      t.bad = not parseCreated(val, t)
+      result.terms.add t
       result.empty = false
       continue
     else: discard
@@ -1009,6 +1152,19 @@ proc withInLibrary*(search, name: string): string =
   if name.len == 0: return tags.join(", ")
   if tags.len == 0: return "in:" & name & ", "
   "in:" & name & ", " & tags.join(", ")
+
+proc withoutHidden*(search: string, libs: seq[Library]): string =
+  ## The search without its `hidden` tag and its in: tags naming a hidden
+  ## library, the other tags kept in their order.
+  var tags: seq[string]
+  for raw in search.split(','):
+    let tag = raw.strip
+    if tag.len == 0 or tag.squash == "hidden": continue
+    if tag.tagKey == "in":
+      let v = unicode.toLower(tag[tag.find(':') + 1 .. ^1].strip)
+      if libs.anyIt(it.hidden and unicode.toLower(it.name) == v): continue
+    tags.add tag
+  tags.join(", ")
 
 proc renamedInSearch*(search, old, name: string): string =
   ## The search with its in: and exclude: tags naming the library old (any
@@ -1065,6 +1221,11 @@ proc matches*(q: Query, f: LibFile, hay = ""): bool =
     of tkPath:
       if t.text notin unicode.toLower(f.path): return false
     of tkFormat: discard
+    of tkCreated:
+      # Where the file system keeps no creation time, the last change is
+      # the earliest known.
+      let c = if f.ctime > 0: f.ctime else: f.mtime
+      if t.bad or c <= 0 or not cmpRange(t.op, c.float, t.lo, t.hi): return false
     of tkSize:
       if t.lo < 0 or not cmpRange(t.op, f.size.float, t.lo, t.hi): return false
     of tkBitrate:
@@ -1209,16 +1370,71 @@ proc groupLabel*(ix: LibIndex, path: string): string =
   result = root.lastPathPart
   if rel.len > 0 and rel != ".": result.add " / " & rel.replace($DirSep, " / ")
 
-proc groupRows*(ix: LibIndex, rows: var seq[int32]): seq[tuple[label: string, count: int]] =
+proc groupRows*(ix: LibIndex, rows: var seq[int32]): seq[tuple[label, dir: string, count: int]] =
   ## Puts rows in folder groups (in name order), keeping their order within
-  ## each; returns the groups in order, with how many rows each has.
+  ## each; returns the groups in order, with the folder (its first file's)
+  ## and how many rows each has.
   var keyed = newSeq[tuple[label: string, id: int32]](rows.len)
   for i, id in rows: keyed[i] = (ix.groupLabel(ix.files[id].path), id)
   keyed.sort(proc (x, y: tuple[label: string, id: int32]): int = naturalLess(x.label, y.label))  # stable
   for i, k in keyed:
     rows[i] = k.id
-    if result.len == 0 or result[^1].label != k.label: result.add (k.label, 0)
+    if result.len == 0 or result[^1].label != k.label:
+      result.add (k.label, ix.files[k.id].path.parentDir, 0)
     inc result[^1].count
+
+# --- folder trees --------------------------------------------------------------
+
+type
+  FolderTree* = object
+    ## A library's folders holding files it lists, from the index alone
+    ## (never the disk): the Library panel's tree.
+    tops*: seq[string]                  ## its listed folders holding any, in name order
+    kids*: Table[string, seq[string]]   ## a folder's subfolders holding any, in name order
+    count*: Table[string, int]          ## files in a folder and below
+
+proc folderTree*(ix: LibIndex, l: Library): FolderTree =
+  var dirs: seq[string]
+  for p in l.paths:
+    let n = p.normPath
+    if n.len == 0: continue
+    let r = ix.roots.getOrDefault(n)
+    if r.isFile or r.state == rsMissing: continue
+    dirs.add n
+  # Those inside another listed folder are that one's subfolders.
+  var tops: seq[string]
+  for d in dirs:
+    if not dirs.anyIt(it != d and d.under(it) and (it.len < d.len or it < d)) and d notin tops:
+      tops.add d
+  var seen = initHashSet[string]()
+  for id in ix.members(l):
+    let p = ix.files[id].path
+    var top = ""
+    for t in tops:
+      if p.under(t):
+        top = t
+        break
+    if top.len == 0: continue  # a file listed as such
+    result.count.mgetOrPut(top, 0).inc
+    var d = p.parentDir
+    while d.len > top.len:
+      result.count.mgetOrPut(d, 0).inc
+      if d notin seen:
+        seen.incl d
+        result.kids.mgetOrPut(d.parentDir, @[]).add d
+      d = d.parentDir
+  let byName = proc (x, y: string): int = naturalLess(x.lastPathPart, y.lastPathPart)
+  for t in tops:
+    if t in result.count: result.tops.add t
+  result.tops.sort(byName)
+  for k in result.kids.mvalues: k.sort(byName)
+
+proc children*(t: FolderTree, folder: string): seq[string] =
+  ## A node's subfolders: a library's ("" for it) are its listed folders,
+  ## or the subfolders of its only one.
+  if folder.len > 0: t.kids.getOrDefault(folder)
+  elif t.tops.len == 1: t.kids.getOrDefault(t.tops[0])
+  else: t.tops
 
 # --- default libraries --------------------------------------------------------
 
@@ -1249,6 +1465,12 @@ proc seedLibraries*(c: var Config) =
   if c.librariesSeeded: return
   c.librariesSeeded = true
   if c.libraries.len == 0: c.libraries = defaultLibraries()
+
+proc renamedInTree*(expanded: seq[string], old, name: string): seq[string] =
+  ## The Library panel's expanded nodes once a library is renamed.
+  for k in expanded:
+    let nl = k.find('\n')
+    result.add(if nl >= 0 and k[0 ..< nl] == old: name & k[nl .. ^1] else: k)
 
 proc validLibraryName*(libs: seq[Library], name: string, skip = -1): string =
   ## Why a name can't be used ("" when it can): commas separate search tags.

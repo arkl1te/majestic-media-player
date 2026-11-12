@@ -75,7 +75,10 @@ proc loadFace(f: FontFace): Typeface =
       result = Typeface(opentype: parseOpenType(buf, offset), filePath: f.path)
     else:
       result = readTypeface(f.path)
-  except CatchableError:
+  except CatchableError, IndexDefect, RangeDefect:
+    # Defects too: pixie's parser can still read past a font it misreads
+    # (patches/pixie.patch fixed the ones found, e.g. Noto Serif CJK), and
+    # a system font that can't be read must not take the app down.
     result = nil
 
 proc face(f: FontFace): Typeface =
@@ -93,7 +96,7 @@ proc draws(tf: Typeface, r: Rune): bool =
   try:
     let b = tf.getGlyphPath(r).computeBounds()
     b.w > 0 and b.h > 0 and b.w.classify == fcNormal and b.h.classify == fcNormal
-  except PixieError:
+  except PixieError, IndexDefect, RangeDefect:  # a glyph pixie misreads: as in loadFace
     false
 
 proc faceFor(r: Rune, lang: string, mono: bool): Typeface =

@@ -93,6 +93,7 @@ type
     kaRedoPlaylist = "redo-playlist"
     kaQueue = "queue"
     kaUnqueue = "unqueue"
+    kaAddClipboardPlaylist = "add-clipboard-to-playlist"
     kaRunLog = "run-log"
     kaLibrary = "library"
     kaSearchLibrary = "search-library"
@@ -205,6 +206,7 @@ const
     (kgPlaylist, "Redo playlist change", "Redo", "Ctrl+Y|Ctrl+Shift+Z"),
     (kgPlaylist, "Add selection to playback queue", "Queue", "Q"),
     (kgPlaylist, "Remove selection from playback queue", "Unqueue", "Shift+Q"),
+    (kgPlaylist, "Add clipboard to playlist", "Add Clipboard To Playlist", "Ctrl+Shift+V"),
     (kgView, "Run log", "Run Log", "Ctrl+5"),
     (kgView, "Library", "Library", "Ctrl+4"),
     (kgView, "Search library", "Search Library", "Ctrl+Shift+F"),

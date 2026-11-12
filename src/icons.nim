@@ -6,6 +6,12 @@ import pixie, silky
 const musicPath* = "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"
 const crownPath* = "M5 16L3 5l5.5 5L12 4l3.5 6L21 5l-2 11H5zm14 3c0 .6-.4 1-1 1H6c-.6 0-1-.4-1-1v-1h14v1z"
 
+const
+  foldCorners = [vec2(8.5, 6.5), vec2(16.5, 12), vec2(8.5, 17.5)]  ## a folder's arrow, closed (pointing right)
+  FoldFrames* = 10
+  CrumbTip* = 7    ## a breadcrumb's pointed end: its width
+  CrumbH* = 18     ## and height
+
 const iconPaths = {
   "play": (24, "M8 5v14l11-7z"),
   "playrev": (24, "M16 5v14L5 12z"),  # play mirrored: playing in reverse
@@ -148,6 +154,34 @@ proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
       let img = renderIcon(spec[1], spec[0], px(size))
       discard builder.addImage(name & $size, img)
   discard builder.addImage("ring16", ringIcon(px(16)))
+  block:
+    # A breadcrumb's pointed end (the Library's folder headers); drawn in the
+    # header's colour at a crumb's start, the notch the one before fits in.
+    let (w, h) = (px(CrumbTip), px(CrumbH))
+    let img = newImage(w, h)
+    let path = newPath()
+    path.moveTo(0, 0)
+    path.lineTo(w.float32, h.float32 / 2)
+    path.lineTo(0, h.float32)
+    path.closePath()
+    img.fillPath(path, color(1, 1, 1, 1))
+    discard builder.addImage("crumbtip", img)
+  # A folder's arrow, turning from right (closed) to down (open) in FoldFrames
+  # steps as it opens: fold0 .. fold<FoldFrames - 1>.
+  for k in 0 ..< FoldFrames:
+    let size = px(20)
+    let img = newImage(size, size)
+    let s = size.float32 / 24
+    # Its corners turned clockwise around the middle (y grows down).
+    let turn = float32(k) / float32(FoldFrames - 1) * PI.float32 / 2
+    let path = newPath()
+    for j, c in foldCorners:
+      let (dx, dy) = (c.x - 12, c.y - 12)
+      let p = vec2(12 + dx * cos(turn) - dy * sin(turn), 12 + dx * sin(turn) + dy * cos(turn)) * s
+      if j == 0: path.moveTo(p) else: path.lineTo(p)
+    path.closePath()
+    img.fillPath(path, color(1, 1, 1, 1))
+    discard builder.addImage("fold" & $k, img)
   for (_, spec) in mouseIcons:
     discard builder.addImage(spec[0], mouseIcon(px(16), spec[1], spec[2]))
 
