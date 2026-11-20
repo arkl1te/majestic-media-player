@@ -3,17 +3,23 @@ Majestic Media Player for Linux (AppImage): licenses
 
 Majestic Media Player itself is under the ISC license (Majestic-Media-Player.txt).
 The AppImage comes with the libraries and programs below, each under its own
-license. They are separate files, used unchanged, and you may replace any of
-them with another build (extract the AppImage with --appimage-extract).
+license. They are separate files, used unchanged but for libpipewire (below),
+and you may replace any of them with another build (extract the AppImage with
+--appimage-extract).
 
 
 The libraries and programs: Arch Linux packages
 -----------------------------------------------
 Everything the player runs with (libmpv and FFmpeg, glibc, Mesa, libopenmpt,
 and ffmpeg, ffprobe and curl, which it starts) comes unchanged from Arch Linux's
-packages as they were on the date in appimage/INDEX.txt. That file lists each
-package with its version, its license and where the license text is in this
-folder:
+packages as they were on the date in appimage/INDEX.txt, except libpipewire:
+the same version, built again from its source as Arch builds it, with one fix
+from PipeWire's own repository (commit 2aee8b4, "thread-loop: avoid race
+between enter() and invoke()"; patches/pipewire.patch in Majestic Media
+Player's source) so that the player doesn't freeze opening a file where no
+sound server runs. Its license is unchanged (MIT, appimage/libpipewire).
+INDEX.txt lists each package with its version, its license and where the
+license text is in this folder:
 
   libmpv/<library>     the same library's license as in the Windows build
   Mesa.txt, LLVM.txt   Mesa (with its Vulkan drivers) and LLVM

@@ -109,6 +109,17 @@ desktop may lack; the AppImage's `bin` comes first on its `PATH`. Programs the
 player starts from the system get the system's environment back
 (anylinux.so), not the AppImage's library paths.
 
+One package's file is rebuilt: `tools/appimage.sh build` puts libpipewire,
+built from the same version's source (tag and commit pinned in the script)
+with `patches/pipewire.patch`, over Arch's before bundling, with makepkg's
+flags and LTO as Arch builds it. The patch is PipeWire's own fix 2aee8b4,
+in no release yet: where no sound server runs, mpv's pipewire output (tried
+when pulse fails) starts a thread loop and stops it at once, and the stop
+could miss the thread starting, leaving both waiting forever: the player
+froze opening a file, once in a while in CI's containers. A new
+`ARCH_DATE` with another libpipewire stops the build: drop the patch when
+that version has the fix, else move `PIPEWIRE_VERSION` and the commit on.
+
 Running from an AppImage (`src/appimage.nim`: `APPIMAGE` set and the program
 inside `APPDIR`), what outlives the temporary mount points at the
 `.AppImage` file instead: a restart (onto the CPU, into an update), Help >
@@ -138,7 +149,7 @@ it held, to commit.
 | Command | What it does |
 |---|---|
 | `tools/appimage.sh deps` | Install the pinned packages (the archive is slow: retried) |
-| `tools/appimage.sh build` | Compile, then install the binary to `/usr/bin` for quick-sharun |
+| `tools/appimage.sh build` | Compile, then install the binary to `/usr/bin` for quick-sharun, and put the patched libpipewire over Arch's |
 | `tools/appimage.sh bundle NAME` | Make `NAME.AppImage` |
 | `tools/appimage.sh all [NAME]` | The three of them |
 | `tools/appimage.sh licenses [APPDIR]` | Rewrite `assets/licenses/appimage/` for the packages in APPDIR, or else those it would hold |

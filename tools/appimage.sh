@@ -3,7 +3,8 @@
 # Linux workflow does; locally: docker/podman run --rm -v "$PWD:/src" -w /src
 # docker.io/library/archlinux:latest tools/appimage.sh all).
 #   tools/appimage.sh deps         install the pinned packages below
-#   tools/appimage.sh build        compile majestic-media-player
+#   tools/appimage.sh build        compile majestic-media-player (and the patched
+#                                  libpipewire, see PIPEWIRE_VERSION)
 #   tools/appimage.sh bundle NAME  make NAME.AppImage from the build
 #   tools/appimage.sh all NAME     the three of them
 #   tools/appimage.sh licenses [APPDIR]  rewrite assets/licenses/appimage for
@@ -31,7 +32,17 @@ BIN=majestic-media-player
 # a desktop may have none of them) and the GPU drivers.
 RUNTIME_PKGS=(mpv libopenmpt taglib dbus libwebp ffmpeg curl mesa vulkan-radeon vulkan-intel
               vulkan-icd-loader intel-media-driver libglvnd)
-BUILD_PKGS=(base-devel git nim libx11 libxrandr file patchelf strace xorg-server-xvfb)
+BUILD_PKGS=(base-devel git nim libx11 libxrandr file patchelf strace xorg-server-xvfb meson)
+# Arch's libpipewire, rebuilt from the same version's source with
+# patches/pipewire.patch (upstream's 2aee8b4, in no release yet): without a
+# PipeWire to connect to (no sound server, as in CI's containers), mpv's
+# pipewire audio output starts a thread loop and stops it at once, and
+# stopping can miss the loop thread starting: both wait forever, the player
+# frozen at opening a file. A new ARCH_DATE with another libpipewire stops
+# the build: drop the patch once that version has the fix, else move it on.
+PIPEWIRE_VERSION=1.6.10
+PIPEWIRE_COMMIT=f9d6cbc99c354b9b0ad1d37245dc3ab0fb9f9171  # its tag
+PIPEWIRE_LIB=libpipewire-0.3.so.0.1610.0
 INDEX=$ROOT/assets/licenses/appimage/INDEX.txt
 # Never in a release: not redistributable.
 NONFREE=(libfdk-aac faac nvidia-utils cuda)
@@ -57,6 +68,45 @@ build() {
   make --no-print-directory
   # quick-sharun deploys from where a package would install it.
   install -Dm755 "$BIN" /usr/bin/"$BIN"
+  patch_pipewire
+}
+
+# libpipewire with patches/pipewire.patch, built as Arch builds it (makepkg's
+# flags, LTO, journal logging; nothing else in its options touches the
+# library), over the package's file: quick-sharun takes it from there.
+patch_pipewire() {
+  local have src=$ROOT/vendor/pipewire try
+  have=$(pacman -Q libpipewire | awk '{ print $2 }')
+  have=${have#*:}
+  have=${have%-*}
+  if [[ $have != "$PIPEWIRE_VERSION" ]]; then
+    echo "libpipewire is $have, patches/pipewire.patch is for $PIPEWIRE_VERSION (see PIPEWIRE_VERSION)" >&2
+    exit 1
+  fi
+  for try in 1 2 3; do
+    rm -rf "$src"
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "$PIPEWIRE_VERSION" \
+      https://gitlab.freedesktop.org/pipewire/pipewire.git "$src" && break
+    (( try < 3 )) || exit 1
+    echo "cloning PipeWire failed; trying again in $((try * 20)) s" >&2
+    sleep $((try * 20))
+  done
+  if [[ $(git -C "$src" rev-parse HEAD) != "$PIPEWIRE_COMMIT" ]]; then
+    echo "PipeWire's $PIPEWIRE_VERSION tag isn't the pinned commit $PIPEWIRE_COMMIT" >&2
+    exit 1
+  fi
+  git -C "$src" apply "$ROOT/patches/pipewire.patch"
+  (
+    # shellcheck disable=SC1091
+    source /etc/makepkg.conf
+    export CFLAGS="$CFLAGS $LTOFLAGS" LDFLAGS="$LDFLAGS $LTOFLAGS"
+    meson setup "$src/build" "$src" --prefix=/usr --buildtype=plain \
+      -Dauto_features=disabled -Dlibsystemd=enabled -Dsession-managers=[] \
+      -Dexamples=disabled -Dtests=disabled -Dman=disabled -Ddocs=disabled
+    ninja -C "$src/build" "src/pipewire/$PIPEWIRE_LIB"
+  )
+  install -m755 "$src/build/src/pipewire/$PIPEWIRE_LIB" "/usr/lib/$PIPEWIRE_LIB"
+  strip --strip-unneeded "/usr/lib/$PIPEWIRE_LIB"
 }
 
 # owned_pkgs FILE... -> the Arch packages owning them, one per line.
@@ -259,5 +309,5 @@ case "${1:-}" in
   bundle)   bundle "${2:-}" ;;
   all)      deps; build; bundle "${2:-$BIN-$(cat VERSION)-$(uname -m)}" ;;
   licenses) licenses "${2:-}" ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1,0 +1,16 @@
+diff --git a/src/pipewire/thread-loop.c b/src/pipewire/thread-loop.c
+index d364828..a9d87a1 100644
+--- a/src/pipewire/thread-loop.c
++++ b/src/pipewire/thread-loop.c
+@@ -241,7 +241,11 @@ void pw_thread_loop_stop(struct pw_thread_loop *loop)
+ 	pw_log_debug("%p stopping %d", loop, loop->running);
+ 	if (loop->running) {
+ 		pw_log_debug("%p signal", loop);
++		/* lock here because we need to ensure the loop does not enter
++		 * while we stop it here */
++		pw_loop_lock(loop->loop);
+ 		pw_loop_invoke(loop->loop, do_stop, 1, NULL, 0, false, loop);
++		pw_loop_unlock(loop->loop);
+ 		pw_log_debug("%p join", loop);
+ 		pthread_join(loop->thread, NULL);
+ 		pw_log_debug("%p joined", loop);
