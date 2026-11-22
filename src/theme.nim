@@ -14,6 +14,7 @@ let
   colPanelRaised* = c("#1f2126")
   colPopup* = c("#202228")
   colBorder* = c("#2d3038")
+  colBorderHover* = c("#464a55")  ## an edge that does something on a click, hovered
   colHover* = c("#2c2f37")
   colPressed* = c("#363a44")
   colContextual* = c("#2c2240")       ## the video frame menu's items about the file opened

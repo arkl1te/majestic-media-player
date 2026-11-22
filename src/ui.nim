@@ -303,6 +303,23 @@ proc stripes*(ui: Ui, r: Rect, color: ColorRGBX, period = 8'f32, width = 4'f32) 
     ui.sk.drawTriangle([p0, p2, p3], [uv, uv, uv], [color, color, color])
     x += period
 
+proc stripeOrigin*(r: Rect, width = 4'f32): float32 = r.x + r.y - width
+  ## Where stripes(r) has its stripes, for stripedColumn to match them.
+
+proc stripedColumn*(ui: Ui, x, y0, y1: float32, color: ColorRGBX, origin: float32,
+                    period = 8'f32, width = 4'f32) =
+  ## The 1-unit column at x, from y0 to y1, as the 45-degree stripes of
+  ## stripes(r) cross it, `origin` being stripeOrigin(r): columns side by
+  ## side draw one striped shape, in step with r's.
+  var y = y0
+  while y < y1:
+    let phase = floorMod(x + y - origin, period)
+    if phase < width:
+      let e = min(y1, y + width - phase)
+      ui.sk.drawRect(vec2(x, y), vec2(1, e - y), color)
+      y = e
+    else: y += period - phase
+
 proc border*(ui: Ui, r: Rect, color: ColorRGBX, t = 1'f32) =
   ui.sk.drawRect(r.xy, vec2(r.w, t), color)
   ui.sk.drawRect(vec2(r.x, r.y + r.h - t), vec2(r.w, t), color)

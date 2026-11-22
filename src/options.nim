@@ -193,8 +193,8 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   template differs(field: untyped): bool = c.field != before.field
   case p
   of opPlayer: differs(autoFitWindow) or differs(openMode) or
-    differs(rememberTime) or differs(rememberTransform) or differs(rememberWindowPos) or
-    differs(rememberWindowSize)
+    differs(rememberTime) or differs(rememberTimeLimit) or differs(rememberTimeMinutes) or
+    differs(rememberTransform) or differs(rememberWindowPos) or differs(rememberWindowSize)
   of opInterface: differs(osdScale) or differs(osdScaleByWindow) or differs(osdTimestamp) or
     differs(showFrames) or differs(showMillis) or differs(showRemaining) or
     differs(titleFullPath) or differs(titleUseMediaTitle) or differs(uiScale)
@@ -205,7 +205,7 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   of opKeys: differs(keys)
   of opPlayback: differs(audioLangs) or differs(bookmarksAsChapters) or
     differs(keepDisplayOn) or differs(rateStep) or differs(seekPreview) or
-    differs(seekStep) or differs(snapWithShift) or differs(subLangs) or differs(volumeStep)
+    differs(sampleStep) or differs(seekStep) or differs(snapWithShift) or differs(subLangs) or differs(volumeStep)
   of opOnline: differs(signInCookies) or differs(streamMaxFps30) or
     differs(streamMaxHeight) or differs(streamOnSave) or differs(streamQuality) or
     differs(streamSmallAudio)
@@ -488,6 +488,9 @@ proc playerPage(ui: Ui, c: var Config, p: var Pane) =
   p.gap
   ui.checkRow(p, "o-fit", "Resize window to fit video on open", c.autoFitWindow)
   ui.checkRow(p, "o-rtime", "Remember time (continue where the file was left off)", c.rememberTime)
+  ui.toggleNumberRow(p, "o-rtimemin", "Only files over (minutes)", c.rememberTimeLimit,
+    c.rememberTimeMinutes, 1, 1, 600)
+  ui.hint(p, "Shorter ones, like songs skimmed through, always start from the beginning.")
   ui.checkRow(p, "o-rpos", "Remember window position", c.rememberWindowPos)
   ui.checkRow(p, "o-rsize", "Remember window size", c.rememberWindowSize)
   ui.checkRow(p, "o-rxf", "Remember last pan, rotation and zoom", c.rememberTransform)
@@ -947,6 +950,9 @@ proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
   ui.numberRow(p, "o-jump", "Jump (milliseconds)", jumpMs, 100, 1, 600_000)
   c.seekStep = round(jumpMs) / 1000
   ui.numberRow(p, "o-vol", "Volume", c.volumeStep, 0.5, 0.5, 50, 1)
+  var samples = c.sampleStep.float
+  ui.numberRow(p, "o-samples", "Samples (sound only)", samples, 100, 1, 10_000_000)
+  c.sampleStep = int(round(samples))
 
 proc onlinePage(ui: Ui, c: var Config, p: var Pane) =
   ui.group(p, "Sign-in for age-restricted videos")

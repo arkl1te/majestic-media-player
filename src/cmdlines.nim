@@ -228,6 +228,25 @@ proc load*(d: CmdDialog, c: CommandLine) =
   d.listOpen = false
   d.error = ""
 
+proc duplicate*(d: CmdDialog) =
+  ## Starts a new command line as a copy of the one shown, unsaved edits
+  ## included, named after it with a free "(copy)" title.
+  let base = d.title.strip
+  var title = ""
+  if base.len > 0:
+    let taken = d.saved.mapIt(it.title)
+    title = base & " (copy)"
+    var n = 2
+    while title in taken:
+      title = base & " (copy " & $n & ")"
+      inc n
+  let toks = d.toks
+  d.load(CommandLine(title: title))
+  d.origTitle = ""
+  d.toks = toks
+  d.caret = d.toks.len
+  d.anchor = d.caret
+
 proc commandLine*(d: CmdDialog): CommandLine =
   var toks = d.toks
   for t in toks.mitems:
@@ -858,7 +877,7 @@ proc draw*(d: CmdDialog, ui: Ui, r: Rect, path: string): CmdAction =
     d.listOpen = not d.listOpen
     d.listScroll = 0
   if ui.textButton("cl-new", newR, "New"):
-    d.load(CommandLine())
+    d.duplicate()
     ui.focusId = "cl-title"
     ui.navId = "cl-title"
     ui.focusFresh = true

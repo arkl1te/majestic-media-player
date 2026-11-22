@@ -104,6 +104,7 @@ type
     chapters*: seq[Chapter]
     buffered*: seq[(float, float)]  ## spans read ahead into the cache, seconds
     cacheAhead*: float = -1   ## seconds read ahead of the position (-1: unknown)
+    cacheEof*: bool           ## mpv has read the stream to its end
     buffering*: bool          ## playback held until the cache fills
     videoConfigs*: int        ## times the video was set up (a picture's size came)
     shotAsked*, shotDone*: bool  ## takeShot: asked for, and come (in shot)
@@ -137,6 +138,15 @@ type
                               ## off, it's never shown
     folderPicture: string     ## the file's folder picture (addFolderPicture),
                               ## "" for none
+    resumed*: bool            ## the next load's start is a remembered time
+                              ## (Remember time), from resumeElse instead
+                              ## should the file prove no longer than resumeMin
+    resumeElse*: float        ## with it: where such a file starts then
+    resumeMin*: float         ## seconds; 0 keeps every remembered start
+    resumeDropped*: bool      ## the file opening started from resumeElse, too
+                              ## short for its remembered time
+    openResumed: bool         ## resumed, for the file opening (and its resumeElse)
+    openElse: float
     quickCoverFor*: proc (path: string): string
                               ## the picture mpv is to show as a saved quick
                               ## cover of the file at path, "" for none
@@ -183,6 +193,7 @@ type
                               ## (queueNext), which mpv goes on to by itself
     nextSource, nextKey: string  ## what mpv opens for it, and the request
     nextStart: float          ## where it starts
+    nextResumed: bool         ## from a remembered time (resumed)
     gapless: bool             ## gapless-audio is on (left on past the change of
                               ## file: turned off then, mpv would cut the sound)
     advanced*: bool           ## mpv went on to nextPath; the app takes it from here
@@ -896,6 +907,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
   of pCacheState:
     p.buffered.setLen 0
     p.cacheAhead = -1
+    p.cacheEof = false
     # A module or MIDI stream is rendered as it's read, an .aud one held in
     # memory: nothing downloaded.
     if d != nil and ev.format == fmtNode and not p.source.startsWith("mmpmod://") and
@@ -904,6 +916,7 @@ proc handleProp(p: Player, id: Prop, ev: ptr MpvEventProperty) =
       for r in j{"seekable-ranges"}.getElems:
         p.buffered.add (r{"start"}.getFloat, r{"end"}.getFloat)
       if j{"cache-duration"} != nil: p.cacheAhead = j{"cache-duration"}.getFloat
+      p.cacheEof = j{"eof"}.getBool
   of pPausedForCache: p.buffering = b
   of pTracks, pChapters, pVideoParams:
     let j = if d == nil or ev.format != fmtNode: newJNull()
@@ -1155,10 +1168,12 @@ proc resetNext(p: Player, gapless = false) =
   (p.nextPath, p.nextSource, p.nextKey) = ("", "", "")
   if not gapless: p.setGapless(false)
 
-proc queueNext*(p: Player, path: string, start = 0.0, opts = "", source = "") =
+proc queueNext*(p: Player, path: string, start = 0.0, opts = "", source = "",
+                resumed = false) =
   ## Gapless playback: has mpv go on to path by itself at the end of this
   ## file, its audio straight after this one's; "" for nothing (the app opens
-  ## what comes next). Asked again with the same, nothing happens.
+  ## what comes next). Asked again with the same, nothing happens. `resumed`:
+  ## start is a remembered time (see Player.resumed).
   var o = opts.joinOpts(p.rgs.rgOpts(path))
   if start > 0:
     o = "start=" & formatFloat(start, ffDecimal, 3) & (if o.len > 0: "," & o else: "")
@@ -1176,6 +1191,7 @@ proc queueNext*(p: Player, path: string, start = 0.0, opts = "", source = "") =
   else: p.h.commandAsync("loadfile", file, "append")
   p.setGapless(true)
   (p.nextPath, p.nextSource, p.nextKey, p.nextStart) = (path, source, key, start)
+  p.nextResumed = resumed and start > 0
 
 proc wentOn(p: Player) =
   ## mpv ended the file and opens the queued one: as load would have it.
@@ -1191,6 +1207,7 @@ proc wentOn(p: Player) =
   p.soundHold = -1
   p.endPinned = false
   p.timePos = p.nextStart
+  (p.openResumed, p.openElse, p.resumeDropped) = (p.nextResumed, 0.0, false)
   p.duration = 0
   p.loadError = ""
   p.opening = true
@@ -1200,6 +1217,7 @@ proc wentOn(p: Player) =
   p.landing = -1
   p.buffered.setLen 0
   p.cacheAhead = -1
+  p.cacheEof = false
   p.buffering = false
   p.resetNext(gapless = true)
 
@@ -1258,6 +1276,15 @@ proc pollEvents*(p: Player): bool =
     of evHook:
       let e = cast[ptr MpvEventHook](ev.data)
       if ev.replyUserdata == CoverHook:
+        # A remembered time of a file found too short to remember (one not
+        # known before it opened): it starts as if there were none.
+        if p.openResumed:
+          p.openResumed = false
+          let d = p.h.getFloat("duration")
+          if d > 0 and d <= p.resumeMin:
+            p.h.setProp("file-local-options/start",
+              if p.openElse > 0: formatFloat(p.openElse, ffDecimal, 3) else: "none")
+            (p.timePos, p.resumeDropped) = (p.openElse, true)
         # Tracks found, none picked yet: the cover's picked before mpv
         # shows another (and the window fits that one). A saved quick cover
         # over any.
@@ -1372,6 +1399,8 @@ proc load*(p: Player, path: string, start = 0.0, demux = dmAhead, opts = "",
   p.holdTime = false
   p.soundHold = -1
   p.timePos = start
+  (p.openResumed, p.openElse, p.resumeDropped) = (p.resumed and start > 0, p.resumeElse, false)
+  (p.resumed, p.resumeElse) = (false, 0.0)
   p.duration = fullDuration
   p.loadError = ""
   p.hookError = ""
@@ -1385,6 +1414,7 @@ proc load*(p: Player, path: string, start = 0.0, demux = dmAhead, opts = "",
   p.landing = -1
   p.buffered.setLen 0
   p.cacheAhead = -1
+  p.cacheEof = false
   p.buffering = false
   p.setBackward(false)
   p.clearTurnFades()
@@ -1446,6 +1476,7 @@ proc close*(p: Player) =
   p.stopped = false
   p.buffered.setLen 0
   p.cacheAhead = -1
+  p.cacheEof = false
   p.buffering = false
   p.sphere = SphereInfo()
   p.tracks.setLen 0

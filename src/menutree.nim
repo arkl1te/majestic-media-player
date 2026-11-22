@@ -54,6 +54,7 @@ type
     bounds: Rect              ## monitor the menus open on, main-window coordinates
     boundsValid: bool
     grabbed: bool             ## holds the pointer grab taken while open
+    opened: int               ## openContext calls so far
     pendingAction: proc ()
     pendingRemove: proc ()
 
@@ -109,6 +110,10 @@ proc contextOpen*(m: MenuSystem): bool = m.mode == mmContext
 
 proc contextAnchor*(m: MenuSystem): Vec2 = m.contextPos
 
+proc openCount*(m: MenuSystem): int = m.opened
+  ## Changes with every openContext: a context menu opened since a tree was
+  ## built needs it built again (it was built for the menu open before).
+
 proc contextRect*(m: MenuSystem): Rect =
   ## The open context menu's top level as last laid out, or empty.
   if m.mode == mmContext and m.levels.len > 0: m.levels[0].rect else: Rect()
@@ -129,6 +134,7 @@ proc openContext*(m: MenuSystem, pos: Vec2, sticky = false, keep = Rect(), above
   ## `sticky`: picking items leaves it open; it closes once the pointer is
   ## away from it and from `keep`. `above`: it opens upward from pos.
   m.mode = mmContext
+  inc m.opened
   m.contextPos = pos
   m.path = @[]
   m.sticky = sticky
@@ -160,6 +166,17 @@ proc pointerOverPopup*(m: MenuSystem, ui: Ui): bool =
   for lv in m.levels:
     if local.inside(lv.rect): return true
 
+proc locate(m: MenuSystem, ui: Ui): IVec2 =
+  ## Finds the main window's content origin on screen and, once per opening,
+  ## the monitor the menus open on. Returns the pointer, window-local.
+  let (screen, local) = ui.window.pointerPos
+  m.origin = (screen - local).vec2
+  if not m.boundsValid:
+    m.boundsValid = true
+    let mon = monitorAt(screen)
+    m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
+  local
+
 proc captureInput*(m: MenuSystem, ui: Ui) =
   ## Call at the start of the frame, before other widgets. Claims the mouse
   ## when it is over an open menu and closes menus on outside clicks.
@@ -167,13 +184,8 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
   if m.mode == mmClosed: return
   # The main window stops seeing the pointer once it enters a popup window,
   # so ask the server where it is.
-  let (screen, local) = ui.window.pointerPos
-  m.origin = (screen - local).vec2
+  let local = m.locate(ui)
   if ui.fakeMouse.x < 0: m.mouse = local.vec2 / ui.scale
-  if not m.boundsValid:
-    m.boundsValid = true
-    let mon = monitorAt(screen)
-    m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
   if m.mode == mmContext and m.sticky and m.levels.len > 0:
     const Near = 24'f32  # how far the pointer may stray
     proc grown(r: Rect): Rect = rect(r.x - Near, r.y - Near, r.w + 2 * Near, r.h + 2 * Near)
@@ -392,6 +404,10 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   let released = ui.window.buttonReleased[MouseLeft] or m.input.leftReleased
   m.input = PopupInput()
   m.levels.setLen 0
+  # Opened during this frame, after captureInput: without this its first
+  # frame would be placed in an empty monitor (the window's top-left corner)
+  # from an old window origin.
+  if m.mode != mmClosed and not m.boundsValid: discard m.locate(ui)
   case m.mode
   of mmBar:
     if m.barIndex < m.barRects.len:

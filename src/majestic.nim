@@ -425,6 +425,8 @@ type
     tabThumbFrom: (float32, float32)  ## pointer y and scroll when its scroll bar's thumb drag began
     tabSeen: int = -1         ## the playlist shown when it was last drawn: another is scrolled into view
     sideResizeFrom: (float32, float32)  ## pointer x and the side column's width when its edge drag began
+    plRestoreRect: Rect       ## the arrow restoring the collapsed side column of playlists (empty when none)
+    sideRestoredAt: float     ## when that column was last restored: a double-click's second press doesn't reach it
     tabRename: int            ## the id of the playlist being renamed, 0 none
     tabRenameText: string
     ctxTab: int = -1          ## the tab right-clicked, -1 for the strip around them
@@ -910,7 +912,12 @@ type
     seekResizeFrom: (float32, float32)   ## pointer y and the seek bar's height when that drag began
     wave: Wave                ## the seek bar's waveform, of waveKey's sound
     waveKey: string           ## the path and audio track it is of; "" none
-    waveCache: seq[(string, Wave)]  ## waveforms decoded whole, the latest last
+    waveCache: seq[(string, Wave)]  ## waveforms decoded whole (a link's, in part), the latest last
+    waveTried: seq[string]    ## a link's: stretches ("file@from") that decoded nothing
+    waveNext: float           ## a link's: when to look for the next stretch, now() seconds
+    waveAsked: bool           ## a link's: a stretch was asked for, not yet seen ended
+    waveFollowSize: int64     ## a link's: the followed file's size when following it last ended
+    waveRecGone: float        ## a link's: when the file followed was seen done being written
     padLen: float             ## the delay under way after a short file; 0 none
     padAt: float              ## when it began, or while held the seconds it has run
     padHeld: bool             ## paused during the delay
@@ -1811,24 +1818,53 @@ proc unsetLoopMark(a: App, isB: bool) =
   a.applyAbLoop()
   a.osd(if isB: "Loop B unset" else: "Loop A unset")
 
+proc resumeMin(a: App): float =
+  ## Remember time leaves out files this long or shorter (seconds), songs
+  ## skimmed through; 0 for none.
+  if a.cfg.rememberTimeLimit: a.cfg.rememberTimeMinutes.float * 60 else: 0.0
+
+proc knownLength(a: App, path: string): float =
+  ## The file's length as far as known without opening it, else 0.
+  let p = a.player
+  if p.loaded and p.path == path and p.duration > 0: return p.duration
+  let m = a.mediaInfo.getOrDefault(path)
+  if m.duration > 0: return m.duration
+  if "://" in path:
+    let (c, s) = (a.linkInfos.lookup(path), a.saved.lookup(path))
+    return if c.duration > 0: c.duration else: s.duration
+  if a.library != nil:
+    let i = a.library.find(path)
+    if i >= 0: return a.library.files[i].duration
+
+proc rememberedTime(a: App, path: string, length = -1.0): float =
+  ## Where the file opens with Remember time, 0 for its start: a time saved
+  ## before Options left files of its length out counts for nothing.
+  ## `length`: the file's, when the caller knows it.
+  if not a.cfg.rememberTime: return 0
+  result = a.positions.getOrDefault(path, 0.0)
+  if result > 0:
+    let d = if length > 0: length else: a.knownLength(path)
+    if d > 0 and d <= a.resumeMin: result = 0
+
 proc savePosition(a: App) =
   ## Remembers where the current file was left off; finished (or barely
-  ## started) files are forgotten.
+  ## started) files are forgotten, as are files too short to remember.
   let p = a.player
   if not a.cfg.rememberTime or not p.loaded or p.path.len == 0 or p.duration <= 0: return
   a.savedPos = p.timePos
   # Reloaded first so positions other players remembered meanwhile survive.
   a.positions = loadPositions()
-  if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached and p.path != a.forgotPath:
+  if p.timePos > 5 and p.timePos < p.duration - 5 and not p.eofReached and p.path != a.forgotPath and
+     p.duration > a.resumeMin:
     a.positions.remember(p.path, p.timePos)
   else:
     a.positions.del(p.path)
   a.positions.save()
 
-proc hasRememberedTime(a: App, path: string): bool =
+proc hasRememberedTime(a: App, path: string, length = -1.0): bool =
   ## Opening the file resumes where it was left off: its playlist and
   ## Library rows show in pale red.
-  a.cfg.rememberTime and path in a.positions
+  a.rememberedTime(path, length) > 0
 
 proc forgetTimes(a: App, paths: seq[string]) =
   ## Forgets where the files were left off, so they open from the start.
@@ -2606,8 +2642,7 @@ proc playIndex(a: App, i: int, start = -1.0) =
   if not a.cfg.rememberTransform: a.xf = VideoTransform()
   a.resumedAt =
     if start >= 0: start
-    elif a.cfg.rememberTime: a.positions.getOrDefault(path, 0.0)
-    else: 0.0
+    else: a.rememberedTime(path)
   a.clearLoopMarks()
   a.subs.scale = a.subScales.getOrDefault(path, 1'f32)
   a.subs.delay = a.subDelays.getOrDefault(path, 0.0)
@@ -2631,9 +2666,14 @@ proc playIndex(a: App, i: int, start = -1.0) =
   let at = if a.resumedAt > 0 or not path.isWebLink: a.resumedAt else: path.linkStart
   let part = s.chainAt(at)
   let aud = if path.isAudFile: wsaud.prepare(path) else: ""
-  if a.adopting: discard  # mpv went on to it by itself, gapless
+  # A remembered time of a file whose length is only found as it opens: it
+  # goes should the file prove too short for one (Player.resumed).
+  (a.player.resumed, a.player.resumeMin) = (start < 0 and a.resumedAt > 0, a.resumeMin)
+  a.player.resumeElse = if path.isWebLink: path.linkStart else: 0.0
+  if a.adopting: a.player.resumed = false  # mpv went on to it by itself, gapless
   elif path.isWebLink and part.stop > part.start and
      (s.complete or part.stop - at >= SavedMin):
+    a.player.resumed = false  # saved: its length known (rememberedTime)
     a.playSaved(path, at, part)
   elif path.isWebLink:
     a.streamLink(path, a.resumedAt, a.streamOpts(path).join(","))
@@ -3409,6 +3449,11 @@ proc mediaState(a: App): MediaState =
       elif key in side.cleared: field[] = ""
   if result.title.len == 0 and p.path.len > 0: result.title = p.path.fileTitle
 
+proc snapVolume(old, nv: float): float =
+  ## A volume change that would cross the soft cap (100) stops on it; the
+  ## next change goes on from there.
+  if (old < 100 and nv > 100) or (old > 100 and nv < 100): 100.0 else: nv
+
 proc runMediaCommand(a: App, c: MediaCommand) =
   let p = a.player
   let s = a.mediaState
@@ -3421,7 +3466,7 @@ proc runMediaCommand(a: App, c: MediaCommand) =
   of mcPrevious: (if s.canGoPrevious: a.navigate(-1))
   of mcSeekBy: (if s.canSeek: a.seekTo(p.timePos + c.value))
   of mcSeekTo: (if s.canSeek and c.value >= 0 and c.value <= p.duration: a.seekTo(c.value))
-  of mcVolume: p.setVolume(c.value * 100)
+  of mcVolume: p.setVolume(snapVolume(p.volume, c.value * 100))
   of mcRaise: a.window.activate()
   of mcQuit: a.window.closeRequested = true
 
@@ -3605,12 +3650,19 @@ proc selectAll(a: App) =
 type PanelStop = enum
   psNone, psPlaylists, psEntries, psLibraries, psFiles
 
+proc sideCollapsed(a: App): bool =
+  ## The playlists' side column (the Playlist Manager) is on but collapsed:
+  ## hidden completely, an arrow on the panel's left edge restores it.
+  a.cfg.playlistTabsSide and a.cfg.playlistSideCollapsed
+
+proc managerShown(a: App): bool = a.cfg.playlistTabsSide and not a.cfg.playlistSideCollapsed
+
 proc panelStops(a: App): seq[PanelStop] =
   ## The places Tab moves the keyboard through, in order: the playlists'
   ## side column (Playlists in a Side Column), the playlist's entries, the
   ## libraries' column and the Library's files.
   if a.cfg.showPlaylist and not a.playlistLocked:
-    if a.cfg.playlistTabsSide: result.add psPlaylists
+    if a.managerShown: result.add psPlaylists
     result.add psEntries
   if a.cfg.showLibrary: result.add [psLibraries, psFiles]
 
@@ -3637,6 +3689,26 @@ proc focusPanel(a: App, stop: PanelStop) =
   if stop == psFiles: a.libReveal = true
   a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
 
+proc setSideCollapsed(a: App, on: bool, save = true) =
+  ## Collapses the playlists' side column (the entries take its room) or
+  ## restores it at the width it had.
+  if a.cfg.playlistSideCollapsed == on: return
+  a.cfg.playlistSideCollapsed = on
+  if on and a.plSideKeys: a.focusPanel(psEntries)
+  if not on:
+    a.tabSeen = -1  # the shown playlist into view
+    a.sideRestoredAt = now()
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  if save: a.cfg.save()
+
+proc restoreSideItem(a: App, m: MenuNode) =
+  ## Restore Playlist Manager, on top of the playlist panel's menus while
+  ## its side column is collapsed: contextual (purple), a separator under it.
+  if not a.sideCollapsed or a.playlistLocked: return
+  m.item("Restore Playlist Manager", action = proc () = a.setSideCollapsed(false))
+  m.markContextual()
+  m.sep()
+
 proc showTagProps(a: App)  # Playlist > Properties, below
 
 proc playlistKeys(a: App): bool =
@@ -3648,7 +3720,7 @@ proc playlistKeys(a: App): bool =
   ## and Enter goes on to its entries.
   let w = a.window
   let pressed = w.buttonPressed
-  if a.plSideKeys and a.cfg.playlistTabsSide and a.cfg.showPlaylist and not a.playlistLocked and
+  if a.plSideKeys and a.managerShown and a.cfg.showPlaylist and not a.playlistLocked and
       a.tabs.len > 0 and not (w.ctrl or w.alt or w.shiftDown):
     var to = -1
     if pressed[KeyUp]: to = max(0, a.tabView - 1)
@@ -3839,35 +3911,91 @@ proc waveSource(a: App): WaveSource =
       (result.file, result.start, result.length) = (sheet.audio, start, max(0.0, length))
   else: result.file = p.path
 
+proc waveLink(a: App) =
+  ## A link's waveform: all of it that's at hand, from the files its stream
+  ## was saved in (websave). Decodes the next stretch of them not in it yet,
+  ## the saved files first, then the one being written, followed as it grows.
+  let p = a.player
+  let w = a.wave
+  let recOn = a.recUrl == p.path and a.rec.file.len > 0
+  if not w.done:
+    # The file followed is written out: the rest comes from it as saved.
+    if w.src.follow and not (recOn and a.rec.file == w.src.file):
+      if a.waveRecGone == 0: a.waveRecGone = now()
+      elif now() - a.waveRecGone > 1.5: w.stop()
+    return
+  if a.waveAsked:  # just ended
+    a.waveAsked = false
+    a.waveNext = now() + 0.25
+    if w.src.follow:
+      a.waveFollowSize = try: getFileSize(w.src.file) except OSError: -1
+    elif w.reach <= w.src.at + 0.05:
+      a.waveTried.add w.src.file & "@" & formatFloat(w.src.start, ffDecimal, 1)
+  if now() < a.waveNext: return
+  var parts: seq[tuple[file: string, start, stop: float]]
+  for g in a.savedIn(p.path).segs:
+    if not (recOn and g.file == a.rec.file): parts.add (g.file, g.start, g.stop)
+  parts.sort(proc (x, y: tuple[file: string, start, stop: float]): int = cmp(x.start, y.start))
+  if recOn: parts.add (a.rec.file, a.rec.start, a.rec.stop)
+  for i, g in parts:
+    let growing = recOn and i == parts.high
+    # The first time in it not decoded, and where decoded resumes after it.
+    var (t, ahead) = (g.start, g.stop)
+    for c in w.covered:
+      if c[1] <= t: continue
+      if c[0] <= t + 0.05: t = c[1]
+      else:
+        ahead = min(ahead, c[0])
+        break
+    if t >= g.stop - (if growing: 1.0 else: 0.1): continue
+    let start = t - g.start
+    if g.file & "@" & formatFloat(start, ffDecimal, 1) in a.waveTried: continue
+    if growing:  # followed to no more since: not again until it grows
+      let size = try: getFileSize(g.file) except OSError: -1
+      if size < 0 or size == a.waveFollowSize: continue
+    w.more(WaveSource(file: g.file, start: start, at: t, follow: growing,
+                      length: if growing or ahead >= g.stop: 0.0 else: ahead - t + w.bucket))
+    (a.waveAsked, a.waveRecGone) = (true, 0.0)
+    return
+
 proc pollWaveform(a: App) =
   ## Keeps the seek bar's waveform that of the sound playing, while shown:
   ## decoded anew for another file or audio track (or taken from the last
   ## few decoded), and redrawn as it fills.
   let p = a.player
+  var linked = false  # a link's own sound: from its saved files
   let key =
     if not (a.cfg.seekWaveform and a.cfg.showSeekBar and p.loaded) or p.opening or
        p.duration <= 0: ""
     else:
       let tr = a.waveTrack
-      if tr.id == 0: "" else: p.path & "\x00" & $tr.id & "\x00" & tr.file
+      linked = tr.file.len == 0 and p.path.isWebLink
+      if tr.id == 0: ""
+      else: p.path & "\x00" & $tr.id & "\x00" & tr.file &
+              (if linked: "\x00" & a.linkFormat(p.path) else: "")
   if key != a.waveKey:
     let old = a.wave
-    if old != nil and old.done and old.error.len == 0 and
-       a.waveCache.allIt(it[0] != a.waveKey):
+    let keep = old != nil and (if old.parts: old.filled > 0 else: old.done and old.error.len == 0)
+    old.stop()
+    if keep and a.waveCache.allIt(it[0] != a.waveKey):
       a.waveCache.add (a.waveKey, old)
       if a.waveCache.len > 4: a.waveCache.delete 0
-    elif old != nil and not old.done: waveform.cancel()
     a.waveKey = key
     a.wave = nil
+    a.waveTried.setLen 0
+    (a.waveNext, a.waveAsked, a.waveFollowSize) = (0.0, false, -1'i64)
     if key.len > 0:
       for (k, wv) in a.waveCache:
         if k == key: a.wave = wv
       if a.wave == nil:
-        let src = a.waveSource
-        if src.file.len > 0: a.wave = waveform.request(src)
+        if linked: a.wave = waveform.empty(p.duration)
+        else:
+          let src = a.waveSource
+          if src.file.len > 0: a.wave = waveform.request(src)
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
   if a.wave != nil and a.wave.poll():
     a.dirtyUntil = max(a.dirtyUntil, now() + 0.05)
+  if a.wave != nil and a.wave.parts: a.waveLink()
 
 proc pollProbe(a: App) =
   ## Collects a finished background probe and redraws to show it.
@@ -4118,7 +4246,7 @@ proc gaplessTarget(a: App): GapNext =
   if i >= 0: result = GapNext(path: entries[i], tab: a.tabs[ti].id, i: i)
   elif a.afterPlayback == apNextInFolder: result = GapNext(path: a.folderNeighbor(1), folder: true)
   if result.path.len == 0 or not result.path.gaplessFile: return GapNext()
-  if a.cfg.rememberTime: result.start = a.positions.getOrDefault(result.path, 0.0)
+  result.start = a.rememberedTime(result.path)
 
 proc queueGapless(a: App) =
   ## Near the end of an audio file, the next one goes into mpv's playlist,
@@ -4133,10 +4261,13 @@ proc queueGapless(a: App) =
   a.gapCheckAt = now() + 0.25
   let t = a.gaplessTarget
   let aud = if t.path.isAudFile: wsaud.prepare(t.path) else: ""
+  p.resumeMin = a.resumeMin  # its start remembered: see Player.resumed
   if t.path.isCueEntry:
-    p.queueNext(t.path, t.start, "force-media-title=" & quoted(t.path.fileTitle), t.path.cueSource)
-  elif aud.len > 0: p.queueNext(t.path, t.start, "force-media-title=" & quoted(t.path.fileTitle), aud)
-  else: p.queueNext(t.path, t.start)
+    p.queueNext(t.path, t.start, "force-media-title=" & quoted(t.path.fileTitle), t.path.cueSource,
+      resumed = true)
+  elif aud.len > 0:
+    p.queueNext(t.path, t.start, "force-media-title=" & quoted(t.path.fileTitle), aud, resumed = true)
+  else: p.queueNext(t.path, t.start, resumed = true)
   if p.nextPath == t.path: a.gapNext = t
 
 proc adoptGapless(a: App) =
@@ -4207,12 +4338,12 @@ proc handleEof(a: App) =
 
 proc volumeStep(a: App, up: bool) =
   ## Soft cap 100, hard cap 200: the volume step (default 5) below the soft
-  ## cap, +2 above it, and the volume step down.
+  ## cap, +2 above it, and the volume step down, stopping on 100 either way.
   let v = a.player.volume
   let st = a.cfg.volumeStep
-  let nv =
-    if up: (if v < 100: min(v + st, 100) else: min(v + 2, 200))
-    else: max(v - st, 0)
+  let nv = snapVolume(v,
+    if up: (if v < 100: v + st else: min(v + 2, 200))
+    else: max(v - st, 0))
   a.player.setVolume(nv)
   a.osd(&"Volume: {nv:g}%")
 
@@ -4286,8 +4417,8 @@ proc stepsSamples(a: App): bool =
     not p.tracks.anyIt(it.kind == "video" and it.selected and not it.albumArt)
 
 proc sampleStep(a: App, forward: bool) =
-  ## Pauses a sample after (or before) the one heard, at the rate the sound
-  ## is decoded at.
+  ## Pauses Options > Playback's sample step (1,000 by default) after (or
+  ## before) the sample heard, at the rate the sound is decoded at.
   let p = a.player
   var rate = p.audioRate
   if rate <= 0:
@@ -4310,7 +4441,8 @@ proc sampleStep(a: App, forward: bool) =
           elif p.eofReached: last
           else: int64(round(p.timePos * r))
   let was = n
-  n += (if forward: 1 else: -1)
+  let step = max(a.cfg.sampleStep, 1).int64
+  n += (if forward: step else: -step)
   if p.duration > 0: n = min(n, last)
   n = max(n, 0)
   if n == was and p.paused: return
@@ -9628,6 +9760,11 @@ proc recordStep(a: App) =
       return
     a.recRanges = p.buffered.len
     a.rec.stop = max(a.rec.stop, ours[1])
+    # Read to its end: nothing more comes, and closing the file writes out
+    # the end mpv's muxer still holds (the seek bar's waveform shows it).
+    if p.cacheEof and ours[1] >= p.buffered.mapIt(it[1]).max:
+      a.recordEnd()
+      return
     if a.rec.stop - a.recWritten >= 10:  # now and then, should the player not get to close
       a.recWritten = a.rec.stop
       a.entry(a.recUrl).addSeg(a.rec)
@@ -10712,9 +10849,15 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
   play.item("Stop", k(kaStop), enabled = loaded, action = proc () = a.stop())
   let (playPause, stop) = (play.children[0], play.children[1])
   let samples = a.stepsSamples
-  play.item(if samples: "Next Sample" else: "Frame Forward", k(kaFrameForward), enabled = loaded,
+  let sampleCount = max(cfg.sampleStep, 1)
+  let (sampleFwd, sampleBack) =
+    if sampleCount == 1: ("Next Sample", "Previous Sample")
+    else:
+      let n = insertSep($sampleCount, ',')
+      (&"Forward {n} Samples", &"Back {n} Samples")
+  play.item(if samples: sampleFwd else: "Frame Forward", k(kaFrameForward), enabled = loaded,
     action = proc () = a.frameStep(true))
-  play.item(if samples: "Previous Sample" else: "Frame Back", k(kaFrameBack), enabled = loaded,
+  play.item(if samples: sampleBack else: "Frame Back", k(kaFrameBack), enabled = loaded,
     action = proc () = a.frameStep(false))
   play.item(&"Fast-Forward (+{a.cfg.rateStep:g}x)", k(kaFaster), enabled = loaded,
     action = proc () = a.changeRate(1))
@@ -11224,6 +11367,7 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
           a.saveReplayGain(rmAlbum, a.rgFiles))
         rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
           a.removeReplayGain(a.rgFiles))
+    a.restoreSideItem(pl)
     if hasSel: a.forgetTimeItem(pl, a.plSelection.mapIt(a.playlist[it]))
     # Read only when picked: the menu is rebuilt every frame.
     pl.item("Add Clipboard to Playlist", k(kaAddClipboardPlaylist), enabled = edit,
@@ -11329,17 +11473,25 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     tm.sep()
     # Tabs above the entries, or a list of the playlists left of them.
     tm.check("Playlists in a Side Column", checked = a.cfg.playlistTabsSide, action = proc () =
+      # Turned off collapsed, it took no room; turned on, it shows.
+      let hidden = a.sideCollapsed
       a.cfg.playlistTabsSide = not a.cfg.playlistTabsSide
+      a.cfg.playlistSideCollapsed = false
       # The panel widens by the column, so that the entries keep their room.
       let side = max(PlaylistSideMinW, round(a.cfg.playlistSideWidth).float32) + 1
-      a.setPanelWidth(clamp(a.panelW +
-        (if a.cfg.playlistTabsSide: side else: -side), PlaylistMinWidth,
-        max(PlaylistMinWidth, a.ui.size.x - MinWindow.x.float32 / 2)))
+      if not hidden:
+        a.setPanelWidth(clamp(a.panelW +
+          (if a.cfg.playlistTabsSide: side else: -side), PlaylistMinWidth,
+          max(PlaylistMinWidth, a.ui.size.x - MinWindow.x.float32 / 2)))
       a.tabSeen = -1  # the shown one into view
       a.cfg.save())
+    # The column hidden completely, the entries taking its room.
+    tm.item("Collapse Playlist Manager", enabled = a.managerShown, action = proc () =
+      a.setSideCollapsed(true))
     (root, tm)
   of cmPlaylistColumns:
     let cols = newMenuRoot()
+    a.restoreSideItem(cols)
     if a.ctxColumn == pfDuration:
       cols.check("Show milliseconds", checked = a.cfg.playlistShowMillis, action = proc () =
         a.cfg.playlistShowMillis = not a.cfg.playlistShowMillis
@@ -13689,29 +13841,39 @@ proc heldRanges(a: App): seq[(float, float)] =
       result[^1][1] = max(result[^1][1], s[1])
     else: result.add s
 
-proc drawWave(a: App, wv: Wave, x0, x1: float32, dur: float, cy, half, playX: float32) =
+proc drawWave(a: App, wv: Wave, x0, x1: float32, dur: float, cy, half, playX: float32,
+              skips: seq[(float32, float32, float32)]) =
   ## The seek bar's waveform from x0 (the start) to x1 (dur), a column per
   ## unit: the peaks dim, the loudness (RMS) bright over them, played up to
-  ## playX in the accent's colors. Past what's decoded, the bare midline.
+  ## playX in the accent's colors; where nothing's decoded, nothing. Within
+  ## `skips` (from x, to x, stripeOrigin: a link's skipped stretches), striped
+  ## in step with their ribbons.
   let ui = a.ui
   let cols = int(x1 - x0)
-  ui.rect(rect(x0, cy - 0.5, x1 - x0, 1), colTrack)
-  if cols <= 0 or wv.peak.len == 0 or dur <= 0: return
+  if cols <= 0 or wv.filled == 0 or dur <= 0: return
   let top = max(wv.top, 0.05)  # silence stays flat
   for i in 0 ..< cols:
     let b0 = int(dur * i.float / cols.float / wv.bucket)
     if b0 >= wv.peak.len: break
     let b1 = min(wv.peak.len, max(b0 + 1, int(ceil(dur * float(i + 1) / cols.float / wv.bucket))))
-    var (pk, rm) = (0'f32, 0'f32)
+    var (pk, rm) = (-1'f32, -1'f32)  # below 0: not decoded
     for b in b0 ..< b1:
       pk = max(pk, wv.peak[b])
       rm = max(rm, wv.rms[b])
+    if pk < 0: continue
     let x = x0 + i.float32
     let played = x < playX
     let ph = round(min(1, pk / top) * half)
     let rh = round(min(1, rm / top) * half)
-    if ph > 0: ui.rect(rect(x, cy - ph, 1, ph * 2), if played: colWavePlayed else: colWave)
-    if rh > 0: ui.rect(rect(x, cy - rh, 1, rh * 2), if played: colAccent else: colWaveRms)
+    var (striped, origin) = (false, 0'f32)  # x in a skipped stretch: its stripes
+    for (lx, rx, o) in skips:
+      if x + 0.5 >= lx and x + 0.5 < rx: (striped, origin) = (true, o)
+    if not striped:
+      if ph > 0: ui.rect(rect(x, cy - ph, 1, ph * 2), if played: colWavePlayed else: colWave)
+      if rh > 0: ui.rect(rect(x, cy - rh, 1, rh * 2), if played: colAccent else: colWaveRms)
+    else:
+      if ph > 0: ui.stripedColumn(x, cy - ph, cy + ph, if played: colWavePlayed else: colWave, origin)
+      if rh > 0: ui.stripedColumn(x, cy - rh, cy + rh, if played: colAccent else: colWaveRms, origin)
 
 proc seekBar(a: App, r: Rect) =
   let ui = a.ui
@@ -13739,7 +13901,7 @@ proc seekBar(a: App, r: Rect) =
         max(SeekBarHeight, ui.size.y - others - MinWindow.y.float32 / 2))
   let half = round((r.h - 12) / 2)  # the waveform's, above and below cy
   let wv = if waveOn and a.wave != nil and a.waveKey.len > 0: a.wave else: nil
-  let showWave = wv != nil and wv.peak.len > 0 and dur > 0 and p.loaded
+  let showWave = wv != nil and wv.filled > 0 and dur > 0 and p.loaded
   # A short file's delay takes up the bar past its end.
   let pad = if a.padLen > 0: a.padLen else: a.shortAudioPad
   let span = dur + pad
@@ -13762,7 +13924,13 @@ proc seekBar(a: App, r: Rect) =
   let frac = if dur > 0: clamp(cur / span, 0, 1) else: 0
   let held = a.heldRanges
   if showWave:
-    a.drawWave(wv, x0, endX, dur, cy, half, x0 + w * frac)
+    # The bare midline where nothing's decoded, in the read-ahead's color
+    # where a link is held.
+    ui.rect(rect(x0, cy - 0.5, endX - x0, 1), colTrack)
+    if wv.parts:
+      for (bs, be) in held:
+        let bx = x0 + w * clamp(bs / span, 0, 1)
+        ui.rect(rect(bx, cy - 0.5, x0 + w * clamp(be / span, 0, 1) - bx, 1), colBuffered)
   else:
     ui.rect(rect(x0, cy - th / 2, endX - x0, th), colTrack)
     if dur > 0 and p.loaded:
@@ -13771,9 +13939,11 @@ proc seekBar(a: App, r: Rect) =
         let bx = x0 + w * clamp(bs / span, 0, 1)
         ui.rect(rect(bx, cy - th / 2, x0 + w * clamp(be / span, 0, 1) - bx, th), colBuffered)
     ui.rect(rect(x0, cy - th / 2, min(w * frac, endX - x0), th), colAccent)
-  if dur > 0 and p.loaded and p.path.isWebLink and not showWave:
-    # What a link's download jumped over, up to as far as it got: stripes, in
-    # the played part's color left of the knob.
+  # What a link's download jumped over, up to as far as it got: a ribbon of
+  # stripes, in the played part's color left of the knob; the waveform, where
+  # it has some of it, striped in step with it.
+  var skips: seq[(float32, float32, float32)]  # from x, to x, stripeOrigin
+  if dur > 0 and p.loaded and p.path.isWebLink:
     let reach = max(p.timePos, if held.len > 0: held[^1][1] else: 0)
     var at = 0.0
     for (bs, be) in held & @[(reach, reach)]:
@@ -13784,7 +13954,14 @@ proc seekBar(a: App, r: Rect) =
         ui.stripes(zone, colTextDisabled)
         if x0 + w * frac > lx:
           ui.stripes(rect(lx, zone.y, min(x0 + w * frac, rx) - lx, th), colAccent)
+        skips.add (lx.float32, rx.float32, stripeOrigin(zone))
       at = max(at, be)
+  if showWave:
+    a.drawWave(wv, x0, endX, dur, cy, half, x0 + w * frac, skips)
+    # Where each skipped stretch starts and ends, across the waveform.
+    for (lx, rx, _) in skips:
+      for bx in [lx, rx - 1]:
+        ui.rect(rect(round(bx), cy - half, 1, half * 2), colTextDim)
   if pad > 0 and dur > 0 and p.loaded:
     # Past the "]" the audio has ended: stripes that fill as the delay runs.
     let zone = rect(endX, cy - th / 2, x0 + w - endX, th)
@@ -15349,6 +15526,24 @@ proc playlistSide(a: App, x, y, w, h: float32, blocked: bool) =
         a.inTab(ti): a.dropRows(-1)
       ui.activeId = ""  # not dropped on the rows too
 
+proc restoreArrow(a: App) =
+  ## The arrow on the playlist panel's left edge while the Playlist Manager
+  ## is collapsed, over the rows: a click restores it. playlistPanel takes
+  ## its press before the rows can.
+  let ui = a.ui
+  let r = a.plRestoreRect
+  if r.w <= 0: return
+  let hov = ui.hover(r) and a.overlay == ovNone and not a.menus.isOpen
+  ui.rect(r, if hov and ui.pressId == "pl-restore" and ui.down(): colPressed
+             elif hov: colHover else: colPanelRaised)
+  ui.rect(rect(r.x + r.w - 1, r.y, 1, r.h), colBorder)
+  ui.rect(rect(r.x, r.y, r.w, 1), colBorder)
+  ui.rect(rect(r.x, r.y + r.h - 1, r.w, 1), colBorder)
+  ui.icon("arrow16", vec2(r.x + r.w / 2, r.y + r.h / 2), if hov: colWhite else: colTextDim)
+  if hov:
+    ui.tip(r, "Restore the Playlist Manager")
+    if ui.window.buttonReleased[MouseLeft] and ui.pressId == "pl-restore": a.setSideCollapsed(false)
+
 proc selectionLine(n: int, total: float, unknown: bool, what: string): string =
   ## A panel's bottom line about its selection: how many, and how long they
   ## last together, with a + while some of their lengths aren't known yet.
@@ -15370,12 +15565,29 @@ proc plSelectionLine(a: App): string =
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   a.plOverEdge = false
+  # The Playlist Manager (the playlists' side column) collapsed: a border
+  # thicker by a pixel, lit while hovered, with an arrow in its middle that
+  # restores it, as does a double-click on the edge or the header.
+  let collapsed = a.sideCollapsed and not a.playlistLocked
+  let border = if collapsed: 2'f32 else: 1'f32
+  let grip = rect(r.x, r.y, PlaylistGripW, r.h)
+  a.plRestoreRect = if collapsed: rect(r.x + border, round(r.y + r.h / 2 - 18), 12, 36) else: Rect()
+  let onRestore = collapsed and ui.hover(a.plRestoreRect)
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y, r.w, 30), colPanelRaised)  # the header: lighter than the body
-  ui.rect(rect(r.x, r.y, 1, r.h), colBorder)
+  ui.rect(rect(r.x, r.y, border, r.h), if collapsed and (ui.hover(grip) or onRestore) and
+    ui.activeId != "plresize": colBorderHover else: colBorder)
+  # A double-click's second press, just after the column came back, isn't
+  # one on the playlist that's now under the pointer.
+  let restoreDouble = a.window.buttonPressed[DoubleClick] and now() - a.sideRestoredAt < 0.8
+  if onRestore and ui.pressed():  # the arrow, drawn over the rows by restoreArrow
+    ui.pressId = "pl-restore"
+    ui.consumeClick()
+  if collapsed and ui.hover(grip) and not onRestore and a.window.buttonPressed[DoubleClick]:
+    ui.consumeClick()  # on the press or, on X11, its release
+    a.setSideCollapsed(false)
   # Dragging the left edge resizes the panel; the video frame takes the rest.
-  let grip = rect(r.x, r.y, PlaylistGripW, r.h)
-  if ui.hover(grip) and ui.pressed():
+  if ui.hover(grip) and not onRestore and ui.pressed():
     ui.activeId = "plresize"
     a.plResizeFrom = (ui.mouse.x, r.w)
     ui.consumeClick()
@@ -15407,9 +15619,14 @@ proc playlistPanel(a: App, r: Rect) =
   var title = &"Playlist ({a.playlist.len})"
   if ui.textSize(title).x > titleW: title = &"({a.playlist.len})"  # narrow: the count alone
   ui.textIn(ui.ellipsize(title, titleW), rect(r.x + 32, header.y, titleW, 30), colText)
-  if ui.iconButton("pl-close", rect(r.x + r.w - 30, header.y + 3, 24, 24), "close16", a.closeTip(kaPlaylist)):
+  let closeR = rect(r.x + r.w - 30, header.y + 3, 24, 24)
+  if ui.iconButton("pl-close", closeR, "close16", a.closeTip(kaPlaylist)):
     a.setPlaylistShown(false)
-  ui.rect(rect(r.x + 1, header.y + 29, r.w - 1, 1), colBorder)
+  if collapsed and ui.hover(header) and not ui.hover(grip) and not ui.hover(closeR) and
+      not ui.hover(rect(asPos.x, asPos.y, asW, 22)) and a.window.buttonPressed[DoubleClick]:
+    ui.consumeClick()
+    a.setSideCollapsed(false)
+  ui.rect(rect(r.x + border, header.y + 29, r.w - border, 1), colBorder)
   if a.playlistLocked:
     a.plListRect = Rect()
     a.plGroups.setLen 0
@@ -15431,26 +15648,35 @@ proc playlistPanel(a: App, r: Rect) =
   let bodyH = r.h - LibraryStatusH  # the panel above the bottom line
   # The entries' column: the whole panel under the tabs, or right of the
   # playlists' side column, whose right edge drags to resize it.
-  var (cx, cw) = (r.x + 1, r.w - 1)
+  var (cx, cw) = (r.x + border, r.w - border)
   var sideEdge = false
-  if a.cfg.playlistTabsSide:
+  if a.cfg.playlistTabsSide and (not collapsed or ui.activeId == "plside"):
     let most = max(PlaylistSideMinW, cw - PlaylistSideRest)
     var sw = clamp(round(a.cfg.playlistSideWidth).float32, PlaylistSideMinW, most)
     let sideGrip = rect(cx + sw - 2, r.y + top, 5, bodyH - top)
-    sideEdge = ui.hover(sideGrip) and not ui.hover(grip)
+    sideEdge = not collapsed and ui.hover(sideGrip) and not ui.hover(grip)
     if sideEdge and ui.pressed():
       ui.activeId = "plside"
       a.sideResizeFrom = (ui.mouse.x, sw)
       ui.consumeClick()
     if ui.activeId == "plside":
+      # Dragged to less than half its narrowest, it collapses, keeping the
+      # width it had; dragged back out, it's back.
       let (x0, w0) = a.sideResizeFrom
-      a.cfg.playlistSideWidth = clamp(w0 + ui.mouse.x - x0, PlaylistSideMinW, most)
+      let want = w0 + ui.mouse.x - x0
+      let fold = want < PlaylistSideMinW / 2
+      a.setSideCollapsed(fold, save = false)
+      a.cfg.playlistSideWidth = if fold: w0 else: clamp(want, PlaylistSideMinW, most)
       sw = round(a.cfg.playlistSideWidth).float32
       if ui.released(): a.cfg.save()
-    a.playlistSide(cx, r.y + top, sw, bodyH - top, sideEdge or ui.hover(grip))
-    ui.rect(rect(cx + sw, r.y + top, 1, bodyH - top), colBorder)
-    cx += sw + 1
-    cw -= sw + 1
+    if not a.cfg.playlistSideCollapsed:
+      a.playlistSide(cx, r.y + top, sw, bodyH - top, sideEdge or ui.hover(grip) or restoreDouble)
+      ui.rect(rect(cx + sw, r.y + top, 1, bodyH - top), colBorder)
+      cx += sw + 1
+      cw -= sw + 1
+    else: (a.tabStrip, a.tabRects, a.tabPlus, a.tabNew) = (Rect(), newSeq[Rect](), Rect(), Rect())
+  elif collapsed:
+    (a.tabStrip, a.tabRects, a.tabPlus, a.tabNew) = (Rect(), newSeq[Rect](), Rect(), Rect())
   else:
     top += a.playlistTabs(cx, r.y + top, cw)
   # The search bar (Ctrl+F): typing selects the first match from where the
@@ -16544,7 +16770,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     if a.libArrows and f.path == a.libCursor: ui.border(row, colAccent)  # where Up/Down go from
     let cur = f.path == playing
     if cur: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
-    let timed = a.hasRememberedTime(f.path)  # opens where it was left off
+    let timed = a.hasRememberedTime(f.path, f.duration)  # opens where it was left off
     for j, (cr, fld) in cells:
       a.playlistCell(a.libCellText(f[], fld), rect(cr.x, row.y, cr.w, rowH), fld, j == 0,
         if cur: colAccent
@@ -18086,7 +18312,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Exit", @[kaExit], "")]),
     a.keyRows("Playback", [
       ("Play / Pause", @[kaPlayPause], ""), ("Stop", @[kaStop], ""),
-      ("Frame (sound only: sample) forward / back", @[kaFrameForward, kaFrameBack], ""),
+      ("Frame (sound only: samples) forward / back", @[kaFrameForward, kaFrameBack], ""),
       ("Fast-forward / slow down", @[kaFaster, kaSlower], "Shift+. / Shift+,"),
       ("Repeat forever", @[kaRepeatForever], ""),
       ("Repeat ping-pong", @[kaRepeatPingPong], ""),
@@ -18287,6 +18513,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("New playlist", "Double-click beside tabs"),
       ("Next / previous playlist", "Wheel over tabs"),
       ("Keyboard to the playlists' or libraries' column", "Click the column"),
+      ("Collapse the Playlist Manager (playlists' side column)", "Drag its right edge far left"),
+      ("Restore the Playlist Manager", "Click edge arrow / Double-click playlist header or left edge"),
       ("Play a library file", "Double-click library file"),
       ("Add library files to the playlist there", "Drag library file onto playlist"),
       ("Add library files to a playlist / a new one", "Drag library file onto tab / +"),
@@ -18409,6 +18637,7 @@ proc frame(a: App) =
   a.flexPanel()
   ui.beginFrame()
   let (root, ctxRoot) = a.buildMenu()
+  let opensBefore = a.menus.openCount
 
   # Layout
   let fs = a.fullscreen
@@ -18601,7 +18830,7 @@ proc frame(a: App) =
     # A click in a panel's column of playlists or libraries gives the
     # keyboard to that column, elsewhere in it to its list.
     a.plFocused = a.cfg.showPlaylist and ui.mouse.inside(plRect)
-    a.plSideKeys = a.plFocused and a.cfg.playlistTabsSide and ui.mouse.inside(a.tabStrip)
+    a.plSideKeys = a.plFocused and a.managerShown and ui.mouse.inside(a.tabStrip)
     a.plArrows = a.plFocused and not a.plSideKeys
     a.libFocused = a.cfg.showLibrary and ui.mouse.inside(libRect)
     a.libCatKeys = a.libFocused and ui.mouse.inside(a.libCatRect)
@@ -18612,8 +18841,11 @@ proc frame(a: App) =
     a.libCatRect = Rect()
     a.libVisible.setLen 0
     a.libOverEdge = false
-  if a.cfg.showPlaylist: a.playlistPanel(plRect)
+  if a.cfg.showPlaylist:
+    a.playlistPanel(plRect)
+    a.restoreArrow()
   else:
+    a.plRestoreRect = Rect()
     a.plListRect = Rect()
     a.plGroups.setLen 0
     (a.tabStrip, a.tabRects, a.tabPlus, a.tabNew) = (Rect(), newSeq[Rect](), Rect(), Rect())
@@ -18621,7 +18853,7 @@ proc frame(a: App) =
   # The list or column holding the arrow keys (until Escape) shows it at its edge.
   if a.plArrows and a.cfg.showPlaylist and a.plListRect.w > 0:
     ui.border(a.plListRect, colAccentDim)
-  if a.plSideKeys and a.cfg.showPlaylist and a.cfg.playlistTabsSide and a.tabStrip.w > 0:
+  if a.plSideKeys and a.cfg.showPlaylist and a.managerShown and a.tabStrip.w > 0:
     ui.border(a.tabStrip, colAccentDim)
   if a.libArrows and a.cfg.showLibrary and a.libListRect.w > 0 and ui.focusId != "lib-search":
     ui.border(a.libListRect, colAccentDim)
@@ -18680,7 +18912,10 @@ proc frame(a: App) =
     if ui.pressed() and a.overlay != ovNone: ui.consumeClick()
   else:
     ui.captured = false
-    a.menus.updatePopups(ui, root, ctxRoot)
+    # A context menu opened by this frame's widgets (a button, a right-click)
+    # gets its own tree, not the one built above for the menu open before.
+    a.menus.updatePopups(ui, root,
+      if a.menus.openCount != opensBefore: a.buildMenu().context else: ctxRoot)
     ui.drawTooltip()
   ui.sk.pushLayer(PopupsLayer)
   a.compactOutline(rect(0, 0, W, H))
@@ -18696,7 +18931,7 @@ proc frame(a: App) =
     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
   let resize = ui.activeId in ["plresize", "plwidth", "plside", "libcol", "libwidth"] or sideOn and
-    (ui.hover(rect(sideRect.x, sideRect.y, PlaylistGripW, sideRect.h)) or
+    (ui.hover(rect(sideRect.x, sideRect.y, PlaylistGripW, sideRect.h)) and not ui.hover(a.plRestoreRect) or
      (a.cfg.showPlaylist and a.plOverEdge) or
      (a.cfg.showLibrary and a.libOverEdge and ui.activeId != "libsplit" and
       not ui.hover(rect(libRect.x, libRect.y - 2, libRect.w, LibrarySplitGrip)))) and
@@ -18876,7 +19111,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "celldump":  # the columns as last drawn, the side column's width and the video frame's
     let cw = proc (c: seq[(Rect, PlaylistField)]): string = c.mapIt(&"{it[1]}={it[0].w:.1f}").join(" ")
     stderr.writeLine &"cells win={a.window.size.x} panel={a.playlistWidth:.1f} video={a.videoRect.w:.1f} ",
-      &"max={a.maxPanelW:.1f} cfg={a.cfg.playlistWidth:.1f} pl=[", cw(a.plCellsShown), "] lib=[", cw(a.libCellsShown), "]"
+      &"max={a.maxPanelW:.1f} cfg={a.cfg.playlistWidth:.1f} pl=[", cw(a.plCellsShown), "] lib=[", cw(a.libCellsShown), "]",
+      &" side={a.cfg.playlistSideWidth:.1f} collapsed={a.sideCollapsed} strip={a.tabStrip.w:.1f} ",
+      &"restore=({a.plRestoreRect.x:.0f},{a.plRestoreRect.y:.0f},{a.plRestoreRect.w:.0f},{a.plRestoreRect.h:.0f})"
   of "coldump":  # the shown playlist's columns and widths, its own or shared, and the shared ones
     stderr.writeLine "columns ", (if a.ownColumns: "own " else: "shared "), $a.plColumns, " ",
       $a.plColumnWidths, " order=", $columnOrder(a.plColumnOrder, a.plColumns),
@@ -18891,7 +19128,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
     let wv = a.wave
     stderr.writeLine "wave key=", a.waveKey.replace("\x00", "|"), " h=", a.seekBarH,
       " marks=", a.cfg.seekMarks, " cached=", a.waveCache.len,
-      (if wv == nil: " none" else: &" buckets={wv.peak.len} bucket={wv.bucket:.4f} top={wv.top:.3f} done={wv.done} error={wv.error} file={wv.src.file} stream={wv.src.stream} start={wv.src.start} length={wv.src.length}")
+      (if wv == nil: " none" else: &" buckets={wv.filled} bucket={wv.bucket:.4f} top={wv.top:.3f} done={wv.done} error={wv.error} file={wv.src.file} stream={wv.src.stream} start={wv.src.start} length={wv.src.length} at={wv.src.at:.2f} follow={wv.src.follow} reach={wv.reach:.2f} parts={wv.parts} covered=" & wv.covered.mapIt(&"{it[0]:.2f}..{it[1]:.2f}").join(",") & " tried=" & $a.waveTried.len)
   of "ctxaction":  # video frame context menu item by label, Sub>Item for a submenu's
     a.ctxMenu = cmVideo
     var n = a.buildMenu().context
@@ -19111,7 +19348,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "cmdplaypath":  # name play(0|1) [default]: a path card at the caret, played when done
     a.cmdDlg.addCard(st.args[0], ckValue, if st.args.len > 2: st.args[2 .. ^1].join(" ") else: "",
       path = true, play = st.args[1] == "1")
-  of "cmdnew": a.cmdDlg.load(CommandLine(title: arg))  # title: a new command line, as New would
+  of "cmdnew": a.cmdDlg.load(CommandLine(title: arg))  # title: a new, empty command line
+  of "cmddup": a.cmdDlg.duplicate()  # the New button: a copy of the command line shown
   of "cmdtext": a.cmdDlg.addText(st.args.join(" "))  # text typed at the caret (spaces kept)
   of "cmdselect": a.cmdDlg.selectCard(arg)  # name: that card's properties shown
   of "cmdapply": a.cmdDlg.applyRequested = true
@@ -19801,6 +20039,15 @@ proc main() =
     if a.player.justLoaded:
       a.player.justLoaded = false
       a.forgotPath = ""  # opened again: remembered again
+      if a.player.resumeDropped:
+        # Its remembered time, of before Options left out files this short:
+        # it started from the beginning instead, forgotten.
+        a.player.resumeDropped = false
+        a.resumedAt = 0
+        a.positions = loadPositions()
+        a.positions.del(a.player.path)
+        a.positions.save()
+        a.positionsAt = positionsStamp()
       if a.stopOnLoad:  # gone online at Stop
         a.stopOnLoad = false
         a.player.stop()
@@ -19925,6 +20172,9 @@ proc main() =
   if a.upJob.running: a.upJob.stop()
   a.cancelSave()
   a.recordEnd()  # mpv closes the file as it shuts down
+  # The waveform's ffmpeg goes: following a file, its worker waits in a read
+  # that holds its stream's lock, which exit() waits for (to flush it).
+  waveform.cancel()
   if a.eqUnsaved.len > 0: a.saveEqualizer()
   a.saved.save()
   a.saveLinkInfos()

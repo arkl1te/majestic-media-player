@@ -89,6 +89,7 @@ type
     playlistWidth*: float = 300    # pixels, changed by dragging its left edge
     playlistTabsSide*: bool = false # the playlists in a column left of the entries, not tabs above them
     playlistSideWidth*: float = 150 # pixels, that column's width, changed by dragging its right edge
+    playlistSideCollapsed*: bool = false # that column hidden; the arrow on the panel's left edge restores it
     playlistColumns*: seq[PlaylistField]   # shown, left to right; set by loadConfig when empty
     playlistColumnWidths*: Table[string, float]  # pixels, by field name: the columns resized by hand
     playlistColumnOrder*: seq[PlaylistField]  # every column, hidden ones too, as the header's menu lists them
@@ -153,6 +154,8 @@ type
     autoFitWindow*: bool = true
     sphereDragMovesWindow*: bool = false  # 360° video: drag moves the window, Ctrl+drag looks around
     rememberTime*: bool = false
+    rememberTimeLimit*: bool = true    # and then only for files longer than rememberTimeMinutes:
+    rememberTimeMinutes*: int = 10     # songs skimmed through always start from the beginning
     rememberWindowPos*: bool = false
     rememberWindowSize*: bool = false
     rememberTransform*: bool = false
@@ -173,6 +176,7 @@ type
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
     seekStep*: float = 5           # seconds (set in milliseconds in Options)
+    sampleStep*: int = 1000        # samples the frame keys step without a picture
     volumeStep*: float = 5
     seekPreview*: bool = true
     snapWithShift*: bool = false   # off: snap unless Shift; on: only with Shift
