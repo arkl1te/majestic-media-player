@@ -6492,8 +6492,9 @@ const
   LoopFrameLook = ["vid", "sid", "secondary-sid", "sub-delay", "sub-visibility",
     "sub-align-x", "sub-align-y", "sub-margin-x", "sub-margin-y", "sub-pos",
     "sub-scale", "sub-font", "sub-bold", "sub-italic", "sub-font-size",
-    "sub-color", "sub-outline-size", "sub-outline-color", "sub-shadow-offset",
-    "sub-back-color", "sub-ass-override", "video-margin-ratio-left", "video-margin-ratio-right",
+    "sub-spacing", "sub-line-spacing", "sub-color", "sub-outline-size", "sub-outline-color",
+    "sub-shadow-offset", "sub-back-color", "sub-ass-override", "video-margin-ratio-left",
+    "video-margin-ratio-right",
     "video-margin-ratio-top", "video-margin-ratio-bottom", "keepaspect",
     "video-scale-x", "video-scale-y"]  ## what shows in a frame
 
@@ -7658,10 +7659,15 @@ proc cancelSave(a: App) =
   a.saveJob = nil
   a.osd("Saving cancelled")
 
+proc rgTaggable(path: string): bool =
+  ## path is a file of its own that ReplayGain values can be measured for:
+  ## not a link, a cue sheet or one of its tracks (a stretch of its album's file).
+  not path.contains("://") and not path.isCueFile and not path.isCueEntry
+
 proc rgFiles(a: App): seq[string] =
   ## The selected playlist items that are files, whose tags can be written.
   for i in a.plSelection:
-    if not a.playlist[i].contains("://"): result.add a.playlist[i]
+    if a.playlist[i].rgTaggable: result.add a.playlist[i]
 
 proc saveReplayGain(a: App, mode: RgMode, files: seq[string]) =
   ## Measures files and writes their ReplayGain values into their tags;
@@ -7683,6 +7689,13 @@ proc rgReport(a: App, did: string, written, total: int, failed: seq[string]) =
   else:
     let more = if failed.len > 1: &" (and {failed.len - 1} more)" else: ""
     a.osd(&"ReplayGain {did} {written} of {n}. {failed[0]}{more}", 6)
+
+proc rgProgressText(a: App): string =
+  ## The status bar's word on a running ReplayGain job: which file of how
+  ## many, and with several, the percent of them all.
+  let (_, pc, step, steps) = a.rgJob.progress
+  (if a.rgJob.writing: "Applying ReplayGain" else: "Analyzing ReplayGain") &
+    (if steps > 1: &" ({step}/{steps}), {int(pc)}% of all" else: &" {int(pc)}%")
 
 proc reopenRetagged(a: App, path: string) =
   ## path's ReplayGain tags were written: still the file playing, it opens
@@ -10008,11 +10021,19 @@ proc buildLibraryView(a: App) =
 
 proc libGroupCollapsed(a: App, label: string): bool = label in a.cfg.libraryCollapsed
 
-proc libToggleGroup(a: App, label: string) =
-  ## Collapses a folder's group, or expands it again.
+proc libToggleGroup(a: App, label: string, deep = false) =
+  ## Collapses a folder's group, or expands it again; deep, its subfolders'
+  ## groups too (those listed collapsing, all expanding).
   let i = a.cfg.libraryCollapsed.find(label)
   if i >= 0: a.cfg.libraryCollapsed.delete(i)
   else: a.cfg.libraryCollapsed.add label
+  if deep:
+    let sub = label & " / "
+    if i >= 0: a.cfg.libraryCollapsed.keepItIf(not it.startsWith(sub))
+    else:
+      for g in a.libGroups:
+        if g.label.startsWith(sub) and g.label notin a.cfg.libraryCollapsed:
+          a.cfg.libraryCollapsed.add g.label
   a.startFold(a.libFoldFiles, label, i >= 0)
   a.buildLibraryView()
   a.cfg.save()
@@ -10265,16 +10286,30 @@ proc libNodeIndex(a: App, nodes: seq[LibNode]): int =
     if n.lib == a.cfg.libraryShown and n.folder == a.cfg.libraryFolder: return i
   -1
 
-proc libSetExpanded(a: App, lib, folder: string, open: bool) =
+proc libSetExpanded(a: App, lib, folder: string, open: bool, deep = false) =
   ## Expands a library or folder of the tree, or collapses it: a folder
-  ## listed inside it is then left for it, as it's hidden.
+  ## listed inside it is then left for it, as it's hidden. Deep, every
+  ## folder under it holding folders too.
   let key = libNodeKey(lib, folder)
   let i = a.cfg.libraryExpanded.find(key)
-  if open == (i >= 0): return
-  a.startFold(a.libFoldTree, key, open)
-  if open: a.cfg.libraryExpanded.add key
+  var under: seq[string]  # deep: the keys of the folders under it holding folders
+  if deep:
+    let t = a.libTrees.getOrDefault(lib)
+    var stack = t.children(folder)
+    while stack.len > 0:
+      let f = stack.pop
+      let kids = t.children(f)
+      if kids.len > 0:
+        under.add libNodeKey(lib, f)
+        stack.add kids
+  if open == (i >= 0) and under.allIt((it in a.cfg.libraryExpanded) == open): return
+  if open != (i >= 0): a.startFold(a.libFoldTree, key, open)
+  if open:
+    for k in @[key] & under:
+      if k notin a.cfg.libraryExpanded: a.cfg.libraryExpanded.add k
   else:
-    a.cfg.libraryExpanded.delete(i)
+    let gone = (@[key] & under).toHashSet
+    a.cfg.libraryExpanded.keepItIf(it notin gone)
     let f = a.cfg.libraryFolder
     if a.cfg.libraryShown == lib and f.len > 0 and f != folder and (folder.len == 0 or f.under(folder)):
       a.libPick(lib, folder)
@@ -10462,6 +10497,8 @@ proc libGroupItems(a: App, m: MenuNode) =
   m.item("Expand All Groups", enabled = a.libGroups.anyIt(it.label in collapsed),
     action = proc () = a.libCollapseAll(false))
 
+proc libReplayGainSub(a: App, m: MenuNode, sel: seq[string])  # below
+
 proc libraryMenu(a: App): MenuNode =
   ## The Library panel's right-click menus: a library's, the blank space
   ## under them, the files', the column headers'.
@@ -10520,6 +10557,7 @@ proc libraryMenu(a: App): MenuNode =
     m.item("Copy Path", enabled = sel.len > 0, action = proc () =
       setClipboardString(sel.join("\n"))
       a.osd(if sel.len == 1: "Copied the path" else: "Copied " & $sel.len & " paths"))
+    if sel.len > 0: a.libReplayGainSub(m, sel)
     m.sep()
     m.item("Select All", "Ctrl+A", enabled = a.libView.anyIt(it >= 0), action = proc () =
       a.libSelectShown())
@@ -10647,6 +10685,46 @@ proc replayGainMenu(a: App, m: MenuNode) =
       a.saveReplayGain(rmTrack, @[path]))
     m.item("Remove ReplayGain Values", enabled = ok, action = proc () =
       a.removeReplayGain(@[path]))
+
+proc replayGainSub(a: App, m: MenuNode, files: seq[string], rg: ReplayGain, read: bool) =
+  ## A list's ReplayGain submenu (the playlist's, the Library's): the menu
+  ## items (rg: the values of the file picked, when `read`), then analyzing
+  ## the files selected, each as a track or all as one album, or removing
+  ## their values.
+  let rgm = m.sub("ReplayGain")
+  a.replayGainItems(rgm, rg, read)
+  rgm.sep()
+  if a.rgJob.running:
+    rgm.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
+  else:
+    # Measured from the audio (ffmpeg decodes it), written with TagLib.
+    let ok = files.anyIt(canWriteGain(it))
+    let count = if files.len > 1: &" ({files.len} files)" else: ""
+    rgm.item("Analyze and Apply as Tracks" & count, enabled = ok, action = proc () =
+      a.saveReplayGain(rmTrack, files))
+    rgm.item("Analyze and Apply as Album" & count, enabled = ok, action = proc () =
+      a.saveReplayGain(rmAlbum, files))
+    rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
+      a.removeReplayGain(files))
+
+proc libReplayGainSub(a: App, m: MenuNode, sel: seq[string]) =
+  ## The Library's ReplayGain submenu for its selected files: the values of
+  ## the one last clicked (the playing file's as applied, else its tags and
+  ## .m2c's as the Library read them).
+  let pick = if a.libCursor in a.libSel: a.libCursor else: sel[0]
+  let p = a.player
+  var rg: ReplayGain
+  var read = true
+  if p.loaded and p.path == pick: rg = a.currentRg
+  elif pick in a.mediaInfo: rg = a.mediaInfo[pick].rg
+  else:
+    let i = a.library.find(pick)
+    read = i >= 0 and a.library.files[i].probed
+    if read:
+      var info: MediaInfo
+      info.retag(a.library.files[i].tags)
+      rg = info.rg
+  a.replayGainSub(m, sel.filterIt(it.rgTaggable), rg, read)
 
 proc setShield(a: App, on: bool)  # below
 
@@ -11350,23 +11428,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     let opened = sel.len > 0 and sel == p.path and p.loaded
     let read = opened or sel.len > 0 and not sel.contains("://") and sel in a.mediaInfo
     let replayGainSub = proc () =
-      let rgm = pl.sub("ReplayGain")
-      a.replayGainItems(rgm,
+      a.replayGainSub(pl, a.rgFiles,
         if opened: a.currentRg elif read: a.mediaInfo[sel].rg else: ReplayGain(), read)
-      rgm.sep()
-      if a.rgJob.running:
-        rgm.item("Cancel Analysis", action = proc () = a.cancelReplayGain())
-      else:
-        # Measured from the audio (ffmpeg decodes it), written with TagLib.
-        let files = a.rgFiles.len
-        let ok = a.rgFiles.anyIt(canWriteGain(it))
-        let count = if files > 1: &" ({files} files)" else: ""
-        rgm.item("Analyze and Apply as Tracks" & count, enabled = ok, action = proc () =
-          a.saveReplayGain(rmTrack, a.rgFiles))
-        rgm.item("Analyze and Apply as Album" & count, enabled = ok, action = proc () =
-          a.saveReplayGain(rmAlbum, a.rgFiles))
-        rgm.item("Remove ReplayGain Values" & count, enabled = ok, action = proc () =
-          a.removeReplayGain(a.rgFiles))
     a.restoreSideItem(pl)
     if hasSel: a.forgetTimeItem(pl, a.plSelection.mapIt(a.playlist[it]))
     # Read only when picked: the menu is rebuilt every frame.
@@ -14457,6 +14520,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if a.cfg.showRunLog and a.runLog.len > 0: mouse.add ("LMB", "Extend Log Selection")
     if plShown: mouse.add ("LMB", "Select Playlist Range")
     if a.cfg.showLibrary and a.libRows.len > 0: mouse.add ("LMB", "Select Library Range")
+    if a.cfg.showLibrary: mouse.add ("LMB", "Toggle Library Folder With Subfolders")
     if plShown and a.tabs.len > 1: mouse.add ("Drag", "Move Entries To A Tab")
   # Mouse shortcuts lead the bar, before any key group.
   if mouse.len > 0: result.insert(mouse, 0)
@@ -14597,11 +14661,10 @@ proc status(a: App, r: Rect) =
     ui.tip(sr, "Saving to " & a.saveJob.dest)
     sw += sr.w + 4
   if a.rgJob.running:
-    let (i, pc) = a.rgJob.progress
+    let (i, _, _, _) = a.rgJob.progress
     let n = a.rgJob.paths.len
     let w = a.rgJob.writing
-    let text = (if w: "Applying ReplayGain " elif n > 1: &"ReplayGain ({min(i + 1, n)}/{n}) " else: "ReplayGain ") &
-               $int(pc) & "%"
+    let text = a.rgProgressText
     let gr = rect(r.x + 30 + sw + 8, r.y, ui.textSize(text, FontSmall).x + 4, r.h)
     ui.textIn(text, gr, colTextDim, FontSmall)
     ui.tip(gr, (if w: "Writing the tags of " else: "Analyzing ") & a.rgJob.paths[min(i, n - 1)].extractFilename)
@@ -16438,6 +16501,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   ui.sk.pushClipRect(cats)
   var onCat = false
   var catPick, catToggle = -1  # after the loop: the rows change
+  var catDeep = false  # the toggle with Shift: the folders under it too
   # The folders unfolding show as far as it's open.
   let catFold = if cm.at < 0: Rect() else: rect(cats.x, cats.y + (cm.at + 1).float32 * catRowH -
     a.libCatScroll, cats.w, cm.foldBottom(catRowH) - (cm.at + 1).float32 * catRowH)
@@ -16479,7 +16543,9 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     ui.textIn(ui.ellipsize(label, row.x + row.w - tx - 4), rect(tx, row.y, row.x + row.w - tx - 2, catRowH), fg)
     if hov:
       onCat = true
-      if onArrow: ui.tip(arrow, if nd.open: "Collapse" else: "Expand")
+      if onArrow: ui.tip(arrow, (if nd.open: "Collapse" else: "Expand") &
+        (if a.libTrees.getOrDefault(name).children(nd.folder).anyIt(
+          a.libTrees.getOrDefault(name).children(it).len > 0): ". Shift+click: with its subfolders" else: ""))
       elif not isLib and name.len > 0:
         ui.tip(row, nd.folder & ": " &
           countLabel(a.libTrees.getOrDefault(name).count.getOrDefault(nd.folder), "file") &
@@ -16495,6 +16561,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
         if onArrow: catToggle = k
         else: catPick = k
       if nd.kids and not onArrow and w.buttonPressed[DoubleClick]: catToggle = k  # on the press or, on X11, its release
+      if catToggle == k: catDeep = w.shiftDown
       if ui.released(MouseRight):
         a.libCtx = if isLib or name.len == 0: lcLibrary else: lcFolder
         a.libCtxName = name
@@ -16506,7 +16573,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   if catPick >= 0: a.libPick(nodes[catPick].lib, nodes[catPick].folder)
   if catToggle >= 0:
     let nd = nodes[catToggle]
-    a.libSetExpanded(nd.lib, nd.folder, not nd.open)
+    a.libSetExpanded(nd.lib, nd.folder, not nd.open, catDeep)
   ui.sk.popClipRect()
   if not onCat and ui.hover(cats) and not overColEdge and ui.released(MouseRight):
     a.libCtx = lcBlank
@@ -16647,6 +16714,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   let playing = if a.player.loaded: a.player.path else: ""
   var toggle = ""  # the folder header clicked
   var toggled = false
+  var toggleDeep = false  # with Shift: its subfolders too
   var toggledRow = -1  # its row, when clicked stuck to the top
   # The header of the folder at the top, scrolled past: it sticks to the top
   # of the list, pushed up by the next folder's header as that comes.
@@ -16730,8 +16798,10 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
       if over >= 0:
         ui.tip(row, "Go to " & shown[over].folder)
       else:
+        let sub = g.label & " / "
         ui.tip(row, g.label & ": " & countLabel(g.count, "file") &
-          (if shut: ". Click to expand" else: ". Click to collapse"))
+          (if shut: ". Click to expand" else: ". Click to collapse") &
+          (if a.libGroups.anyIt(it.label.startsWith(sub)): ", Shift+click with its subfolders" else: ""))
       if ui.pressed():
         ui.consumeClick()
         a.libFocused = true
@@ -16739,7 +16809,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
         a.libCatKeys = false
         if a.ui.focusId == "lib-search": a.ui.focusId = ""
         if over >= 0: crumbGo = shown[over].folder
-        else: (toggle, toggled) = (g.label, true)  # after the loop: the rows it draws change
+        else: (toggle, toggled, toggleDeep) = (g.label, true, w.shiftDown)  # after the loop: the rows it draws change
   # The files unfolding show as far as their folder is open.
   let fileFold = if fm.at < 0: Rect() else: rect(rows.x, rows.y + (fm.at + 1).float32 * rowH -
     a.libScroll, rows.w, fm.foldBottom(rowH) - (fm.at + 1).float32 * rowH)
@@ -16821,7 +16891,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   ui.sk.popClipRect()
   if crumbGo.len > 0: a.libGoToFolder(crumbGo)
   if toggled:
-    a.libToggleGroup(toggle)
+    a.libToggleGroup(toggle, toggleDeep)
     # Collapsed from the top: its header stays there, the next folder under it.
     if toggledRow >= 0: a.libScroll = toggledRow.float32 * rowH
   if ui.hover(list) and ui.released(MouseRight):
@@ -18470,8 +18540,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Resize playlist or library column", "Drag column edge"),
       ("Fit playlist or library column to the rows shown", "Double-click column edge"),
       ("Collapse / expand library folder", "Click folder header (not a breadcrumb)"),
+      ("Collapse / expand library folder with its subfolders", "Shift+Click folder header"),
       ("Go to a folder of a library folder header", "Click its breadcrumb"),
       ("Expand / collapse a library or folder in the libraries' column", "Click its arrow / Double-click it"),
+      ("Expand / collapse it with its subfolders", "Shift+Click its arrow / Shift+Double-click it"),
       ("Resize window (compact mode)", "Drag window edge"),
       ("Quick cover (music, video track off)", "Drop picture on video"),
       ("Run window file list: select several / a range", "Ctrl+Click / Shift+Click"),
@@ -19187,17 +19259,17 @@ proc runScriptStep(a: App, st: ScriptStep) =
     stderr.writeLine "librows ", $a.libRows[0 ..< min(a.libRows.len, 30)].mapIt(
       ix.files[it].path.extractFilename & (if ix.files[it].probed: "" else: "?"))
     stderr.writeLine "libcols ", $a.cfg.libraryColumns, " ", $a.cfg.libraryColumnWidths,
-      " groups=", $a.libGroups
+      " groups=", $a.libGroups, " collapsed=", $a.cfg.libraryCollapsed
     stderr.writeLine "libsel ", $a.libSelectedPaths.mapIt(it.extractFilename), " cursor=",
       a.libCursor.extractFilename, " list=", (a.libListRect.x.int, a.libListRect.y.int,
       a.libListRect.w.int, a.libListRect.h.int), " height=", a.cfg.libraryHeight.int
   of "libsearch": a.cfg.librarySearch = arg  # the search's text
   of "libpick": a.libShow(if arg == "All": "" else: arg)  # the library listed, its within: tag in the search
-  of "libnode", "libtoggle":  # Library|folder (folder optional): a tree row clicked, or its arrow
+  of "libnode", "libtoggle", "libtoggledeep":  # Library|folder (folder optional): a tree row clicked, or its arrow (deep: with Shift)
     let bar = arg.find('|')
     let (lib, folder) = if bar < 0: (arg, "") else: (arg[0 ..< bar], arg[bar + 1 .. ^1])
     if st.cmd == "libnode": a.libPick(lib, folder)
-    else: a.libSetExpanded(lib, folder, not a.libExpanded(lib, folder))
+    else: a.libSetExpanded(lib, folder, not a.libExpanded(lib, folder), st.cmd == "libtoggledeep")
   of "libtreedump":  # the libraries' column, as drawn: depth, arrow, the row listed *
     for n in a.libTreeRows:
       stderr.writeLine "libtree ", repeat("  ", n.depth),
@@ -19206,6 +19278,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
         (if n.lib == a.cfg.libraryShown and n.folder == a.cfg.libraryFolder: " *" else: "")
   of "libselect": a.libSelectRow(parseInt(st.args[0]), st.args.len > 1)  # selects row i (i +: from the anchor to it)
   of "libgroup": a.libToggleGroup(arg)  # label: a folder group's header clicked (Group by Folder)
+  of "libgroupdeep": a.libToggleGroup(arg, true)  # label: the same, Shift held (its subfolders too)
   of "libscroll": a.libScroll = parseFloat(arg) * PlaylistRowH  # the files list scrolled down that many rows
   of "libctx", "libaction":  # ctx [label]: lib:NAME, blank, files or header; lists its menu or runs label
     let c = st.args[0]
@@ -19213,12 +19286,19 @@ proc runScriptStep(a: App, st: ScriptStep) =
                elif c == "files": lcFiles else: lcHeader
     if c.startsWith("lib:"): a.libCtxName = c[4 .. ^1]
     let m = a.libraryMenu()
-    let label = st.args[1 .. ^1].join(" ")
-    for n in m.children:
-      if st.cmd == "libctx" and n.kind != mkSeparator:
-        stderr.writeLine "libmenu ", n.label, (if n.enabled: "" else: " [off]"),
-          (if n.checked: " [x]" else: "")
-      elif n.label == label and n.enabled and n.action != nil: n.action()
+    # A submenu's item as "ReplayGain > Analyze and Apply as Album"; listed, indented.
+    let label = st.args[1 .. ^1].join(" ").split(" > ")
+    proc walk(m: MenuNode, depth: int) =
+      for n in m.children:
+        if st.cmd == "libctx" and n.kind != mkSeparator:
+          stderr.writeLine "libmenu ", repeat("  ", depth), n.label, (if n.enabled: "" else: " [off]"),
+            (if n.checked: " [x]" else: "")
+          walk(n, depth + 1)
+        elif st.cmd == "libaction" and depth < label.len and n.label == label[depth] and n.enabled:
+          if depth == label.high:
+            if n.action != nil: n.action()
+          else: walk(n, depth + 1)
+    walk(m, 0)
   of "optlib": a.editLibraries(arg)  # Options > Libraries with that library selected
   of "optlibnew": a.editLibraries(create = true)
   of "optlibitem": a.optionsDlg.libItem = parseInt(arg)  # selects its folder or file i
@@ -19614,7 +19694,8 @@ proc runScriptStep(a: App, st: ScriptStep) =
     let c = a.cfg
     stderr.writeLine "rg cfg=", c.replayGain, " preamp=", c.replayGainPreamp, " fallback=",
       c.replayGainFallback, " noclip=", c.replayGainNoClip, " file=", a.currentRg,
-      " button=", a.rgButton, " rect=", a.rgRect
+      " button=", a.rgButton, " rect=", a.rgRect,
+      (if a.rgJob.running: " job=\"" & a.rgProgressText & "\"" else: "")
     for (name, p) in [("player", a.player), ("standby", a.standby), ("lsound", a.lsound)]:
       if p != nil:
         stderr.writeLine "rg ", name, " ", ["replaygain", "replaygain-preamp", "replaygain-clip",

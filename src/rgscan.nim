@@ -1,5 +1,6 @@
 ## ReplayGain 2.0 values worked out for files and written to their tags (the
-## playlist menu's ReplayGain > Analyze and Apply as Tracks / as Album).
+## playlist's and the Library's ReplayGain > Analyze and Apply as Tracks / as
+## Album).
 ##
 ## Each file's first audio track is decoded by ffmpeg into a WAV on a pipe
 ## (its header gives the rate and the channel layout) and measured on a
@@ -66,6 +67,7 @@ type
     written: int
     tagged, failed: seq[string]  ## tagged: since poll last took them
     writing, finished, cancel: bool
+    tagging: int              ## while writing an album's tags: how many files get them
     ffmpeg: Process
 
   WorkArg = object
@@ -413,7 +415,9 @@ proc work(arg: WorkArg) =
       if album.loudness.isNaN:
         withLock sh.lock: sh.failed.add "the album: silent"
       else:
-        withLock sh.lock: sh.writing = true
+        withLock sh.lock:
+          sh.writing = true
+          sh.tagging = measured.len
         for k, (i, m) in measured:
           if cancelled(): break
           progress(i, k / measured.len)
@@ -470,6 +474,7 @@ proc start*(paths: seq[string], durations: seq[float], mode: RgMode,
     sh.tagged = @[]
     sh.failed = @[]
     sh.writing = false
+    sh.tagging = 0
     sh.finished = false
     sh.cancel = false
     sh.job = WorkArg(mode: mode, paths: paths, durations: durations, fonts: fonts)
@@ -477,13 +482,17 @@ proc start*(paths: seq[string], durations: seq[float], mode: RgMode,
     signal(sh.cond)
   result = RgJob(mode: mode, paths: paths)
 
-proc progress*(j: RgJob): tuple[index: int, percent: float] =
-  ## The file being measured and how far along all of them are; while an
-  ## album's tags are written (j.writing), the file being tagged and how
-  ## many of them are.
+proc progress*(j: RgJob): tuple[index: int, percent: float, step, steps: int] =
+  ## The file being measured, how far along all of them are, and which of
+  ## them it is (step of steps, from 1); while an album's tags are written
+  ## (j.writing), the file being tagged, how many of them are, and which of
+  ## the files measured it is.
   withLock sh.lock:
-    result = if sh.writing: (sh.index, sh.frac * 100)
-             else: (sh.index, (sh.index.float + sh.frac) * 100 / max(1, j.paths.len).float)
+    let n = max(1, j.paths.len)
+    result = if sh.writing:
+               let m = max(1, sh.tagging)
+               (sh.index, sh.frac * 100, min(int(round(sh.frac * m.float)) + 1, m), m)
+             else: (sh.index, (sh.index.float + sh.frac) * 100 / n.float, min(sh.index + 1, n), n)
 
 proc cancel*(j: RgJob) =
   withLock sh.lock:

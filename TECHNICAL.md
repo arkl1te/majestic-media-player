@@ -628,9 +628,10 @@ it held, to commit.
   gain + pre-amp, capped at -20·log10(peak) with Prevent clipping). Script commands: `rg` opens
   the menu, `rgaction Label/Sub` picks an item (`playlist/...` for the playlist's), `rgmenu
   [playlist]` lists the items, `rgdump` prints the settings and each player's properties.
-- Analyzing ReplayGain into tags (the playlist menu's ReplayGain > Analyze and Apply as Tracks
-  (track gains only) / Analyze and Apply as Album (track gains plus one album gain) / Remove
-  ReplayGain Values, for the selected local files; the controls' ReplayGain button (and Play >
+- Analyzing ReplayGain into tags (the ReplayGain submenu of the playlist's and the Library
+  files' menus, `replayGainSub`: Analyze and Apply as Tracks (track gains only) / Analyze and
+  Apply as Album (track gains plus one album gain) / Remove ReplayGain Values, for the selected
+  local files, cue sheets and their tracks left out; the controls' ReplayGain button (and Play >
   ReplayGain, the same menu: `replayGainMenu`) has Analyze
   and Apply as Track and Remove ReplayGain Values for the open file, disabled for a cue sheet's
   track, which has no tags of its own; `src/rgscan.nim`): a
@@ -653,7 +654,8 @@ it held, to commit.
   block back to the heap of the thread that allocated it, which a thread per job took with it (a
   crash on the third job under `GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0`, at random
   otherwise). `RgJob.writing` marks the album's writing, which the
-  status bar shows as "Applying ReplayGain". Tagged files leave the probe cache so the playlist reads them
+  status bar shows as "Applying ReplayGain" (else "Analyzing ReplayGain"); with several files,
+  `progress` also gives which of them it's at, shown as "(3/10), 24% of all" (`rgProgressText`). Tagged files leave the probe cache so the playlist reads them
   again. mpv reads a file's values only on opening it, so the open file, when tagged, opens again
   where it is (`reopenHere`, as the tag editor does) once the job ends (once for an album's track
   and album gains), or right after Remove ReplayGain Values when mpv had values for it; the
@@ -1153,7 +1155,7 @@ it held, to commit.
   Test kits: `tmp/lib/libtest.nim` (scanning, search, rescans, saved index),
   `tmp/lib/hangtest.nim` with `tmp/lib/hang/hangfs` (a FUSE folder whose calls never return; kill
   it by PID to release the test), `tmp/lib/bigtest.nim` (20 000 files), `tmp/libt/run.sh` (GUI), `tmp/libtree/run.sh` (nested folders, the tree).
-  Script commands: `libshow`, `libdump`, `libsearch`, `libpick`, `libnode`/`libtoggle` (`Library|folder`), `libtreedump`, `libgroup` (a group's label), `libscroll` (rows), `libselect`, `libctx`/`libaction`,
+  Script commands: `libshow`, `libdump`, `libsearch`, `libpick`, `libnode`/`libtoggle` (`Library|folder`), `libtreedump`, `libgroup` (a group's label), `libscroll` (rows), `libselect`, `libctx`/`libaction` (a submenu's item as `ReplayGain > Label`),
   `optlib`, `optlibnew`, `optlibitem`, `optlibadd`, `optlibctx`/`optlibaction`, `optlibmenu`,
   `libtypes`, `libtypesclose`.
 
