@@ -57,7 +57,7 @@ type Hook = ref object
   chrome, minSize: IVec2     ## client-area sizes
   frameless: bool            ## undecorated by setDecorated: the hook finds its edges
   cursor: HCURSOR            ## shown instead of Windy's cursor; 0: Windy's
-  onMessage: MessageHook     ## sees every message, see setMessageHook
+  onMessage: seq[MessageHook]  ## see every message, see addMessageHook
 
 var hooks: seq[Hook]
 
@@ -294,7 +294,7 @@ proc registerDrops(hwnd: HWND): bool =
 proc hookProc(h: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.stdcall.} =
   let k = hookFor(h)
   if k == nil: return DefWindowProcW(h, msg, wParam, lParam)
-  if k.onMessage != nil: k.onMessage(msg, wParam, lParam)
+  for hook in k.onMessage: hook(msg, wParam, lParam)
   case msg
   of WM_GETMINMAXINFO:
     result = CallWindowProcW(k.prev, h, msg, wParam, lParam)
@@ -375,10 +375,10 @@ proc initMainWindow*(window: Window) =
   discard window.hookWindow()
   if not registerDrops(window.hwnd): DragAcceptFiles(window.hwnd, 1)
 
-proc setMessageHook*(window: Window, hook: MessageHook) =
+proc addMessageHook*(window: Window, hook: MessageHook) =
   ## Shows hook every message of the main window, before it's handled.
   let k = hookFor(window.hwnd)
-  if k != nil: k.onMessage = hook
+  if k != nil: k.onMessage.add hook
 
 # --- Windows' modal loops -----------------------------------------------------
 # Dragging a title bar or a border, or opening a title bar's menu, runs a

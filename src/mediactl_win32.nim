@@ -112,7 +112,7 @@ proc newMediaControls*(window: Window): MediaControls =
   c.pauseIcon = makeIcon("pause", size)
   c.prevIcon = makeIcon("prev", size)
   c.nextIcon = makeIcon("next", size)
-  window.setMessageHook(proc (msg: UINT, wParam: WPARAM, lParam: LPARAM) =
+  window.addMessageHook(proc (msg: UINT, wParam: WPARAM, lParam: LPARAM) =
     c.onMessage(msg, wParam))
   c.apply()  # the window is showing already, so TaskbarButtonCreated may be gone
 

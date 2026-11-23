@@ -42,6 +42,8 @@ Majestic's aim is to be the video player I wish I had.
 - Playlists line: - **Several playlists**, foobar2000-style, with a playback queue and group headers.
 - Tag editor line: - **A tag editor**, even for files that can't hold tags (MIDI, tracker modules...).
 - After "A shield button": - **Westwood `.aud` game music.**
+- After "A tag editor": - **A subtitle editor**, Aegisub-style, its edits shown live on the video.
+- After "Taskbar media controls": - **Global keys and media keys**: any command's key can work from other programs.
 -->
 
 Hold Ctrl, Shift or Alt to see what else you can do, or press F1 for every shortcut. Try right-clicking everything, too!

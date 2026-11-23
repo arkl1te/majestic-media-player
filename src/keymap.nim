@@ -96,6 +96,7 @@ type
     kaQueue = "queue"
     kaUnqueue = "unqueue"
     kaAddClipboardPlaylist = "add-clipboard-to-playlist"
+    kaSubEditor = "subtitle-editor"
     kaRunLog = "run-log"
     kaLibrary = "library"
     kaSearchLibrary = "search-library"
@@ -140,8 +141,8 @@ const
     (kgFile, "Save screenshot", "Screenshot", "Alt+I"),
     (kgFile, "Properties", "Properties", ""),
     (kgFile, "Exit", "Exit", "Alt+X"),
-    (kgPlayback, "Play / Pause", "Play/Pause", "Space"),
-    (kgPlayback, "Stop", "Stop", ""),
+    (kgPlayback, "Play / Pause", "Play/Pause", "Space|Media Play"),
+    (kgPlayback, "Stop", "Stop", "Media Stop"),
     (kgPlayback, "Frame (sound only: sample) forward", "Frame / Sample Forward", "."),
     (kgPlayback, "Frame (sound only: sample) back", "Frame / Sample Back", ","),
     (kgPlayback, "Fast-forward", "Fast-Forward", "Shift+."),
@@ -170,8 +171,8 @@ const
     (kgNavigate, "Jump to 90%", "Jump To 90%", "9"),
     (kgNavigate, "Next chapter", "Next Chapter", "Ctrl+Right"),
     (kgNavigate, "Previous chapter", "Previous Chapter", "Ctrl+Left"),
-    (kgNavigate, "Next file", "Next File", "Page Down"),
-    (kgNavigate, "Previous file", "Previous File", "Page Up"),
+    (kgNavigate, "Next file", "Next File", "Page Down|Media Next"),
+    (kgNavigate, "Previous file", "Previous File", "Page Up|Media Previous"),
     (kgNavigate, "Add bookmark", "Add Bookmark", "Insert"),
     (kgNavigate, "Remove bookmark here or selected playlist item", "Remove Bookmark Or Playlist Item", "Delete"),
     (kgSubtitles, "Align top left", "Align Top Left", "Shift+Numpad 7"),
@@ -211,7 +212,8 @@ const
     (kgPlaylist, "Add selection to playback queue", "Queue", "Q"),
     (kgPlaylist, "Remove selection from playback queue", "Unqueue", "Shift+Q"),
     (kgPlaylist, "Add clipboard to playlist", "Add Clipboard To Playlist", "Ctrl+Shift+V"),
-    (kgView, "Run log", "Run Log", "Ctrl+5"),
+    (kgView, "Subtitle editor", "Subtitle Editor", "Ctrl+5"),
+    (kgView, "Run log", "Run Log", "Ctrl+6"),
     (kgView, "Library", "Library", "Ctrl+4"),
     (kgView, "Search library", "Search Library", "Ctrl+Shift+F"),
     (kgView, "Show OSD", "Show OSD", ""),
@@ -247,7 +249,8 @@ const
   Unbindable = {KeyLeftShift, KeyRightShift, KeyLeftControl, KeyRightControl,
                 KeyLeftAlt, KeyRightAlt, KeyLeftSuper, KeyRightSuper, KeyCapsLock,
                 KeyNumLock, KeyEscape}
-  BindableKeys* = {Key0 .. NumpadEqual} - Unbindable
+  MediaKeys* = {KeyMediaPlayPause .. KeyVolumeUp}
+  BindableKeys* = {Key0 .. NumpadEqual} + MediaKeys - Unbindable
 
 proc keyName*(b: Button): string =
   case b
@@ -291,6 +294,13 @@ proc keyName*(b: Button): string =
   of NumpadMultiply: "Numpad *"
   of NumpadDivide: "Numpad /"
   of NumpadEqual: "Numpad ="
+  of KeyMediaPlayPause: "Media Play"
+  of KeyMediaStop: "Media Stop"
+  of KeyMediaPrevious: "Media Previous"
+  of KeyMediaNext: "Media Next"
+  of KeyVolumeMute: "Volume Mute"
+  of KeyVolumeDown: "Volume Down"
+  of KeyVolumeUp: "Volume Up"
   else: ""
 
 proc shortKeyName*(b: Button): string =
@@ -307,6 +317,13 @@ proc shortKeyName*(b: Button): string =
   of KeyPrintScreen: "PrtSc"
   of KeyScrollLock: "ScrLk"
   of Numpad0 .. NumpadEqual: keyName(b).replace("Numpad ", "Num")
+  of KeyMediaPlayPause: "Play"
+  of KeyMediaStop: "Stop"
+  of KeyMediaPrevious: "Prev"
+  of KeyMediaNext: "Next"
+  of KeyVolumeMute: "Mute"
+  of KeyVolumeDown: "Vol-"
+  of KeyVolumeUp: "Vol+"
   else: keyName(b)
 
 proc `$`*(k: KeyCombo): string =
@@ -364,6 +381,14 @@ proc setCombo*(c: var Config, a: KeyAction, k: KeyCombo) =
 
 proc removeCombo*(c: var Config, a: KeyAction, k: KeyCombo) =
   c.setCombos(a, c.combos(a).filterIt(it != k))
+
+proc isGlobal*(c: Config, a: KeyAction): bool = $a in c.globalKeys
+
+proc setGlobal*(c: var Config, a: KeyAction, on: bool) =
+  ## Global keys work while another program has the keyboard (Options >
+  ## Player > Keys); none is by default.
+  if on and not c.isGlobal(a): c.globalKeys.add $a
+  elif not on: c.globalKeys.keepItIf(it != $a)
 
 proc actionsUsing*(c: Config, k: KeyCombo): seq[KeyAction] =
   if k.key == ButtonUnknown: return
@@ -453,8 +478,8 @@ const
     ("scale", @["width", "height"]),
     ("next", @["forward"]),
     ("previous", @["back", "prior"]),
-    ("hide", @["seek bar", "controls", "status", "playlist", "run log", "show"]),
-    ("toggle", @["show", "seek bar", "controls", "status", "playlist", "run log", "full screen"])]
+    ("hide", @["seek bar", "controls", "status", "playlist", "subtitle editor", "run log", "show"]),
+    ("toggle", @["show", "seek bar", "controls", "status", "playlist", "subtitle editor", "run log", "full screen"])]
 
 proc alternatives(word: string): seq[string] =
   ## word and what it stands for. A word of three letters or more also
@@ -483,7 +508,8 @@ proc matchesSearch*(c: Config, a: KeyAction, search: string): bool =
   ## Every word of search begins a word of the command's name, group or
   ## keys; or one of its synonyms begins a word of the name.
   let label = Actions[a].label.toLowerAscii
-  let hay = label & " " & ($Actions[a].group).toLowerAscii & " " & c.keysText(a).toLowerAscii
+  var hay = label & " " & ($Actions[a].group).toLowerAscii & " " & c.keysText(a).toLowerAscii
+  if c.isGlobal(a): hay.add " global"
   for word in strutils.splitWhitespace(search.toLowerAscii):
     if not hay.hasWordStart(word) and not word.alternatives.anyIt(label.hasWordStart(it)):
       return false

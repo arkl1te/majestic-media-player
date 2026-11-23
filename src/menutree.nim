@@ -57,6 +57,15 @@ type
     opened: int               ## openContext calls so far
     pendingAction: proc ()
     pendingRemove: proc ()
+    keys: seq[MenuKey]        ## pressed since the last frame (pressKey)
+    keyLed: bool              ## the keyboard leads: keyRow is lit, not the row
+                              ## under the pointer, until the pointer moves
+    keyRow: int               ## the row lit in the last popup (rows' index), -1 none
+    keyMouse: Vec2            ## the pointer when the keyboard took over
+
+  MenuKey* = enum
+    ## A key that moves through the open menus.
+    mkeyUp, mkeyDown, mkeyHome, mkeyEnd, mkeyLeft, mkeyRight, mkeyEnter
 
 proc newMenuSystem*(): MenuSystem = MenuSystem()
 
@@ -118,21 +127,30 @@ proc contextRect*(m: MenuSystem): Rect =
   ## The open context menu's top level as last laid out, or empty.
   if m.mode == mmContext and m.levels.len > 0: m.levels[0].rect else: Rect()
 
+proc dropKeys(m: MenuSystem) =
+  m.keys.setLen 0
+  m.keyLed = false
+  m.keyRow = -1
+
 proc close*(m: MenuSystem) =
   m.mode = mmClosed
   m.path.setLen 0
   m.levels.setLen 0
   m.boundsValid = false
+  m.dropKeys()
   for w in m.windows: w.hide()
 
 proc openBar*(m: MenuSystem, barIndex: int, path: seq[int] = @[]) =
   m.mode = mmBar
   m.barIndex = barIndex
   m.path = path
+  m.dropKeys()
 
-proc openContext*(m: MenuSystem, pos: Vec2, sticky = false, keep = Rect(), above = false) =
+proc openContext*(m: MenuSystem, pos: Vec2, sticky = false, keep = Rect(), above = false,
+                  keyboard = false) =
   ## `sticky`: picking items leaves it open; it closes once the pointer is
   ## away from it and from `keep`. `above`: it opens upward from pos.
+  ## `keyboard`: opened by a key, its first item lit for the arrows.
   m.mode = mmContext
   inc m.opened
   m.contextPos = pos
@@ -140,6 +158,14 @@ proc openContext*(m: MenuSystem, pos: Vec2, sticky = false, keep = Rect(), above
   m.sticky = sticky
   m.keep = keep
   m.above = above
+  m.dropKeys()
+  if keyboard: m.keys.add mkeyHome
+
+proc pressKey*(m: MenuSystem, k: MenuKey) =
+  ## A key for the open menus: Up/Down/Home/End light a row, Right (or
+  ## Enter) opens its submenu, Left closes it, Enter runs the row; in the
+  ## menu bar's menus Left/Right go on to the menu beside. Taken next frame.
+  if m.mode != mmClosed: m.keys.add k
 
 proc pollInput*(m: MenuSystem): bool =
   ## Call after pollEvents every loop iteration. Collects clicks on the popup
@@ -294,12 +320,80 @@ proc topLevelAt(m: MenuSystem, p: Vec2): int =
   for d in countdown(m.levels.high, 0):
     if p.inside(m.levels[d].rect): return d
 
+proc selectable(c: MenuNode): bool = c.kind notin {mkSeparator, mkColumn} and c.enabled
+
+proc rowNodes(node: MenuNode): seq[MenuNode] =
+  ## node's rows, in the order (and by the index) rows gives them.
+  for (_, c, _) in rows(node, Rect()): result.add c
+
+proc nextRow(items: seq[MenuNode], at, dir: int): int =
+  ## The selectable row after at going dir (1 or -1), round the end; -1 for
+  ## none. From -1 going 1 (or from items.len going -1): the first (last).
+  let n = items.len
+  var i = at
+  for _ in 0 ..< n:
+    i = (i + dir + n) mod n
+    if items[i].selectable: return i
+  -1
+
+proc lastOpen(m: MenuSystem, top: MenuNode): MenuNode =
+  ## The last popup open from top (the one the arrows move in); entries of
+  ## path that no longer name a submenu are dropped.
+  result = top
+  var d = 0
+  while d < m.path.len:
+    let i = m.path[d]
+    if result.columns or i notin 0 ..< result.children.len or result.children[i].kind != mkSub:
+      m.path.setLen d
+      return
+    result = result.children[i]
+    inc d
+
+proc takeKeys(m: MenuSystem, root, contextRoot: MenuNode) =
+  ## Acts on the keys pressed since the last frame (pressKey).
+  for k in m.keys:
+    let top = if m.mode == mmBar: root.children[m.barIndex] else: contextRoot
+    let node = m.lastOpen(top)
+    let items = node.rowNodes
+    if not m.keyLed:
+      # From the row under the pointer, if it's in that popup.
+      m.keyLed = true
+      m.keyRow = -1
+      if m.levels.len == m.path.len + 1:  # last frame's, with that popup last
+        for (i, c, row) in rows(node, m.levels[^1].rect):
+          if c.selectable and m.mouse.inside(row): m.keyRow = i
+    m.keyMouse = m.mouse
+    let cur = if m.keyRow in 0 ..< items.len and items[m.keyRow].selectable: m.keyRow else: -1
+    template beside(dir: int) =
+      # The menu bar's next or previous menu, its first row lit.
+      let n = root.children.len
+      m.barIndex = (m.barIndex + dir + n) mod n
+      m.path.setLen 0
+      m.keyRow = root.children[m.barIndex].rowNodes.nextRow(-1, 1)
+    case k
+    of mkeyDown: m.keyRow = items.nextRow(cur, 1)
+    of mkeyUp: m.keyRow = items.nextRow(if cur < 0: items.len else: cur, -1)
+    of mkeyHome: m.keyRow = items.nextRow(-1, 1)
+    of mkeyEnd: m.keyRow = items.nextRow(items.len, -1)
+    of mkeyRight, mkeyEnter:
+      if cur >= 0 and items[cur].kind == mkSub and not node.columns:
+        m.path.add cur
+        m.keyRow = items[cur].rowNodes.nextRow(-1, 1)
+      elif k == mkeyEnter:
+        if cur >= 0 and items[cur].action != nil: m.pendingAction = items[cur].action
+      elif m.mode == mmBar and root.children.len > 0: beside(1)
+    of mkeyLeft:
+      if m.path.len > 0: m.keyRow = m.path.pop()
+      elif m.mode == mmBar and root.children.len > 0: beside(-1)
+  m.keys.setLen 0
+
 proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
                   below: bool, released: bool) =
   ## Places the open popups, then tracks hover/open submenus and clicks in the
-  ## topmost popup under the pointer only.
+  ## topmost popup under the pointer only (none while the keyboard leads).
   m.levels.setLen 0
   m.placePopup(ui, node, anchor, 0, below)
+  if m.keyLed: return
   let d = m.topLevelAt(m.mouse)
   if d < 0: return
   let lv = m.levels[d]
@@ -327,7 +421,7 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
   ## Draws one popup level into its own window, i.e. at the origin.
   let r = rect(vec2(0, 0), lv.rect.wh)
   let mouse = m.mouse - lv.rect.xy
-  let top = m.topLevelAt(m.mouse) == depth
+  let top = not m.keyLed and m.topLevelAt(m.mouse) == depth
   ui.rect(r, colPopup)
   ui.border(r, colBorder)
   for (i, c, row) in rows(lv.node, r):
@@ -340,7 +434,9 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
       if row.x > r.x + 4:  # a line between columns
         ui.rect(rect(row.x, r.y + 6, 1, r.h - 12), colBorder)
       continue
-    let hov = c.enabled and top and mouse.inside(row)
+    let hov =
+      if m.keyLed: c.enabled and depth == m.levels.high and i == m.keyRow
+      else: c.enabled and top and mouse.inside(row)
     let isOpenSub = c.kind == mkSub and m.path.len > depth and m.path[depth] == i
     if hov or isOpenSub:
       ui.rect(row, if c.contextual: colContextualHover else: colHover)
@@ -390,7 +486,7 @@ proc drawBar*(m: MenuSystem, ui: Ui, root: MenuNode, bar: Rect) =
         m.barIndex = i
         m.path.setLen 0
       ui.consumeClick()
-    elif hov and m.mode == mmBar and not open:
+    elif hov and m.mode == mmBar and not open and not m.keyLed:
       m.barIndex = i
       m.path.setLen 0
     let isOpen = m.mode == mmBar and m.barIndex == i
@@ -403,11 +499,19 @@ proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   ## Lays out open popups, handles hover and runs a clicked action.
   let released = ui.window.buttonReleased[MouseLeft] or m.input.leftReleased
   m.input = PopupInput()
-  m.levels.setLen 0
   # Opened during this frame, after captureInput: without this its first
   # frame would be placed in an empty monitor (the window's top-left corner)
   # from an old window origin.
   if m.mode != mmClosed and not m.boundsValid: discard m.locate(ui)
+  # The pointer leads again once it moves or clicks.
+  if m.keyLed and (released or (m.mouse - m.keyMouse).length > 3):
+    m.keyLed = false
+    m.keyRow = -1
+  if m.keys.len > 0:
+    if m.mode == mmContext or (m.mode == mmBar and m.barIndex < root.children.len):
+      m.takeKeys(root, contextRoot)  # from last frame's popups
+    m.keys.setLen 0
+  m.levels.setLen 0
   case m.mode
   of mmBar:
     if m.barIndex < m.barRects.len:

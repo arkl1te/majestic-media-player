@@ -1,5 +1,23 @@
+diff --git a/src/windy/common.nim b/src/windy/common.nim
+index 5d71a50..109bc6b 100644
+--- a/src/windy/common.nim
++++ b/src/windy/common.nim
+@@ -204,6 +204,13 @@ type
+     NumpadMultiply  # *
+     NumpadDivide    # /
+     NumpadEqual     # =
++    KeyMediaPlayPause
++    KeyMediaStop
++    KeyMediaPrevious
++    KeyMediaNext
++    KeyVolumeMute
++    KeyVolumeDown
++    KeyVolumeUp
+ 
+   ButtonView* = distinct set[Button]
+ 
 diff --git a/src/windy/platforms/linux/x11.nim b/src/windy/platforms/linux/x11.nim
-index 5b29e3c..496ea53 100644
+index 5b29e3c..2cf5b59 100644
 --- a/src/windy/platforms/linux/x11.nim
 +++ b/src/windy/platforms/linux/x11.nim
 @@ -52,6 +52,8 @@ type
@@ -70,8 +88,18 @@ index 5b29e3c..496ea53 100644
    )
  
  proc delProperty(window: XWindow, property: Atom) =
-@@ -376,6 +391,33 @@ proc keysymToButton(sym: KeySym): Button =
+@@ -374,8 +389,43 @@ proc keysymToButton(sym: KeySym): Button =
+   of xk_7: Key7
+   of xk_8: Key8
    of xk_9: Key9
++  # XF86 media keys (the play key is the play/pause toggle on keyboards).
++  of 0x1008FF14, 0x1008FF31: KeyMediaPlayPause  # XF86AudioPlay, XF86AudioPause
++  of 0x1008FF15: KeyMediaStop                   # XF86AudioStop
++  of 0x1008FF16: KeyMediaPrevious               # XF86AudioPrev
++  of 0x1008FF17: KeyMediaNext                   # XF86AudioNext
++  of 0x1008FF12: KeyVolumeMute                  # XF86AudioMute
++  of 0x1008FF11: KeyVolumeDown                  # XF86AudioLowerVolume
++  of 0x1008FF13: KeyVolumeUp                    # XF86AudioRaiseVolume
    else: ButtonUnknown
  
 +const
@@ -104,7 +132,7 @@ index 5b29e3c..496ea53 100644
  proc queryKeyboardState(): set[0..255] =
    var r: array[32, char]
    display.XQueryKeymap(r)
-@@ -471,6 +513,23 @@ proc size*(window: Window): IVec2 =
+@@ -471,6 +521,23 @@ proc size*(window: Window): IVec2 =
  proc framebufferSize*(window: Window): IVec2 =
    window.size
  
@@ -128,7 +156,7 @@ index 5b29e3c..496ea53 100644
  proc `size=`*(window: Window, v: IVec2) =
    let originalValue = window.size
    if originalValue == v:
-@@ -479,9 +538,18 @@ proc `size=`*(window: Window, v: IVec2) =
+@@ -479,9 +546,18 @@ proc `size=`*(window: Window, v: IVec2) =
    # Its important to swap buffers so that openGL viewport updates.
    window.swapBuffers()
    # TODO: for some reason Chrome GLFW just do display.XFlush() and its enough?
@@ -148,7 +176,7 @@ index 5b29e3c..496ea53 100644
  
  proc centerWindow*(window: Window) =
    ## Calculate centered position for a window on the primary screen.
-@@ -580,7 +648,7 @@ proc `style=`*(window: Window, v: WindowStyle) =
+@@ -580,7 +656,7 @@ proc `style=`*(window: Window, v: WindowStyle) =
        )
      of WmForDecoratedKind.kwm, WmForDecoratedKind.other:
        window.handle.setProperty(
@@ -157,7 +185,7 @@ index 5b29e3c..496ea53 100644
        )
      else:
        return
-@@ -788,6 +856,19 @@ proc newWindow*(
+@@ -788,6 +864,19 @@ proc newWindow*(
      result.handle, wmProtocols[0].addr, cint wmProtocols.len
    )
  
@@ -177,7 +205,7 @@ index 5b29e3c..496ea53 100644
    result.im = display.XOpenIM
    result.ic = result.im.XCreateIC(
      "clientWindow",
-@@ -814,8 +895,11 @@ proc newWindow*(
+@@ -814,8 +903,11 @@ proc newWindow*(
    result.applyCursor()
  
    # Enable XDnD awareness (version 5)
@@ -191,7 +219,7 @@ index 5b29e3c..496ea53 100644
  
    makeContextCurrent result
  
-@@ -829,9 +913,11 @@ proc newWindow*(
+@@ -829,9 +921,11 @@ proc newWindow*(
      else:
        raise WindyError.newException("VSync is not supported")
  
@@ -206,7 +234,7 @@ index 5b29e3c..496ea53 100644
    block xsync:
      var vEv, vEr: cint
      if display.XSyncQueryExtension(vEv.addr, vEr.addr):
-@@ -842,13 +928,51 @@ proc newWindow*(
+@@ -842,13 +936,51 @@ proc newWindow*(
          xaNetWMSyncRequestCounter,
          xaCardinal,
          32,
@@ -259,7 +287,7 @@ index 5b29e3c..496ea53 100644
  proc pollEvents(window: Window) =
  
    # Clear all per-frame data
-@@ -865,8 +989,8 @@ proc pollEvents(window: Window) =
+@@ -865,8 +997,8 @@ proc pollEvents(window: Window) =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -270,7 +298,7 @@ index 5b29e3c..496ea53 100644
  
    template pushButtonEvent(
      button: Button,
-@@ -909,25 +1033,35 @@ proc pollEvents(window: Window) =
+@@ -909,25 +1041,35 @@ proc pollEvents(window: Window) =
          window.xdndSource = cast[XWindow](ev.client.data.l[0])
          window.xdndVersion = (ev.client.data.l[1] shr 24).int32
          window.xdndFormat = 0
@@ -313,7 +341,7 @@ index 5b29e3c..496ea53 100644
              window.xdndFormat = fmt
              break
  
-@@ -941,6 +1075,13 @@ proc pollEvents(window: Window) =
+@@ -941,6 +1083,13 @@ proc pollEvents(window: Window) =
          if window.xdndVersion > 5:
            continue
  
@@ -327,7 +355,7 @@ index 5b29e3c..496ea53 100644
          # Send status back to source.
          let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
          let action: clong = if window.xdndVersion >= 2 and window.xdndFormat != 0: cast[clong](xaXdndActionCopy) else: 0
-@@ -993,13 +1134,13 @@ proc pollEvents(window: Window) =
+@@ -993,13 +1142,13 @@ proc pollEvents(window: Window) =
        if window.ic != nil:
          XSetICFocus window.ic
  
@@ -346,7 +374,7 @@ index 5b29e3c..496ea53 100644
  
        if window.onFocusChange != nil:
          window.onFocusChange()
-@@ -1055,10 +1196,13 @@ proc pollEvents(window: Window) =
+@@ -1055,10 +1204,13 @@ proc pollEvents(window: Window) =
  
      of xeButtonPress, xeButtonRelease:
  
@@ -363,7 +391,7 @@ index 5b29e3c..496ea53 100644
  
        let
          now = getTime()
-@@ -1097,10 +1241,13 @@ proc pollEvents(window: Window) =
+@@ -1097,10 +1249,13 @@ proc pollEvents(window: Window) =
          window.clickSeqLen = 0
  
      of xeKeyPress, xeKeyRelease:
@@ -378,7 +406,7 @@ index 5b29e3c..496ea53 100644
          inc i
        if key != ButtonUnknown:
          pushButtonEvent(key, ev.kind == xeKeyPress)
-@@ -1122,36 +1269,39 @@ proc pollEvents(window: Window) =
+@@ -1122,36 +1277,39 @@ proc pollEvents(window: Window) =
  
      of xeSelection:
        # Handle XDnD selection data.
@@ -443,7 +471,7 @@ index 5b29e3c..496ea53 100644
  
      else:
        discard
-@@ -1224,8 +1374,8 @@ proc processClipboardEvents: bool =
+@@ -1224,8 +1382,8 @@ proc processClipboardEvents: bool =
      d: Display,
      event: ptr XEvent,
      userData: pointer
@@ -454,7 +482,7 @@ index 5b29e3c..496ea53 100644
  
    while display.XCheckIfEvent(
      ev.addr, checkEvent, cast[pointer](clipboardWindow)
-@@ -1234,8 +1384,13 @@ proc processClipboardEvents: bool =
+@@ -1234,8 +1392,13 @@ proc processClipboardEvents: bool =
      of xeSelection:
        template e: untyped = ev.selection
  
@@ -469,7 +497,7 @@ index 5b29e3c..496ea53 100644
  
        clipboardContent = clipboardWindow.property(
          xaWindyClipboardTargetProperty
-@@ -1296,7 +1451,13 @@ proc getClipboardString*: string =
+@@ -1296,7 +1459,13 @@ proc getClipboardString*: string =
      clipboardWindow
    )
  
@@ -484,7 +512,7 @@ index 5b29e3c..496ea53 100644
    result = clipboardContent
    clipboardContent = ""
  
-@@ -1348,8 +1509,12 @@ proc `icon=`*(window: Window, icon: Image) =
+@@ -1348,8 +1517,12 @@ proc `icon=`*(window: Window, icon: Image) =
    var data: seq[uint64]
    data.add icon.width.uint64
    data.add icon.height.uint64
@@ -499,7 +527,7 @@ index 5b29e3c..496ea53 100644
  
    display.XChangeProperty(
      window.handle,
-@@ -1455,3 +1620,4 @@ proc saveFileDialog*(
+@@ -1455,3 +1628,4 @@ proc saveFileDialog*(
      args.add("--file-filter=" & filter.name & " | " &
        filter.extensions.replace(";", " ").replace(",", " "))
    result = runZenity(args)
@@ -532,10 +560,28 @@ index c84b559..b267d9b 100644
  
  proc XGetInputFocus*(d: Display, window: ptr Window; revertTo: ptr RevertTo)
 diff --git a/src/windy/platforms/win32/platform.nim b/src/windy/platforms/win32/platform.nim
-index e790375..2124a33 100644
+index e790375..232b7f7 100644
 --- a/src/windy/platforms/win32/platform.nim
 +++ b/src/windy/platforms/win32/platform.nim
-@@ -1044,7 +1044,9 @@ proc wndProc(
+@@ -1038,13 +1038,26 @@ proc wndProc(
+     else:
+       let
+         scancode = (HIWORD(lParam) and (KF_EXTENDED or 0xff))
+-        button = scancodeToButton[scancode]
++        # Media keys by their virtual key: keyboards that send them as HID
++        # consumer keys give no scancode.
++        button =
++          case wParam
++          of 0xB3: KeyMediaPlayPause  # VK_MEDIA_PLAY_PAUSE
++          of 0xB2: KeyMediaStop       # VK_MEDIA_STOP
++          of 0xB1: KeyMediaPrevious   # VK_MEDIA_PREV_TRACK
++          of 0xB0: KeyMediaNext       # VK_MEDIA_NEXT_TRACK
++          of 0xAD: KeyVolumeMute      # VK_VOLUME_MUTE
++          of 0xAE: KeyVolumeDown      # VK_VOLUME_DOWN
++          of 0xAF: KeyVolumeUp        # VK_VOLUME_UP
++          else: scancodeToButton[scancode]
+       if button != ButtonUnknown:
+         if (HIWORD(lParam) and KF_UP) == 0:
            window.handleButtonPress(button)
          else:
            window.handleButtonRelease(button)

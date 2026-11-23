@@ -100,6 +100,10 @@ type
     playlistGroups*: bool = false          # a header over each run of entries whose playlistGroupPattern reads the same
     playlistGroupPattern*: string = DefaultGroupPattern  # foobar2000 title formatting (folderpics.formatTitle)
     showRunLog*: bool = false
+    showSubEditor*: bool = false
+    subEditorHeight*: float = 300  # pixels, changed by dragging its bottom edge
+    subFindCase*: bool = false     # the subtitle editor's search matches case
+    subEditorSeek*: bool = true    # selecting a line in the subtitle editor seeks the video there
     seededPresets*: seq[string]    # preset command lines already offered once
     runLogHeight*: float = 200     # pixels, changed by dragging its bottom edge
     libraries*: seq[Library]       # Options > Libraries, in its order
@@ -172,6 +176,7 @@ type
     ytdlp*: string = ""            # "" = found automatically (ytdlp.findYtdlp)
     # Options > Player > Keys
     keys*: Table[string, string]   # command id -> "Home|0" ("" = none); only changed keys
+    globalKeys*: seq[string]       # command ids whose keys work while other programs have the keyboard
     # Options > Playback
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
@@ -428,10 +433,13 @@ proc loadConfig*(): Config =
       result.avsStarRatings[id] = clamp(int(round(fifths * 4 / 5)), 1, 20)
   result.avsRatings.clear()
 
-proc readKeys(keys: var Table[string, string]): bool =
-  ## The file's keys; false, leaving keys as they are, when it can't be read.
+proc readKeys(keys: var Table[string, string], global: var seq[string]): bool =
+  ## The file's keys and which are global; false, leaving them as they are,
+  ## when it can't be read.
   try:
-    keys = readFile(configPath()).fromJson(Config).keys
+    let file = readFile(configPath()).fromJson(Config)
+    keys = file.keys
+    global = file.globalKeys
     dropOldKeys(keys)
     true
   except CatchableError:
@@ -443,7 +451,7 @@ proc save*(c: Config, ownKeys = false) =
   ## the old keys mustn't undo that.
   let path = configPath()
   var c = c
-  if not ownKeys: discard readKeys(c.keys)
+  if not ownKeys: discard readKeys(c.keys, c.globalKeys)
   try:
     createDir(path.parentDir)
     writeAtomic(path, c.toJson)
@@ -457,7 +465,7 @@ proc reloadKeys*(c: var Config) =
   let t = try: getLastModificationTime(configPath()) except OSError: Time()
   if t != keysStamp:
     keysStamp = t
-    discard readKeys(c.keys)
+    discard readKeys(c.keys, c.globalKeys)
 
 # --- Open Recent, shared by every running player -----------------------------
 # Kept apart from the config, which each player saves whole (the last one to

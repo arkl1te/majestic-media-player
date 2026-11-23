@@ -3,6 +3,7 @@
 ## file when there's neither kdialog nor zenity (dialogs_unix). A request
 ## returns an object path at once; the answer comes later as a Response
 ## signal on it, polled once per frame, so the window keeps drawing meanwhile.
+## Global keys (globalkeys) come the same way, as GlobalShortcuts signals.
 ## libdbus is loaded at run time: without it, a session bus or the portal,
 ## requests simply fail.
 
@@ -34,6 +35,8 @@ when not defined(windows):
     TimeoutMs = 5000.cint
     Dest = "org.freedesktop.portal.Desktop"
     Request = "org.freedesktop.portal.Request"
+    Shortcuts = "org.freedesktop.portal.GlobalShortcuts"
+    AppId = "majestic-media-player"  ## the .desktop file's name
 
   var
     lib: LibHandle
@@ -63,6 +66,7 @@ when not defined(windows):
     conn: Conn
     failed: bool       ## no libdbus or no session bus; don't retry
     pending: seq[Msg]  ## Responses popped while polling for another request
+    signals: seq[Msg]  ## GlobalShortcuts signals not taken yet
 
   proc loadDbus(): bool =
     if lib != nil: return true
@@ -116,12 +120,31 @@ when not defined(windows):
       failed = true
       return false
     setExitOnDisconnect(conn, 0)
+    # First of all, as it only counts before any other call: who's asking,
+    # for a player not started by the launcher (whose app id the portal
+    # reads from the process). The desktop names the app by it, and keeps
+    # its global keys under it. Older portals have no registry.
+    let reg = newMethodCall(Dest, "/org/freedesktop/portal/desktop",
+      "org.freedesktop.host.portal.Registry", "Register")
+    if reg != nil:
+      var it, opts: Iter
+      iterInitAppend(reg, addr it)
+      var id = cstring(AppId)
+      discard iterAppendBasic(addr it, TypeString, addr id)
+      discard iterOpen(addr it, TypeArray, "{sv}", addr opts)
+      discard iterClose(addr it, addr opts)
+      let reply = sendBlocking(conn, reg, TimeoutMs, addr err)
+      unref(reg)
+      if reply != nil: unref(reply)
+      else: errorFree(addr err)
     # Before any call: the answer may come before the call returns its path.
-    addMatch(conn, "type='signal',sender='" & Dest & "',interface='" & Request &
-      "',member='Response'", addr err)
-    if err.name != nil:
-      stderr.writeLine "portal: ", err.message
-      errorFree(addr err)
+    for (iface, member) in [(Request, "Response"), (Shortcuts, "Activated"),
+                            (Shortcuts, "ShortcutsChanged")]:
+      addMatch(conn, cstring("type='signal',sender='" & Dest & "',interface='" & iface &
+        "',member='" & member & "'"), addr err)
+      if err.name != nil:
+        stderr.writeLine "portal: ", err.message
+        errorFree(addr err)
     true
 
   proc request*(iface, meth: string, args: proc (it: ptr Iter)): string =
@@ -152,16 +175,50 @@ when not defined(windows):
     result = $path
     unref(reply)
 
-  proc pollResponse*(handle: string): Msg =
-    ## The Response(u response, a{sv} results) to the request at `handle`
-    ## once it came, else nil; the caller unrefs it.
-    if handle.len == 0 or conn == nil: return nil
+  proc pump() =
     discard readWrite(conn, 0)
     while true:
       let m = popMessage(conn)
       if m == nil: break
       if isSignal(m, Request, "Response") != 0: pending.add m
+      elif isSignal(m, Shortcuts, "Activated") != 0 or
+           isSignal(m, Shortcuts, "ShortcutsChanged") != 0: signals.add m
       else: unref(m)
+
+  proc call*(path, iface, meth: string, args: proc (it: ptr Iter)): bool =
+    ## A method with no answer to wait for (Session.Close, say); false when
+    ## the desktop refused it.
+    if not connect(): return false
+    let msg = newMethodCall(Dest, cstring(path), cstring(iface), cstring(meth))
+    if msg == nil: return false
+    var it: Iter
+    iterInitAppend(msg, addr it)
+    args(addr it)
+    var err: DBusError
+    errorInit(addr err)
+    let reply = sendBlocking(conn, msg, TimeoutMs, addr err)
+    unref(msg)
+    if reply == nil:
+      stderr.writeLine "portal: ", iface, ".", meth, ": ", err.message
+      errorFree(addr err)
+      return false
+    unref(reply)
+    true
+
+  proc takeSignals*(): seq[Msg] =
+    ## The GlobalShortcuts signals (Activated, ShortcutsChanged) since the
+    ## last call; the caller unrefs them.
+    if conn == nil: return
+    pump()
+    result = move signals
+
+  proc isMember*(m: Msg, member: string): bool = isSignal(m, Shortcuts, cstring(member)) != 0
+
+  proc pollResponse*(handle: string): Msg =
+    ## The Response(u response, a{sv} results) to the request at `handle`
+    ## once it came, else nil; the caller unrefs it.
+    if handle.len == 0 or conn == nil: return nil
+    pump()
     for i, m in pending:
       if $getPath(m) == handle:
         pending.delete(i)
@@ -170,6 +227,17 @@ when not defined(windows):
   proc appendString*(it: ptr Iter, s: string) =
     var c = cstring(s)
     discard iterAppendBasic(it, TypeString, addr c)
+
+  proc appendPath*(it: ptr Iter, s: string) =
+    var c = cstring(s)
+    discard iterAppendBasic(it, TypeObjectPath, addr c)
+
+  proc getString*(it: ptr Iter): string =
+    ## A string or object path at it, "" for anything else.
+    if iterArgType(it) in [TypeString, TypeObjectPath]:
+      var c: cstring
+      iterGetBasic(it, addr c)
+      result = $c
 
   template dictEntry*(opts: ptr Iter, key, sig: string, body: untyped) =
     ## An a{sv} entry: `body` appends the value through `value` (a ptr Iter).

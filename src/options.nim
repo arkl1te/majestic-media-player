@@ -2,9 +2,10 @@
 ## tree view) and the selected page on the right. Edits apply to the config
 ## live; the caller snapshots it beforehand so Cancel can undo them.
 
-import std/[os, strutils, sequtils, strformat, math, tables, times]
+import std/[os, strutils, sequtils, strformat, math, tables, times, algorithm]
 import silky, vmath, bumpy, chroma, pixie
 import ui, theme, config, assoc, keymap, websave, mediainfo, screenpick, fontlist, gpumem, library
+import globalkeys
 
 type
   OptionsPage* = enum
@@ -34,7 +35,7 @@ type
     ## Paths page buttons the caller carries out (file dialogs, file manager).
     prNone, prBrowseScreenshots, prBrowseOpen, prShowSettings,
     prBrowseWeb, prOpenWebDir, prClearWeb, prDeleteWeb, prBrowseMkvpropedit, prBrowseYtdlp,
-    prBrowseSoundFont,
+    prBrowseSoundFont, prDesktopKeys,
     prLibAddFolder, prLibAddFiles, prLibChange, prLibCustom, prLibContext, prWebContext
 
   ItemMove* = enum
@@ -74,6 +75,7 @@ type
     capSlot: int                ## which of its keys that replaces; -1 adds one
     keyTaken: bool              ## a key went to the capture this frame
     keyNote: string             ## Keys page: outcome of the last change
+    noteFor: KeyAction          ## the command keyNote is about; shown while it's selected
     keyReveal: bool             ## scroll the selected command into view
     web*: WebInfo               ## Media Cache page; the caller refreshes it
     webPicked*: seq[string]     ## Media Cache page: links checked in the list
@@ -108,6 +110,9 @@ type
     libReveal: bool             ## scroll the selected folder or file into view
     ctxPos*: Vec2               ## where a context menu was asked for (prLibContext, prWebContext)
     pathInfo*: proc (path: string): PathInfo  ## set by the caller
+    globalInfo*: proc (act: KeyAction, k: KeyCombo): tuple[known: bool,
+      state: GlobalKeyState, trigger: string]  ## how a global key fares; set by the caller
+    canConfigureGlobal*: bool   ## the desktop can show its settings for global keys
     findScroll: float32         ## the search results' scroll
 
   Pane = object
@@ -719,6 +724,7 @@ proc assignKeys*(d: OptionsDialog, c: var Config, act: KeyAction, ks: seq[KeyCom
   ## Gives act the keys ks. A key another command has stays there too: OK
   ## waits for one of them to give it up.
   c.setCombos(act, ks)
+  d.noteFor = act
   d.keyNote =
     if ks.len == 0: Actions[act].label & ": no key"
     else: Actions[act].label & ": " & c.keysText(act)
@@ -729,6 +735,52 @@ proc addKey(d: OptionsDialog, c: var Config, act: KeyAction, k: KeyCombo, slot =
   if slot in 0 .. ks.high: ks[slot] = k
   else: ks.add k
   d.assignKeys(c, act, ks.deduplicate)
+
+proc sameKeys(desktop: string, k: KeyCombo): bool =
+  ## The desktop's name for a key (Qt's "Ctrl+Num+5" on KDE) is k's, in any
+  ## order of the modifiers.
+  proc parts(s: string): seq[string] =
+    result = s.toLowerAscii.replace("numpad ", "num+").replace(" ", "").split('+')
+    result.sort()
+  parts(desktop) == parts($k)
+
+proc globalStatus(d: OptionsDialog, c: Config, act: KeyAction): tuple[warn: bool, text: string] =
+  ## How a global command's keys fare, for the note and the tip; the one
+  ## doing worst speaks for them all.
+  if not c.isGlobal(act): return
+  let keys = c.combos(act)
+  if keys.len == 0: return (false, "Global once it has a key.")
+  var rank = -1
+  for k in keys:
+    let info = if d.globalInfo != nil: d.globalInfo(act, k) else: (false, gkWaiting, "")
+    let (r, warn, text) =
+      if not info.known:
+        (1, false, "Global from OK on: works while other programs have the keyboard.")
+      else:
+        case info.state
+        of gkActive:
+          if info.trigger.len > 0 and not sameKeys(info.trigger, k):
+            (2, false, "Global: the desktop gave " & $k & " the key " & info.trigger & " instead.")
+          else: (0, false, "Global: works while other programs have the keyboard.")
+        of gkWaiting: (3, false, "Global: waiting for the desktop to confirm " & $k & ".")
+        of gkOtherPlayer: (4, false, "Global: another running player has the global keys.")
+        of gkUnsupported: (5, true, "Global: " & $k & " can't be global on this desktop.")
+        of gkTaken: (6, true, "Global: another program has " & $k & ".")
+        of gkDeclined:
+          (6, true, "Global: the desktop gave " & $k & " no key" &
+            (if d.canConfigureGlobal: "; Desktop keys... sets one." else: "."))
+    if r > rank:
+      rank = r
+      result = (warn, text)
+
+proc toggleGlobal(d: OptionsDialog, c: var Config, act: KeyAction) =
+  c.setGlobal(act, not c.isGlobal(act))
+  d.keySel = act
+  d.noteFor = act
+  d.keyNote =
+    if not c.isGlobal(act): Actions[act].label & ": no longer global"
+    elif c.combos(act).len == 0: Actions[act].label & ": global once it has a key"
+    else: Actions[act].label & ": global from OK on"
 
 proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
   ## Keys while searching: the matching commands under their groups; a click
@@ -789,6 +841,7 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   ui.border(list, colBorder)
   const rowH = 24'f32
   const keyW = 220'f32
+  const globalW = 48'f32        # the Global column, left of the keys
   let inner = rect(list.x + 1, list.y + 1, list.w - 2, list.h - 2)
   let maxScroll = max(0'f32, rows.len.float32 * rowH - inner.h)
   let listFocused = ui.tabStop("o-keys-list", list)
@@ -826,6 +879,8 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
         d.startCapture(ui, d.keySel)
       elif w.buttonPressed[KeyDelete] or w.buttonPressed[KeyBackspace]:
         d.assignKeys(c, d.keySel, @[])
+      elif w.buttonPressed[KeyG] and w.heldMods == {}:
+        d.toggleGlobal(c, d.keySel)
   if ui.hover(inner) and ui.scroll() != 0:
     d.keyScroll += ui.scroll() * rowH / 3
     ui.scrollConsumed = true
@@ -837,8 +892,11 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   for i, row in rows:
     let r = rect(inner.x, inner.y + i.float32 * rowH - d.keyScroll, inner.w, rowH)
     if r.y + rowH < inner.y or r.y > inner.y + inner.h: continue
+    let gr = rect(r.x + r.w - keyW - 6 - globalW, r.y, globalW, rowH)
     if row.header:
       ui.textIn($row.group, rect(r.x + 8, r.y, r.w - 16, rowH), colAccent, FontSmall)
+      ui.textIn("Global", gr, colTextDim, FontSmall, h = CenterAlign)
+      if ui.hover(gr): ui.tip(gr, "Global keys work while other programs have the keyboard")
       ui.rect(rect(r.x + 8, r.y + rowH - 3, r.w - 16, 1), colBorder)
       continue
     let act = row.act
@@ -852,8 +910,25 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
     elif hov: ui.rect(r, colHover)
     let fg = if clash: colWarning elif accent: colOnAccent else: colText
     let changed = not c.isDefault(act)
-    ui.textIn(ui.ellipsize(Actions[act].label, r.w - keyW - 40),
-      rect(r.x + 20, r.y, r.w - keyW - 28, rowH), fg)
+    ui.textIn(ui.ellipsize(Actions[act].label, r.w - keyW - 40 - globalW),
+      rect(r.x + 20, r.y, r.w - keyW - 28 - globalW, rowH), fg)
+    # Global: a box to tick, yellow when the desktop or another program
+    # stands in its way.
+    let global = c.isGlobal(act)
+    let (gwarn, gtext) = d.globalStatus(c, act)
+    let gbox = rect(gr.x + (globalW - 16) / 2, r.y + (rowH - 16) / 2, 16, 16)
+    let ghov = ui.hover(gr)
+    ui.rect(gbox,
+      if global and gwarn: colWarning
+      elif global: (if accent: colOnAccent else: colAccent)
+      else: colPanelRaised)
+    ui.border(gbox, if ghov: (if accent: colOnAccent else: colAccent) else: colBorder)
+    if global:
+      ui.icon("check16", gbox.xy + gbox.wh / 2,
+        if accent and not gwarn: colAccent else: colOnAccent)
+    if ghov:
+      ui.tip(gr, if global: gtext & " Click (or G) to make it work only here."
+                 else: "Click (or G) to make it global: working while other programs have the keyboard.")
     let kr = rect(r.x + r.w - keyW - 6, r.y + 2, keyW, rowH - 4)
     let keys = c.combos(act)
     var picked = -1             # the key under the pointer
@@ -889,10 +964,12 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
       ui.focusId = ""
       # Clicking a key changes it; clicking beside it or double-clicking the
       # row adds one.
-      if ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act, picked)
+      if ghov: d.toggleGlobal(c, act)
+      elif ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act, picked)
       else: d.keySel = act
     elif picked >= 0 and w.buttonPressed[MouseRight] and not wasCapturing:
       d.keySel = act
+      d.noteFor = act
       c.removeCombo(act, keys[picked])
       d.keyNote = Actions[act].label & ": " & $keys[picked] & " removed"
   if rows.len == 0:
@@ -911,22 +988,33 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   if ui.button("o-keyreset", "Default", at(2), has and not c.isDefault(d.keySel)):
     d.assignKeys(c, d.keySel, d.keySel.defaults)
   let allR = rect(p.x + p.w - 150, p.y, 150, 28)
+  # The desktop's own settings for the global keys, where one it gave no key
+  # gets one (KDE asks only once).
+  let deskR = rect(at(3).x, by, 130, 28)
+  if d.canConfigureGlobal and c.globalKeys.len > 0 and deskR.x + deskR.w + 8 <= allR.x:
+    if ui.textButton("o-keydesk", deskR, "Desktop keys..."):
+      d.request = prDesktopKeys
+    if ui.hover(deskR): ui.tip(deskR, "The desktop's settings for the global keys")
   if c.keys.len > 0:
     if ui.textButton("o-keyresetall", allR, "Reset all keys"):
       c.keys.clear()
+      d.noteFor = d.keySel
       d.keyNote = "All keys are back to their defaults."
   else:
     ui.rect(allR, colPanelRaised)
     ui.border(allR, colBorder)
     ui.textIn("Reset all keys", allR, colTextDisabled, h = CenterAlign)
   p.y += 34
+  let (gwarn, gtext) = if has: d.globalStatus(c, d.keySel) else: (false, "")
   let note =
     if d.capturing: "Press a key for \"" & Actions[d.keySel].label & "\"; Esc cancels."
     elif clashes.card > 0: "The yellow commands share a key: change one of them to save."
-    elif d.keyNote.len > 0: d.keyNote
+    elif d.keyNote.len > 0 and d.noteFor == d.keySel: d.keyNote
+    elif gtext.len > 0: gtext
     else: "Click a key to change it, right-click to remove it. Add... gives a command another key."
+  let warn = not d.capturing and (clashes.card > 0 or (note == gtext and gwarn))
   ui.textIn(ui.ellipsize(note, p.w - 8, FontSmall), rect(p.x + 8, p.y, p.w - 8, 18),
-    if d.capturing: colAccent elif clashes.card > 0: colWarning else: colTextDim, FontSmall)
+    if d.capturing: colAccent elif warn: colWarning else: colTextDim, FontSmall)
   p.y += 18
 
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =

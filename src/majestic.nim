@@ -8,7 +8,8 @@ import appimage, mpv, videogl, xwin, config, dialogs, theme, ui, menutree, playe
   options, instance, playlists, peers, cmdlines, runlog, mediainfo, inhibit, spherical, keymap, mediactl,
   rectedit, syncdlg, ytdlp, websave, mediasave, mkvtoolnix, updater, ytthumb, ytboard, srv3,
   netprobe, tracker, trackerchart, modstream, midisong, midistream, midichart, rgscan, tagdlg, avsdlg,
-  avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog, waveform
+  avsview, plmanager, cue, animpic, library, libtypes, glyphcache, crashlog, waveform, subdoc,
+  globalkeys
 from coverart import pictures
 from assoc import loadAssocItems, updateRegistration
 import wsaud, m2c
@@ -83,6 +84,12 @@ const
   RunLogGripH = 5'f32       ## draggable bottom edge of the run log
   RunLogBarW = 10'f32       ## its scroll bar
   RunLogWheelRows = 4       ## lines scrolled per mouse wheel step
+  SeHeaderH = 28'f32        ## the subtitle editor's header,
+  SeFindH = 30'f32          ## search bar,
+  SeGridHeaderH = 22'f32    ## grid's column names,
+  SeRowH = 22'f32           ## and rows (room for a cell being typed in)
+  SeBreak = "¶"             ## a line break in a text cell (Shift+Enter types it)
+  SeGripH = 5'f32           ## its draggable bottom edge
   PlaylistWheelRows = 2     ## playlist entries scrolled per mouse wheel step
   PlaylistFollowPage = 0.6'f32  ## of the list's height, when playback reaches its bottom
   PlaylistBarW = 14'f32     ## the playlist's scroll bar gutter
@@ -145,7 +152,7 @@ type
     id: string                ## Change Visualizer's list: the preset (two may share a name)
 
   ContextMenu = enum
-    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistTab, cmPlaylistColumns, cmRepeat, cmPlay, cmStop, cmPause, cmRunLog, cmQuality, cmReplayGain, cmLibrary  ## where the right-click menu was opened
+    cmVideo, cmVideoShift, cmTime, cmStatus, cmSeekBar, cmPlaylist, cmPlaylistTab, cmPlaylistColumns, cmRepeat, cmPlay, cmStop, cmPause, cmRunLog, cmQuality, cmReplayGain, cmLibrary, cmSubEditor  ## where the right-click menu was opened
 
   AfterCurrent = enum
     acOff, acStop, acPause  ## the Stop and Pause buttons' "... after current": one at a time
@@ -261,6 +268,11 @@ type
     folder: bool              ## the next file in the folder (Play > After playback)
     tab, i: int               ## else that playlist's (id) entry
     start: float              ## where it starts (Remember position)
+
+  SeSnap = object
+    ## The subtitle editor's lines and selection, for undo.
+    lines: seq[SubLine]
+    sel: int
 
   App = ref object
     window: Window
@@ -442,6 +454,13 @@ type
     plFocused: bool           ## the playlist was clicked last: it takes its keys
     plArrows: bool            ## clicked and the pointer has not left it since: Up/Down select
     plSideKeys: bool          ## the playlists' side column was clicked or reached with Tab: Up/Down show a playlist
+    typeText: string          ## typed into the playlist or the library to jump to a name (typeAhead), lowercase
+    typeAt: float             ## when it was last typed into
+    typeStop: int             ## the PanelStop it was typed into
+    plSelRect: Rect           ## the selected entry's row as last drawn, empty when out of view
+    libCursorRect: Rect       ## the Library's cursor row (libCursor) as last drawn, the same
+    libPickedRect: Rect       ## the library or folder picked in its column as last drawn, the same
+    seSelRect: Rect           ## the subtitle editor's selected line as last drawn, the same
     plFindOpen: bool          ## the playlist's search bar is shown (Ctrl+F)
     plFind: string            ## its text
     plFindHits: seq[int]      ## the entries matching it, as of the last frame
@@ -673,6 +692,38 @@ type
     rlThumbFrom: (float32, float32)      ## pointer y and scroll when the thumb drag began
     rlRows: seq[string]       ## the run log's rows as last drawn, for copying
     rlSelFrom, rlSelTo: (int, int)       ## selected text: (row, byte offset) where the drag began and where it is
+    seDoc: SubDoc             ## the subtitle editor's subtitles
+    seName: string            ## their name as shown: the file's, or the track's
+    sePath: string            ## the file Save writes, "" until Save As gives one
+    seKey: string             ## the track they were read from (seTrackKey), "" for none
+    seMedia: string           ## the media file open then
+    seDirty: bool             ## changed since read or saved
+    seNote: string            ## why there's nothing to edit (picture subtitles...), or that they're being read
+    seSel: int = -1           ## the line selected: the one the edit box edits
+    seScroll: float32
+    seReveal: bool            ## scroll the selected line into view
+    seFocused: bool           ## clicked last: it takes its keys (arrows, Delete...)
+    seRows: Rect              ## the grid's rows, as last drawn
+    seUndo, seRedo: seq[SeSnap]
+    seUndoKey: string         ## the field typed in (and its line) since the last undo step
+    seEditLine: int = -1      ## the line whose cell is being typed in, -1 for none
+    seEditCol: string         ## that cell's column (Start, End, Duration, Style, Actor, Text)
+    seEditBuf: string         ## what's typed in it
+    seEditOrig: SubLine       ## the line before, for Escape
+    seEditSnapped: bool       ## the typing made an undo step
+    seEditWasDirty: bool      ## there were unsaved changes before
+    seEditKey: string         ## a key that ends the typing (esc, tab, backtab, up, down)
+    seFind, seReplace: string ## the search bar's fields
+    seFindKeep: bool          ## Enter stepped to a match: the field keeps the keyboard
+    sePreview: string         ## the working copy mpv shows the edits from
+    sePreviewId: int          ## its track, 0 for none
+    sePreviewDue: float       ## when to write it again (0: up to date)
+    seExtract: Process        ## ffmpeg copying an embedded track out
+    seExtractOut: string      ## to this file
+    seExtractFmt: SubFormat   ## in this format
+    seResizeFrom: (float32, float32)  ## pointer y and height when the drag began
+    seThumbFrom: (float32, float32)   ## pointer y and scroll when the thumb drag began
+    seQuitOk: bool            ## closing without saving them was confirmed
     pickDlg: PickDialog       ## Run window: timestamps and values for a run
     extRun: CommandLine       ## the command line whose external files are asked for
     extQueue: seq[string]     ## its external-file cards still to ask about
@@ -995,6 +1046,8 @@ type
     screenInhibit: Inhibitor  # keeps the display on while video plays
     media: MediaControls      # the task bar's play/pause, previous and next
     mediaPollAt, mediaStateAt: float  # when to look at each next, see syncMediaControls
+    globalKeys: GlobalKeys    # commands' keys that work while other programs have the keyboard
+    heldKeys: (Table[string, string], seq[string])  # cfg.keys and cfg.globalKeys as globalKeys holds them
     title: string
     hintsKey: string
     fitPending: bool
@@ -1277,6 +1330,9 @@ proc ownResize(a: App, size: IVec2) =
 proc runLogHeight(a: App): float32 =
   max(RunLogMinHeight, round(a.cfg.runLogHeight).float32)
 
+proc subEditorHeight(a: App): float32 =
+  max(SubEditorMinHeight, round(a.cfg.subEditorHeight).float32)
+
 proc px(a: App, v: IVec2): IVec2 =
   ## UI units to window pixels (Options > Player > UI scaling).
   let s = a.sk.uiScale
@@ -1371,7 +1427,8 @@ proc chromeSize(a: App): IVec2 =
   ## Window space not used by the video frame (windowed mode), in pixels.
   let menuH = if a.cfg.compactMode: 0'f32 else: MenuBarHeight
   a.px(ivec2(int32(if a.sideShown: a.playlistWidth else: 0),
-        int32(menuH + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))))
+        int32(menuH + a.bottomHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0) +
+          (if a.cfg.showSubEditor: a.subEditorHeight else: 0))))
 
 proc naturalSize(a: App): Vec2 =
   var w = a.player.videoW.float32
@@ -3470,6 +3527,25 @@ proc runMediaCommand(a: App, c: MediaCommand) =
   of mcRaise: a.window.activate()
   of mcQuit: a.window.closeRequested = true
 
+proc runAction(a: App, act: KeyAction)  # below
+
+proc syncGlobalKeys(a: App) =
+  ## Every iteration: the global keys pressed, run like the window's own.
+  ## Options' live edits wait for OK, so the desktop doesn't ask about each
+  ## tick (KDE asks to confirm every new global key).
+  let g = a.globalKeys
+  if a.overlay != ovOptions and (a.cfg.keys, a.cfg.globalKeys) != a.heldKeys:
+    a.heldKeys = (a.cfg.keys, a.cfg.globalKeys)
+    g.setKeys(a.cfg.wantedKeys)
+  for id in g.poll():
+    let (ok, act) = actionOf(id)
+    if ok:
+      a.runAction(act)
+      a.dirtyUntil = max(a.dirtyUntil, now() + 0.3)
+  let report = g.takeReport()
+  if report.len > 0: a.osd(report, 4)
+  a.optionsDlg.canConfigureGlobal = g.canConfigure
+
 proc syncMediaControls(a: App) =
   ## Every iteration; acts a few dozen times a second at most, as the bus
   ## needn't hear of every frame. A command shows on the bus at the next update.
@@ -3674,9 +3750,25 @@ proc panelStop(a: App): PanelStop =
   elif a.libArrows: psFiles
   else: psNone
 
+proc typingStop(a: App): PanelStop =
+  ## The list or column typing jumps in (typeAhead): the one holding the
+  ## arrows, else the playlist's entries or the Library's files when that
+  ## panel was clicked last; psNone while neither panel (shown) has the
+  ## keyboard, the keys then running their commands.
+  let pl = a.cfg.showPlaylist and not a.playlistLocked
+  case a.panelStop
+  of psPlaylists: (if pl and a.managerShown: psPlaylists else: psNone)
+  of psEntries: (if pl: psEntries else: psNone)
+  of psLibraries, psFiles: (if a.cfg.showLibrary: a.panelStop else: psNone)
+  of psNone:
+    if a.plFocused and pl: psEntries
+    elif a.libFocused and a.cfg.showLibrary: psFiles
+    else: psNone
+
 proc focusPanel(a: App, stop: PanelStop) =
   ## Gives that place the keyboard (psNone: none of them): its arrows, Enter
   ## and Ctrl keys, until Escape or a click elsewhere.
+  a.typeText = ""
   a.plFocused = stop in {psPlaylists, psEntries}
   a.plSideKeys = stop == psPlaylists
   a.plArrows = stop == psEntries
@@ -7923,6 +8015,9 @@ proc pickOpen(a: App): bool =
   ## offers follow the seek bar as the player is used.
   a.pickWin != nil and a.pickWin.visible
 
+proc seOpenFile(a: App, path: string)
+proc seSaveTo(a: App, path: string): bool
+
 proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
   if paths.len == 0: return
   case purpose
@@ -7976,6 +8071,12 @@ proc handleDialogResult(a: App, purpose: string, paths: seq[string]) =
       else: a.cfg.openDir = paths[0]
   of "subtitle":
     if a.player.loaded: a.player.h.command("sub-add", paths[0], "select")
+  of "subopen":  # the subtitle editor's Open...
+    a.seOpenFile(paths[0])
+  of "subsave":  # its Save As...
+    var p = paths[0]
+    if p.splitFile.ext.len == 0: p.add "." & $a.seDoc.format
+    discard a.seSaveTo(p)
   of "audio":
     if a.player.loaded: a.player.h.command("audio-add", paths[0], "select")
   of "screenshot":
@@ -8118,7 +8219,8 @@ proc closeOptions(a: App, ok: bool) =
   if a.typesWin != nil and a.typesWin.visible: a.closeTypes(false)
   if a.optMenus != nil: a.optMenus.close()
   if ok:
-    a.cfg.save(ownKeys = a.cfg.keys != a.cfgBefore.keys)
+    a.cfg.save(ownKeys = a.cfg.keys != a.cfgBefore.keys or
+      a.cfg.globalKeys != a.cfgBefore.globalKeys)
     a.rendererChanged(a.cfgBefore.renderMode)
     # Another folder for links: its own index, the current one left as is.
     let dir = a.cfg.webDir.expandPath
@@ -8189,6 +8291,11 @@ proc ensureOptionsWindow(a: App) =
   a.optionsDlg.pathInfo = proc (path: string): PathInfo =
     let r = a.library.roots.getOrDefault(path.normPath)
     (r.state, r.isFile)
+  a.optionsDlg.globalInfo = proc (act: KeyAction, k: KeyCombo): tuple[known: bool,
+      state: GlobalKeyState, trigger: string] =
+    # Only as held: a key changed in Options is "from OK on".
+    if a.heldKeys[1].contains($act): a.globalKeys.state(globalId(act, k))
+    else: (false, gkWaiting, "")
 
 proc showDialog(a: App, w: Window, size: IVec2, minSize = ivec2(0, 0)) =
   ## Centres a dialog's frame on the main window's frame (both have the
@@ -8758,6 +8865,538 @@ proc setRunLogShown(a: App, shown: bool) =
   if shown: a.rlFollow = true
   let h = int32(a.runLogHeight)
   a.resizeKeepingVideo(ivec2(0, if shown: h else: -h))
+
+# --- subtitle editor: the document ------------------------------------------
+
+const
+  SeImageCodecs = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub",
+                   "dvb_teletext", "arib_caption", "pgssub", "dvdsub", "vobsub"]
+  SeTextExtensions = ["srt", "ass", "ssa", "vtt"]  ## what it reads and writes
+  SeUndoMax = 300
+  SeEditCols = ["Start", "End", "Duration", "Style", "Actor", "Text"]  ## cells that can be typed in
+  SeNewLength = 2.0   ## seconds: an inserted line's length
+
+proc seTrack(a: App): (bool, Track) =
+  ## The subtitle track shown, unless it's the editor's own working copy.
+  for t in a.player.tracks:
+    if t.kind == "sub" and t.selected and
+       not (a.sePreview.len > 0 and t.external and t.file == a.sePreview):
+      return (true, t)
+
+proc seTrackKey(a: App, t: Track): string =
+  a.player.path & "|" & (if t.external: t.file else: "#" & $t.id)
+
+proc seDropPreview(a: App) =
+  ## Takes the working copy's track out of mpv.
+  if a.sePreviewId == 0: return
+  for t in a.player.tracks:
+    if t.kind == "sub" and t.id == a.sePreviewId and t.file == a.sePreview:
+      a.player.h.command("sub-remove", $t.id)
+      break
+  a.sePreviewId = 0
+  a.sePreviewDue = 0
+
+proc seStopExtract(a: App) =
+  if a.seExtract == nil: return
+  try:
+    a.seExtract.kill()
+    a.seExtract.close()
+  except OSError: discard
+  a.seExtract = nil
+
+proc seSetDoc(a: App, d: SubDoc, name, path, key: string) =
+  ## The document the editor shows from now on, as read (nothing to save).
+  a.seStopExtract()
+  a.seDropPreview()
+  a.seDoc = d
+  (a.seName, a.sePath, a.seKey, a.seMedia) = (name, path, key, a.player.path)
+  a.seDirty = false
+  a.seNote = ""
+  a.seUndo.setLen 0
+  a.seRedo.setLen 0
+  a.seUndoKey = ""
+  # The line playing, else the first one after the position.
+  a.seSel = -1
+  let t = a.player.timePos
+  for i, l in d.lines:
+    if l.stop > t:
+      a.seSel = i
+      break
+  if a.seSel < 0 and d.lines.len > 0: a.seSel = d.lines.high
+  a.seReveal = true
+  if a.ui.focusId.startsWith("se-") and a.ui.focusId != "se-find": a.ui.focusId = ""
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc seCacheDir(): string = getCacheDir("majestic-media-player") / "subedit"
+
+proc seLoadTrack(a: App) =
+  ## Reads the subtitle track shown into the editor: its file, or for one in
+  ## the media file, what ffmpeg makes of it. With none shown, an empty
+  ## document (SubRip, until saved as something else).
+  let p = a.player
+  let (has, t) = a.seTrack
+  if not p.loaded or not has:
+    a.seSetDoc(newDoc(sfSrt), "", "", if p.loaded: p.path & "|none" else: "")
+    return
+  let key = a.seTrackKey(t)
+  if t.external:
+    if t.file.contains("://") or not fileExists(t.file):
+      a.seSetDoc(newDoc(sfSrt), "", "", key)
+      a.seNote = "These subtitles come from a link: open a saved copy to edit them."
+      return
+    try:
+      let d = parseSubs(readFile(t.file), formatOf(t.file))
+      a.seSetDoc(d, t.file.extractFilename, t.file, key)
+    except IOError, OSError:
+      a.seSetDoc(newDoc(sfSrt), "", "", key)
+      a.seNote = "Couldn't read " & t.file.extractFilename
+    return
+  # In the media file: ffmpeg copies it out (in the background: it reads
+  # the whole file to find it).
+  let name = (if t.title.len > 0: t.title elif t.lang.len > 0: t.lang else: "Track " & $t.id)
+  a.seSetDoc(newDoc(sfSrt), name, "", key)
+  if t.codec.toLowerAscii in SeImageCodecs:
+    a.seNote = "Picture subtitles (" & t.codec & ") can't be edited: only text ones can."
+    return
+  if p.path.contains("://") or not fileExists(p.path):
+    a.seNote = "Subtitles inside a link's stream can't be read for editing."
+    return
+  var ff = -1
+  for n in p.h.getNode("track-list"):
+    if n{"type"}.getStr == "sub" and n{"id"}.getInt == t.id: ff = n{"ff-index"}.getInt(-1)
+  if ff < 0:
+    a.seNote = "Couldn't find this track in the file."
+    return
+  let ass = t.codec.toLowerAscii in ["ass", "ssa"]
+  let fmt = if ass: sfAss else: sfSrt
+  try: createDir(seCacheDir())
+  except OSError: discard
+  let outPath = seCacheDir() / &"{getCurrentProcessId()}-track.{fmt}"
+  try:
+    a.seExtract = startProcess("ffmpeg", args = ["-nostdin", "-v", "error", "-y", "-i", p.path,
+      "-map", "0:" & $ff, "-c:s", (if ass: "ass" else: "srt"), outPath],
+      options = {poUsePath, poDaemon, poStdErrToStdOut})  # poDaemon: no console window on Windows
+    a.seExtractOut = outPath
+    a.seExtractFmt = fmt
+    a.seNote = "Reading the subtitles from the file…"
+  except OSError:
+    a.seNote = "ffmpeg can't be run: it reads subtitles from inside media files."
+
+proc pollSeExtract(a: App) =
+  ## ffmpeg reading an embedded track: its result into the editor once done.
+  let pr = a.seExtract
+  if pr == nil or pr.running: return
+  let code = pr.peekExitCode
+  var err = ""
+  try:
+    err = pr.outputStream.readAll.strip
+    pr.close()
+  except IOError, OSError: discard
+  a.seExtract = nil
+  if code != 0:
+    a.seNote = "ffmpeg couldn't read these subtitles" &
+      (if err.len > 0: ": " & err.splitLines[^1] else: ".")
+    return
+  try:
+    let d = parseSubs(readFile(a.seExtractOut), a.seExtractFmt)
+    let (name, key) = (a.seName, a.seKey)
+    a.seSetDoc(d, name, "", key)
+    removeFile(a.seExtractOut)
+  except IOError, OSError:
+    a.seNote = "Couldn't read what ffmpeg wrote."
+
+proc seWritePreview(a: App) =
+  ## Shows the document as it is now: written to its working copy, which
+  ## mpv opens again in the place of the one before.
+  a.sePreviewDue = 0
+  let p = a.player
+  if not p.loaded: return
+  try: createDir(seCacheDir())
+  except OSError: discard
+  let path = seCacheDir() / &"{getCurrentProcessId()}-preview.{a.seDoc.format}"
+  try: writeFile(path, a.seDoc.render)
+  except IOError, OSError:
+    a.osd("Couldn't write the subtitles' working copy")
+    return
+  a.seDropPreview()
+  a.sePreview = path
+  let title = (if a.seName.len > 0: a.seName else: "New subtitles") & " (editing)"
+  if p.h.command("sub-add", path, "select", title) < 0:
+    a.osd("mpv couldn't show the edited subtitles")
+    return
+  p.refreshTracks()
+  for t in p.tracks:
+    if t.kind == "sub" and t.external and t.file == path: a.sePreviewId = t.id
+
+proc seSnap(a: App, key = "") =
+  ## An undo step before an edit, unless it goes on with the one before
+  ## (typing in the same field of the same line: key).
+  if key.len > 0 and key == a.seUndoKey: return
+  a.seUndo.add SeSnap(lines: a.seDoc.lines, sel: a.seSel)
+  if a.seUndo.len > SeUndoMax: a.seUndo.delete(0)
+  a.seRedo.setLen 0
+  a.seUndoKey = key
+
+proc seChanged(a: App) =
+  ## After an edit: unsaved, and shown on the video right away.
+  a.seDirty = true
+  a.sePreviewDue = now()  # on the video at once: the next pass of the main loop
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc seEndEdit(a: App, cancel: bool) =
+  ## Stops typing in a cell: what was typed stays (it's in already), or
+  ## with cancel the line goes back to what it was.
+  let i = a.seEditLine
+  a.seEditLine = -1
+  a.seEditKey = ""
+  a.seUndoKey = ""
+  if not cancel or i notin 0 ..< a.seDoc.lines.len or not a.seEditSnapped: return
+  if a.seUndo.len > 0: a.seUndo.setLen(a.seUndo.len - 1)
+  a.seDoc.lines[i] = a.seEditOrig
+  a.seChanged()
+  a.seDirty = a.seEditWasDirty
+
+proc seEditCell(a: App, i: int, col: string) =
+  ## Starts typing in line i's cell col (all of it selected).
+  if i notin 0 ..< a.seDoc.lines.len: return
+  if a.seEditLine >= 0: a.seEndEdit(cancel = false)
+  a.seSel = i
+  a.seReveal = true
+  (a.seEditLine, a.seEditCol, a.seEditKey) = (i, col, "")
+  a.seEditOrig = a.seDoc.lines[i]
+  (a.seEditSnapped, a.seEditWasDirty) = (false, a.seDirty)
+  a.seEditBuf = case col
+    of "Start": editTime(a.seEditOrig.start)
+    of "End": editTime(a.seEditOrig.stop)
+    of "Duration": editTime(max(0.0, a.seEditOrig.stop - a.seEditOrig.start))
+    of "Style": a.seDoc.style(a.seEditOrig)
+    of "Actor": a.seDoc.actor(a.seEditOrig)
+    else: a.seEditOrig.text.replace("\n", SeBreak)
+  a.ui.focusId = "se-cell"
+  a.ui.focusFresh = true
+  a.seFocused = true
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc seUndoStep(a: App, redo: bool) =
+  let fromS = if redo: addr a.seRedo else: addr a.seUndo
+  let toS = if redo: addr a.seUndo else: addr a.seRedo
+  if fromS[].len == 0:
+    a.osd(if redo: "Nothing to redo" else: "Nothing to undo")
+    return
+  let s = fromS[][^1]
+  fromS[].setLen(fromS[].len - 1)
+  toS[].add SeSnap(lines: a.seDoc.lines, sel: a.seSel)
+  a.seDoc.lines = s.lines
+  a.seSel = min(s.sel, a.seDoc.lines.high)
+  a.seUndoKey = ""
+  a.seReveal = true
+  if a.ui.focusId.startsWith("se-") and a.ui.focusId != "se-find": a.ui.focusId = ""
+  a.seChanged()
+
+proc seDelay(a: App): float =
+  ## The subtitle delay (- and =): what the lines' times are shown later by.
+  try: parseFloat(a.player.props.getOrDefault("sub-delay", "0"))
+  except ValueError: 0.0
+
+proc seVideoTime(a: App): float =
+  ## The position as the subtitles' own time: the subtitle delay taken off.
+  max(0.0, a.player.timePos - a.seDelay)
+
+proc setSubEditorSeek(a: App, on: bool) =
+  ## Ties the subtitle editor to playback (selecting a line seeks there) or not.
+  a.cfg.subEditorSeek = on
+  a.osd(if on: "Subtitle editor: selecting a line goes there" else: "Subtitle editor: untied from playback")
+
+proc seSelect(a: App, i: int, seek = true) =
+  ## Selects line i; with seek (and the editor tied to playback), the video
+  ## goes to its start.
+  if a.seDoc.lines.len == 0: return
+  let i = clamp(i, 0, a.seDoc.lines.high)
+  if i != a.seSel: a.seUndoKey = ""
+  a.seSel = i
+  a.seReveal = true
+  if seek and a.cfg.subEditorSeek and a.player.loaded:
+    a.seekTo(a.seDoc.lines[i].start + a.seDelay)
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+
+proc seInsert(a: App, atVideo: bool) =
+  ## A new line: at the video's time (in time order), or after the one selected.
+  let ls = a.seDoc.lines
+  var at: float
+  var i: int
+  if atVideo or a.seSel notin 0 ..< ls.len:
+    at = a.seVideoTime
+    i = 0
+    while i < ls.len and ls[i].start <= at: inc i
+  else:
+    i = a.seSel + 1
+    at = ls[a.seSel].stop
+  var stop = at + SeNewLength
+  # Up to the next line, unless that leaves it too short.
+  if i < ls.len and ls[i].start > at + 0.5: stop = min(stop, ls[i].start)
+  let like = if a.seSel in 0 ..< ls.len: ls[a.seSel] elif i > 0: ls[i - 1]
+             elif ls.len > 0: ls[0] else: SubLine()
+  var l = a.seDoc.newLine(at, stop, like)
+  l.text = ""
+  l.comment = false
+  a.seSnap()
+  a.seDoc.lines.insert(l, i)
+  a.seSel = i
+  a.seReveal = true
+  a.seChanged()
+  a.seEditCell(i, "Text")  # type its text right away
+
+proc seDuplicate(a: App) =
+  if a.seSel notin 0 ..< a.seDoc.lines.len: return
+  a.seSnap()
+  a.seDoc.lines.insert(a.seDoc.lines[a.seSel], a.seSel + 1)
+  inc a.seSel
+  a.seReveal = true
+  a.seChanged()
+
+proc seDelete(a: App) =
+  if a.seSel notin 0 ..< a.seDoc.lines.len: return
+  a.seSnap()
+  a.seDoc.lines.delete(a.seSel)
+  a.seSel = min(a.seSel, a.seDoc.lines.high)
+  a.seReveal = true
+  if a.ui.focusId.startsWith("se-") and a.ui.focusId != "se-find": a.ui.focusId = ""
+  a.seChanged()
+
+proc seSplit(a: App) =
+  ## Splits the selected line in two at the video's time; its text at the
+  ## text box's caret while typing in it, else at its first line break (with
+  ## neither, both keep all of it).
+  let i = a.seSel
+  if i notin 0 ..< a.seDoc.lines.len: return
+  let l = a.seDoc.lines[i]
+  let t = a.seVideoTime
+  if t <= l.start or t >= l.stop:
+    a.osd("Split: the video's time is outside the line")
+    return
+  var (first, second) = (l.text, l.text)
+  # Typing in its text: at the caret (the cell shows line breaks as SeBreak).
+  let typing = a.ui.focusId == "se-cell" and a.seEditLine == i and a.seEditCol == "Text"
+  let cut = if typing: a.seEditBuf[0 ..< min(a.ui.caret, a.seEditBuf.len)].replace(SeBreak, "\n").len
+            else: l.text.find('\n')
+  if a.seEditLine >= 0:
+    a.seEndEdit(cancel = false)
+    if a.ui.focusId == "se-cell": a.ui.focusId = ""
+  if cut > 0 and cut < l.text.len:
+    first = l.text[0 ..< cut].strip(leading = false)
+    second = l.text[cut .. ^1].strip(trailing = false)
+  a.seSnap()
+  a.seDoc.lines[i].stop = t
+  a.seDoc.lines[i].text = first
+  var n = l
+  n.start = t
+  n.text = second
+  a.seDoc.lines.insert(n, i + 1)
+  a.seChanged()
+
+proc seJoin(a: App) =
+  ## The selected line and the next as one: from the first's start to the
+  ## second's end, their texts on two lines.
+  let i = a.seSel
+  if i notin 0 ..< a.seDoc.lines.high: return
+  a.seSnap()
+  let b = a.seDoc.lines[i + 1]
+  a.seDoc.lines[i].stop = max(a.seDoc.lines[i].stop, b.stop)
+  a.seDoc.lines[i].start = min(a.seDoc.lines[i].start, b.start)
+  let t = a.seDoc.lines[i].text
+  a.seDoc.lines[i].text = if t.len == 0: b.text elif b.text.len == 0: t else: t & "\n" & b.text
+  a.seDoc.lines.delete(i + 1)
+  if a.ui.focusId.startsWith("se-") and a.ui.focusId != "se-find": a.ui.focusId = ""
+  a.seChanged()
+
+proc seSetTime(a: App, isEnd: bool) =
+  ## The selected line's start or end to the video's time ([ and ]).
+  let i = a.seSel
+  if i notin 0 ..< a.seDoc.lines.len: return
+  let t = a.seVideoTime
+  a.seSnap()
+  if isEnd:
+    a.seDoc.lines[i].stop = t
+    if a.seDoc.lines[i].start > t: a.seDoc.lines[i].start = t
+  else:
+    let len = a.seDoc.lines[i].stop - a.seDoc.lines[i].start
+    a.seDoc.lines[i].start = t
+    if a.seDoc.lines[i].stop < t: a.seDoc.lines[i].stop = t + max(len, 0.0)
+  a.seChanged()
+
+proc seSort(a: App) =
+  a.seSnap()
+  let sel = a.seSel
+  let order = a.seDoc.sortByTime
+  a.seSel = order.find(sel)
+  a.seReveal = true
+  a.seChanged()
+
+# --- subtitle editor: finding -----------------------------------------------
+
+proc seHits(a: App): seq[int] =
+  ## The lines whose text has the search's text.
+  if a.seFind.len == 0: return
+  for i, l in a.seDoc.lines:
+    if findText(l.text, a.seFind, 0, a.cfg.subFindCase) >= 0: result.add i
+
+proc seFindGo(a: App, step: int) =
+  ## Selects the next match (step 1), the one before (-1), or with 0 the
+  ## first from the selection on (typing).
+  let hits = a.seHits
+  if hits.len == 0: return
+  let cur = a.seSel
+  var k =
+    if step > 0: hits.upperBound(cur)
+    elif step < 0: hits.lowerBound(cur) - 1
+    else: hits.lowerBound(max(0, cur))
+  if k >= hits.len: k = 0
+  if k < 0: k = hits.high
+  a.seSelect(hits[k])
+
+proc seReplaceOne(a: App) =
+  ## Replaces the matches in the selected line when it has some, then goes
+  ## to the next line that does.
+  let i = a.seSel
+  if a.seFind.len == 0: return
+  if i in 0 ..< a.seDoc.lines.len and findText(a.seDoc.lines[i].text, a.seFind, 0, a.cfg.subFindCase) >= 0:
+    a.seSnap()
+    a.seDoc.lines[i].text = replaceText(a.seDoc.lines[i].text, a.seFind, a.seReplace, a.cfg.subFindCase).text
+    a.seChanged()
+  a.seFindGo(1)
+
+proc seReplaceAll(a: App) =
+  if a.seFind.len == 0: return
+  var total = 0
+  var snapped = false
+  for l in a.seDoc.lines.mitems:
+    let (t, n) = replaceText(l.text, a.seFind, a.seReplace, a.cfg.subFindCase)
+    if n == 0: continue
+    if not snapped:
+      a.seSnap()
+      snapped = true
+    l.text = t
+    total += n
+  if total > 0: a.seChanged()
+  a.osd(if total == 0: "Nothing to replace"
+        elif total == 1: "Replaced 1 match" else: &"Replaced {total} matches")
+
+# --- subtitle editor: files -------------------------------------------------
+
+proc seDefaultSaveName(a: App): string =
+  ## Where Save As starts: the file it came from, else next to the media file
+  ## and named after it (with the track's language).
+  if a.sePath.len > 0: return a.sePath
+  let ext = $a.seDoc.format
+  let media = a.player.path
+  if media.len == 0 or media.contains("://"): return getHomeDir() / "subtitles." & ext
+  let (_, t) = a.seTrack
+  let lang = if t.lang.len > 0 and t.lang.len <= 3: "." & t.lang else: ""
+  media.changeFileExt("") & lang & "." & ext
+
+proc seSaveTo(a: App, path: string): bool =
+  ## Writes the document to path, in the format its extension names (tags
+  ## translated where they can be). mpv shows the saved file from then on.
+  let fmt = formatOf(path)
+  let doc = a.seDoc.convertTo(fmt)
+  let tmp = path & ".saving"
+  try:
+    writeFile(tmp, doc.render)
+    moveFile(tmp, path)
+  except IOError, OSError:
+    try: removeFile(tmp)
+    except OSError: discard
+    a.osd("Couldn't save " & path.extractFilename)
+    return false
+  a.seDoc = doc
+  a.sePath = path
+  a.seName = path.extractFilename
+  a.seDirty = false
+  a.osd("Saved " & path.extractFilename)
+  # The saved file in the place of the working copy (and of an older copy
+  # of the same file).
+  let p = a.player
+  if p.loaded:
+    a.seDropPreview()
+    p.refreshTracks()
+    for t in p.tracks:
+      if t.kind == "sub" and t.external and t.file == path: p.h.command("sub-remove", $t.id)
+    p.h.command("sub-add", path, "select")
+    p.refreshTracks()
+    for t in p.tracks:
+      if t.kind == "sub" and t.external and t.file == path: a.seKey = a.seTrackKey(t)
+  true
+
+proc seSaveAs(a: App) =
+  a.ask(dkSaveFile, "subsave", "Save Subtitles", a.seDefaultSaveName,
+    @SeTextExtensions, "Subtitles")
+
+proc seSave(a: App) =
+  if a.sePath.len > 0 and not a.sePath.contains("://"): discard a.seSaveTo(a.sePath)
+  else: a.seSaveAs()
+
+proc seOpenFile(a: App, path: string) =
+  ## Subtitles from a file: edited, and shown over the video.
+  try:
+    let d = parseSubs(readFile(path), formatOf(path))
+    if a.player.loaded:
+      a.player.h.command("sub-add", path, "select")
+      a.player.refreshTracks()
+    var key = ""
+    for t in a.player.tracks:
+      if t.kind == "sub" and t.external and t.file == path: key = a.seTrackKey(t)
+    a.seSetDoc(d, path.extractFilename, path, key)
+  except IOError, OSError:
+    a.osd("Couldn't read " & path.extractFilename)
+
+proc seNew(a: App) =
+  a.seSetDoc(newDoc(sfSrt), "", "", a.seKey)
+
+proc seConfirmDiscard(a: App, what: string, then: proc ()) =
+  ## Runs then, asking first when there are unsaved changes.
+  if not a.seDirty or a.seDoc.lines.len == 0 and a.sePath.len == 0:
+    then()
+    return
+  a.showConfirm("Unsaved Subtitles",
+    "The subtitles being edited (" & (if a.seName.len > 0: a.seName else: "new subtitles") &
+      ") have changes that weren't saved.", what, then)
+
+proc setSubEditorShown(a: App, shown: bool) =
+  ## Shows or hides the subtitle editor, growing or shrinking the window by
+  ## its height. Shown, it reads the subtitles on screen (unless it has
+  ## unsaved changes of its own).
+  if a.cfg.showSubEditor == shown: return
+  a.cfg.showSubEditor = shown
+  let h = int32(a.subEditorHeight)
+  a.resizeKeepingVideo(ivec2(0, if shown: h else: -h))
+  if shown:
+    a.seFocused = true
+    if not a.seDirty and (a.seKey.len == 0 or a.seMedia != a.player.path): a.seLoadTrack()
+  else:
+    a.seFocused = false
+    if a.ui.focusId.startsWith("se-"): a.ui.focusId = ""
+
+proc pollSubEditor(a: App) =
+  ## Follows the subtitles shown while there's nothing unsaved; writes the
+  ## working copy once typing pauses.
+  a.pollSeExtract()
+  if a.sePreviewDue > 0 and now() >= a.sePreviewDue: a.seWritePreview()
+  if not a.cfg.showSubEditor or a.seDirty or a.seExtract != nil: return
+  let p = a.player
+  if not p.loaded or p.opening or p.justLoaded: return
+  let (has, t) = a.seTrack
+  let key = if has: a.seTrackKey(t) else: p.path & "|none"
+  # Hiding the subtitles keeps what was read from them.
+  if not has and a.seMedia == p.path: return
+  if key != a.seKey: a.seLoadTrack()
+
+proc seQuitBlocked(a: App): bool =
+  ## Closing with unsaved subtitles: asks first (true: not closing yet).
+  if not a.seDirty or a.seQuitOk or a.upRestart or a.rdRestart.len > 0: return false
+  a.seConfirmDiscard("Quit without saving them?", proc () =
+    a.seQuitOk = true
+    a.window.closeRequested = true)
+  true
 
 proc runDir(a: App): string =
   ## Where command lines run: the media file's folder, else home.
@@ -10829,6 +11468,8 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     a.setPlaylistShown(not a.cfg.showPlaylist))
   view.check("Library", k(kaLibrary), cfg.showLibrary, action = proc () =
     a.setLibraryShown(not a.cfg.showLibrary))
+  view.check("Subtitle Editor", k(kaSubEditor), cfg.showSubEditor, action = proc () =
+    a.setSubEditorShown(not a.cfg.showSubEditor))
   view.check("Run Log", k(kaRunLog), cfg.showRunLog, action = proc () =
     a.setRunLogShown(not a.cfg.showRunLog))
   view.sep()
@@ -11405,6 +12046,54 @@ proc buildMenu(a: App): tuple[bar, context: MenuNode] =
     ac.markListed()
     (root, q)
   of cmLibrary: (root, a.libraryMenu())
+  of cmSubEditor:
+    let m = newMenuRoot()
+    let n = a.seDoc.lines.len
+    let has = a.seSel in 0 ..< n
+    m.item("Edit Text", "Enter", enabled = has, action = proc () = a.seEditCell(a.seSel, "Text"))
+    if a.seDoc.format == sfAss:
+      let st = m.sub("Style", enabled = has)
+      let cur = if has: a.seDoc.style(a.seDoc.lines[a.seSel]) else: ""
+      for name in a.seDoc.styles:
+        st.radio(name, checked = name == cur, action = bindAct(proc (name: string) =
+          if a.seSel notin 0 ..< a.seDoc.lines.len: return
+          a.seSnap()
+          a.seDoc.setField(a.seDoc.lines[a.seSel], "Style", name)
+          a.seChanged(), name))
+      m.check("Comment", checked = has and a.seDoc.lines[a.seSel].comment, enabled = has,
+        action = proc () =
+          if a.seSel notin 0 ..< a.seDoc.lines.len: return
+          a.seSnap()
+          a.seDoc.lines[a.seSel].comment = not a.seDoc.lines[a.seSel].comment
+          a.seChanged())
+    m.sep()
+    m.item("Insert at Video Time", "Insert", enabled = a.player.loaded or n == 0,
+      action = proc () = a.seInsert(true))
+    m.item("Insert After", "Shift+Insert", enabled = has, action = proc () = a.seInsert(false))
+    m.item("Duplicate", "Ctrl+D", enabled = has, action = proc () = a.seDuplicate())
+    m.item("Split at Video Time", "Ctrl+K", enabled = has, action = proc () = a.seSplit())
+    m.item("Join With Next", "Ctrl+J", enabled = has and a.seSel < n - 1, action = proc () = a.seJoin())
+    m.item("Delete", "Delete", enabled = has, action = proc () = a.seDelete())
+    m.sep()
+    m.check("Selecting a Line Seeks There", checked = a.cfg.subEditorSeek,
+      action = proc () = a.setSubEditorSeek(not a.cfg.subEditorSeek))
+    m.item("Start at Video Time", "[", enabled = has, action = proc () = a.seSetTime(false))
+    m.item("End at Video Time", "]", enabled = has, action = proc () = a.seSetTime(true))
+    m.item("Sort by Time", enabled = n > 1, action = proc () = a.seSort())
+    m.sep()
+    m.item("Undo", "Ctrl+Z", enabled = a.seUndo.len > 0, action = proc () = a.seUndoStep(false))
+    m.item("Redo", "Ctrl+Y", enabled = a.seRedo.len > 0, action = proc () = a.seUndoStep(true))
+    m.sep()
+    m.item("New", action = proc () =
+      a.seConfirmDiscard("Start new subtitles without saving them?", proc () = a.seNew()))
+    m.item("Open...", action = proc () =
+      a.seConfirmDiscard("Open another file without saving them?", proc () =
+        a.ask(dkOpenFile, "subopen", "Edit Subtitles", exts = @SeTextExtensions, filterName = "Subtitles")))
+    m.item("Read Subtitles Shown Again", enabled = a.player.loaded, action = proc () =
+      a.seConfirmDiscard("Read them again without saving your changes?", proc () = a.seLoadTrack()))
+    m.item("Save", k(kaSave), action = proc () = a.seSave())
+    m.item("Save As...", "Ctrl+Shift+S", action = proc () = a.seSaveAs())
+    (root, m)
   of cmRunLog:
     let rl = newMenuRoot()
     # The selected text, or the whole log when nothing is selected.
@@ -11647,7 +12336,6 @@ const
   ## (menu, word, alias), "Join videos" found as "Concatenate videos" too.
   PaletteWordAliases = [("Run", "Join", "Concatenate")]
 
-proc runAction(a: App, act: KeyAction)  # below
 proc trackerButton(a: App): bool  # below
 
 proc paletteKey(it: PaletteItem): string =
@@ -12583,6 +13271,7 @@ proc runAction(a: App, act: KeyAction) =
   of kaQueue: (if a.cfg.showPlaylist: a.queueSelected())
   of kaUnqueue: (if a.cfg.showPlaylist: a.unqueueSelected())
   of kaAddClipboardPlaylist: a.addFromClipboard()
+  of kaSubEditor: a.runMenuPath(@["View", "Subtitle Editor"])
   of kaRunLog: a.runMenuPath(@["View", "Run Log"])
   of kaLibrary: a.runMenuPath(@["View", "Library"])
   of kaSearchLibrary: a.openLibrarySearch()
@@ -12597,6 +13286,175 @@ proc runAction(a: App, act: KeyAction) =
 proc rectKeys(a: App): bool  # rectangle drawing, below
 
 proc libraryKeys(a: App): bool  # below
+
+const
+  TypingKeys = {Key0 .. KeyZ, KeyBacktick, KeyMinus, KeyEqual, KeyLeftBracket, KeyRightBracket,
+                KeyBackslash, KeySemicolon, KeyApostrophe, KeyComma, KeyPeriod, KeySlash}
+    ## The keys that type into typeAhead (Space too, once it has begun)
+  TypePause = 1.0  ## seconds without typing after which typing starts over
+
+proc typeJump(a: App, stop: PanelStop) =
+  ## Selects the row of that list or column whose name begins with what was
+  ## typed (typeText): for a first letter the next one after the row
+  ## selected (the same letter again goes on to the next), else from the
+  ## row selected on, round the end. A letter typed over and over that no
+  ## name begins with goes on through those beginning with the letter.
+  var names: seq[string]
+  var cur = -1
+  var nodes: seq[LibNode]
+  var fileRows: seq[int]
+  case stop
+  of psEntries:
+    for p in a.playlist: names.add a.rowName(p)
+    cur = a.plSelected
+  of psPlaylists:
+    names = a.tabNames
+    cur = a.tabView
+  of psLibraries:
+    nodes = a.libTreeRows
+    for nd in nodes:
+      names.add(if nd.lib.len == 0: "All" elif nd.folder.len == 0: nd.lib else: nd.folder.lastPathPart)
+    cur = a.libNodeIndex(nodes)
+  of psFiles:
+    let at = a.libCursorRow
+    for i, id in a.libView:
+      if id < 0: continue
+      if i == at: cur = names.len
+      names.add a.library.files[id].displayName
+      fileRows.add i
+  of psNone: return
+  let n = names.len
+  if n == 0: return
+  if cur notin 0 ..< n: cur = -1
+  proc firstFrom(prefix: string, start: int): int =
+    for k in 0 ..< n:
+      let i = (start + k) mod n
+      if unicode.toLower(names[i]).startsWith(prefix): return i
+    -1
+  let typed = a.typeText.toRunes
+  let next = cur + 1  # 0 with none selected
+  var hit = if typed.len == 1: firstFrom(a.typeText, next) else: firstFrom(a.typeText, max(cur, 0))
+  if hit < 0 and typed.len > 1 and typed.allIt(it == typed[0]): hit = firstFrom($typed[0], next)
+  if hit < 0: return
+  case stop
+  of psEntries:
+    a.selectOnly(hit)
+    a.plReveal = true
+  of psPlaylists: (if hit != a.tabView: a.showTab(hit))
+  of psLibraries:
+    a.libPick(nodes[hit].lib, nodes[hit].folder)
+    a.libCatReveal = true
+  of psFiles: a.libSelectRow(fileRows[hit])
+  of psNone: discard
+
+proc typeAhead(a: App): bool =
+  ## While the playlist or the library has the keyboard (typingStop),
+  ## typing jumps to the row whose name begins with what was typed (see
+  ## typeJump), and the keys without a modifier don't run their commands
+  ## (letters, digits, punctuation; the arrows only do what the list does
+  ## with them) until Escape gives them back. Shift with a key that has a
+  ## command runs it. True when the keys were taken.
+  let stop = a.typingStop
+  if stop == psNone or a.menus.isOpen: return
+  let w = a.window
+  let mods = w.heldMods
+  if mods notin [{}, {kmShift}]: return
+  let pressed = w.buttonPressed
+  let t = now()
+  if a.typeStop != stop.ord or t - a.typeAt > TypePause: a.typeText = ""
+  var typing = false
+  for k in TypingKeys:
+    if pressed[k]: typing = true
+  if pressed[KeySpace] and a.typeText.len > 0: typing = true  # "the b": on past the space
+  let arrows = mods == {} and (pressed[KeyUp] or pressed[KeyDown] or pressed[KeyLeft] or pressed[KeyRight])
+  if not typing and not arrows:
+    # A key no button stands for (one only some layouts have) types too.
+    if a.ui.typedPending.len == 0 or w.pressedKey != ButtonUnknown: return
+    typing = true
+  if mods == {kmShift} and a.cfg.pressedAction(w).ok: return
+  if a.panelStop == psNone:
+    # The panel was clicked, not one of its lists: its list takes the keys.
+    a.focusPanel(stop)
+    if a.playlistKeys() or a.libraryKeys(): return true
+  if not typing: return true  # arrows the list has no use for do nothing
+  var text = ""
+  for r in a.ui.typedPending.runes:
+    if r.int >= 0x20 and r.int != 0x7F: text.add $r
+  if text.len == 0: return true
+  a.typeText.add unicode.toLower(text)
+  a.typeAt = t
+  a.typeStop = stop.ord
+  a.typeJump(stop)
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  true
+
+proc menuKeyAt(a: App, row, area: Rect): Vec2 =
+  ## Where the context menu key opens a list's menu: under the row, as far
+  ## as it shows in the list; at the list's top when it's out of view.
+  if row.h > 0 and row.y + row.h > area.y and row.y < area.y + area.h:
+    vec2(row.x + 16, clamp(row.y + row.h, area.y, area.y + area.h))
+  else: vec2(area.x + 16, area.y)
+
+proc menuKey(a: App): bool =
+  ## The context menu key (Menu): the menu that right-clicking what has the
+  ## keyboard opens, on the selection: the subtitle editor's line, the
+  ## playlist shown (its side column), the playlist's entries, the library
+  ## or folder picked, the Library's files; else the video's (with Shift:
+  ## the menu bar's, as Shift+right-click), at the pointer when it's over
+  ## the video, else in its middle. Pressed again, it closes the menu.
+  let w = a.window
+  if not w.buttonPressed[KeyMenu] or w.heldMods notin [{}, {kmShift}] or
+      a.cfg.pressedAction(w).ok:
+    return
+  if a.menus.isOpen:
+    a.menus.close()
+    return true
+  var pos: Vec2
+  let stop = a.typingStop
+  if a.seFocused and a.cfg.showSubEditor and a.seRows.h > 0:
+    a.ctxMenu = cmSubEditor
+    pos = a.menuKeyAt(a.seSelRect, a.seRows)
+  elif stop == psPlaylists:
+    a.ctxTab = a.tabView
+    a.ctxMenu = cmPlaylistTab
+    pos = a.menuKeyAt(if a.tabView < a.tabRects.len: a.tabRects[a.tabView] else: Rect(), a.tabStrip)
+  elif stop == psEntries:
+    a.ctxMenu = cmPlaylist
+    pos = a.menuKeyAt(a.plSelRect, a.plListRect)
+  elif stop == psLibraries:
+    let nodes = a.libTreeRows
+    let at = a.libNodeIndex(nodes)
+    if at >= 0:
+      a.libCtx = if nodes[at].lib.len == 0 or nodes[at].folder.len == 0: lcLibrary else: lcFolder
+      a.libCtxName = nodes[at].lib
+      a.libCtxFolder = nodes[at].folder
+    else: a.libCtx = lcBlank
+    a.ctxMenu = cmLibrary
+    pos = a.menuKeyAt(a.libPickedRect, a.libCatRect)
+  elif stop == psFiles:
+    a.libCtx = lcFiles
+    a.ctxMenu = cmLibrary
+    pos = a.menuKeyAt(a.libCursorRect, a.libListRect)
+  else:
+    let v = a.videoRect
+    a.ctxMenu = if w.shiftDown: cmVideoShift else: cmVideo
+    pos = if w.mouseInside and a.ui.mouse.inside(v): a.ui.mouse else: v.xy + v.wh / 2
+  a.menus.openContext(pos, keyboard = true)
+  a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
+  true
+
+proc menuNavKeys(a: App): bool =
+  ## The arrows, Home, End and Enter move through the open menus and run
+  ## their items, instead of running their commands. True when taken.
+  if not a.menus.isOpen: return
+  let pressed = a.window.buttonPressed
+  for (b, k) in [(KeyUp, mkeyUp), (KeyDown, mkeyDown), (KeyHome, mkeyHome), (KeyEnd, mkeyEnd),
+                 (KeyLeft, mkeyLeft), (KeyRight, mkeyRight), (KeyEnter, mkeyEnter),
+                 (NumpadEnter, mkeyEnter)]:
+    if pressed[b]:
+      a.menus.pressKey(k)
+      result = true
+  if result: a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
 
 proc panelTab(a: App): bool =
   ## Tab / Shift+Tab: the keyboard to the next or previous place shown (see
@@ -12615,6 +13473,85 @@ proc panelTab(a: App): bool =
   a.focusPanel(stops[next])
   true
 
+proc subEditorKeys(a: App, typing: bool): bool =
+  ## The subtitle editor's keys: with typing, while one of its fields has
+  ## the keyboard (they take every key but these); else while it was
+  ## clicked last. True when a key was taken.
+  if not a.cfg.showSubEditor: return
+  let w = a.window
+  let pressed = w.buttonPressed
+  let ui = a.ui
+  let f = ui.focusId
+  let mods = w.heldMods
+  if not typing and not a.seFocused: return
+  # Its Ctrl keys, typing or not.
+  if mods == {kmCtrl} or mods == {kmCtrl, kmShift}:
+    let shift = kmShift in mods
+    if pressed[KeyS]:
+      if shift: a.seSaveAs() else: a.seSave()
+      return true
+    if pressed[KeyZ] or pressed[KeyY]:
+      if typing and f != "se-find" and f != "se-replace": ui.focusId = ""
+      if typing and (f == "se-find" or f == "se-replace"): return true  # its own text
+      a.seUndoStep(redo = pressed[KeyY] or shift)
+      return true
+    if pressed[KeyF] or pressed[KeyH]:
+      ui.focusId = if pressed[KeyH]: "se-replace" else: "se-find"
+      ui.focusFresh = true
+      a.seFocused = true
+      return true
+  if typing:
+    # A cell: Escape puts it back, Tab goes on to the next one, Up and Down
+    # to the line above or below (subEditorPanel acts on seEditKey).
+    if f == "se-cell":
+      if pressed[KeyEscape]: a.seEditKey = "esc"
+      elif pressed[KeyTab]: a.seEditKey = if w.shiftDown: "backtab" else: "tab"
+      elif pressed[KeyUp] and mods == {}: a.seEditKey = "up"
+      elif pressed[KeyDown] and mods == {}: a.seEditKey = "down"
+    if f == "se-find" or f == "se-replace":
+      if pressed[KeyEscape]:
+        ui.focusId = ""
+      elif f == "se-find" and (pressed[KeyEnter] or pressed[NumpadEnter] or pressed[KeyF3]):
+        a.seFindGo(if w.shiftDown: -1 else: 1)
+        a.seFindKeep = true
+      elif f == "se-replace" and (pressed[KeyEnter] or pressed[NumpadEnter]):
+        a.seReplaceOne()
+        a.seFindKeep = true
+        ui.focusId = "se-replace"
+      elif f == "se-find" and (pressed[KeyDown] or pressed[KeyUp]):
+        a.seFindGo(if pressed[KeyUp]: -1 else: 1)
+    return true
+  if a.seFind.len > 0 and pressed[KeyF3] and mods in [{}, {kmShift}]:
+    a.seFindGo(if kmShift in mods: -1 else: 1)
+    return true
+  let n = a.seDoc.lines.len
+  let page = max(1, int(a.seRows.h / SeRowH) - 1)
+  template go(i: int) =
+    if n > 0: a.seSelect(i)
+    return true
+  if mods == {}:
+    if pressed[KeyUp]: go(max(0, a.seSel - 1))
+    if pressed[KeyDown]: go(min(n - 1, a.seSel + 1))
+    if pressed[KeyPageUp]: go(max(0, a.seSel - page))
+    if pressed[KeyPageDown]: go(min(n - 1, a.seSel + page))
+    if pressed[KeyHome]: go(0)
+    if pressed[KeyEnd]: go(n - 1)
+    if pressed[KeyEnter] or pressed[NumpadEnter] or pressed[KeyF2]:
+      if a.seSel in 0 ..< n: a.seEditCell(a.seSel, "Text")
+      return true
+    if pressed[KeyInsert]: (a.seInsert(true); return true)
+    if pressed[KeyDelete]: (a.seDelete(); return true)
+    if pressed[KeyLeftBracket]: (a.seSetTime(false); return true)
+    if pressed[KeyRightBracket]: (a.seSetTime(true); return true)
+    if pressed[KeyEscape]:
+      a.seFocused = false
+      return true
+  if mods == {kmShift} and pressed[KeyInsert]: (a.seInsert(false); return true)
+  if mods == {kmCtrl}:
+    if pressed[KeyD]: (a.seDuplicate(); return true)
+    if pressed[KeyK]: (a.seSplit(); return true)
+    if pressed[KeyJ]: (a.seJoin(); return true)
+
 proc handleKeys(a: App) =
   let w = a.window
   let pressed = w.buttonPressed
@@ -12622,6 +13559,8 @@ proc handleKeys(a: App) =
   if a.overlay == ovPalette:
     a.paletteKeys()
     return
+  # An open menu takes the arrows and Enter.
+  if a.menuNavKeys(): return
 
   # The tracker panel's field takes the keys while it's being typed in.
   if a.tkOpen and a.ui.focusId.startsWith("tk-"):
@@ -12642,6 +13581,10 @@ proc handleKeys(a: App) =
       a.plFindKeep = true
     elif pressed[KeyDown] or pressed[KeyUp]:
       a.plFindGo(if pressed[KeyUp]: -1 else: 1)
+    return
+  # And the subtitle editor's fields, but for its Ctrl keys.
+  if a.ui.focusId.startsWith("se-"):
+    discard a.subEditorKeys(typing = true)
     return
   # So does a library's name being typed over in the libraries' column.
   if a.ui.focusId == "lib-rename":
@@ -12664,7 +13607,9 @@ proc handleKeys(a: App) =
     elif a.plFindOpen: a.closePlaylistFind()
     elif a.libFocused and a.cfg.showLibrary and a.cfg.librarySearch.len > 0:
       a.clearLibrarySearch()  # then the next Escape gives the keys back
-    elif a.panelStop != psNone: a.focusPanel(psNone)  # the arrows' commands again
+    elif a.seFocused and a.cfg.showSubEditor: a.seFocused = false  # the same
+    elif a.panelStop != psNone or a.typingStop != psNone:
+      a.focusPanel(psNone)  # the arrows' and the letters' commands again
     elif a.fullscreen: a.setFullscreen(false)
     return
   if a.overlay == ovProperties:
@@ -12678,6 +13623,7 @@ proc handleKeys(a: App) =
     elif pressed[KeyHome]: a.propScroll = 0
     elif pressed[KeyEnd]: a.propScroll = float32.high
   if a.overlay != ovNone: return
+  if a.menuKey(): return
 
   # Ctrl+C with text selected in the run log copies that text instead.
   if pressed[KeyC] and w.ctrl and not w.alt and not w.shiftDown and a.cfg.showRunLog:
@@ -12690,8 +13636,10 @@ proc handleKeys(a: App) =
     a.plFindGo(if w.shiftDown: -1 else: 1)
     return
   if a.panelTab(): return
+  if a.subEditorKeys(typing = false): return
   if a.playlistKeys(): return
   if a.libraryKeys(): return
+  if a.typeAhead(): return
 
   let (ok, act) = a.cfg.pressedAction(w)
   if ok: a.runAction(act)
@@ -13959,7 +14907,8 @@ proc seekBar(a: App, r: Rect) =
     if ui.activeId == "seekresize":
       let (y0, h0) = a.seekResizeFrom
       let others = a.bottomHeight - r.h +
-        (if a.fullscreen: 0'f32 else: a.menuBarHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0))
+        (if a.fullscreen: 0'f32 else: a.menuBarHeight + (if a.cfg.showRunLog: a.runLogHeight else: 0) +
+          (if a.cfg.showSubEditor: a.subEditorHeight else: 0))
       a.cfg.waveformHeight = clamp(h0 - (ui.mouse.y - y0), SeekBarHeight,
         max(SeekBarHeight, ui.size.y - others - MinWindow.y.float32 / 2))
   let half = round((r.h - 12) / 2)  # the waveform's, above and below cy
@@ -14438,9 +15387,20 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   let rot = &"{a.cfg.rotateStep:g}°"
   # View toggles and pan/rotate/scale only show with "Show all shortcuts".
   let all = a.cfg.showAllShortcuts
-  let viewToggles = {kaCompact, kaSeekBar, kaControls, kaStatus, kaCycleBars, kaCycleBarsBack, kaPlaylist, kaRunLog, kaLibrary, kaShowOsd}
+  let viewToggles = {kaCompact, kaSeekBar, kaControls, kaStatus, kaCycleBars, kaCycleBarsBack, kaPlaylist, kaSubEditor, kaRunLog, kaLibrary, kaShowOsd}
   # Ctrl+C copies the run log's selected text while there is some (handleKeys).
   let logSel = a.cfg.showRunLog and a.rlSelection.len > 0
+  # Keys the subtitle editor takes while it has them (subEditorKeys): not
+  # their commands' then.
+  let seTyping = a.ui.focusId.startsWith("se-")
+  let seKeys = a.cfg.showSubEditor and (a.seFocused or seTyping)
+  let seTaken: set[Button] =
+    if not seKeys: {}
+    elif mods == {kmCtrl}: (if seTyping: {KeyS, KeyZ, KeyY, KeyF, KeyH}
+                            else: {KeyS, KeyZ, KeyY, KeyF, KeyH, KeyD, KeyK, KeyJ})
+    elif mods == {kmCtrl, kmShift}: {KeyS, KeyZ, KeyY, KeyF, KeyH}
+    elif mods == {kmShift} and not seTyping: {KeyInsert}
+    else: {}
   for g in KeyGroup:
     if g == kgPan and not all: continue
     var hints: seq[KeyHint]
@@ -14455,7 +15415,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     for act in KeyAction:
       if Actions[act].group != g or act in done: continue
       if act in viewToggles and not all: continue
-      let ks = a.cfg.combos(act).filterIt(it.mods == mods)
+      let ks = a.cfg.combos(act).filterIt(it.mods == mods and it.key notin seTaken)
       if ks.len == 0: continue
       let label =
         case act
@@ -14485,10 +15445,30 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if mods == {kmCtrl}: result.add @[("A", "Select All Files"), ("F", "Search Library")]
     elif mods == {kmShift} and a.libArrows:
       result.add @[("Up/Down", "Extend Library Selection"), ("Enter", "Play In New Player")]
+  # The subtitle editor's own keys while it has them (subEditorKeys).
+  if seKeys:
+    if mods == {kmCtrl}:
+      var h = @[("S", "Save Subtitles"), ("Z/Y", "Undo/Redo Subtitles"), ("F", "Find In Subtitles"),
+                ("H", "Replace In Subtitles")]
+      if not seTyping:
+        h.add @[("D", "Duplicate Line"), ("K", "Split Line At Video Time"), ("J", "Join With Next Line")]
+      result.add h
+    elif mods == {kmCtrl, kmShift}: result.add @[("S", "Save Subtitles As"), ("Z", "Redo Subtitles")]
+    elif mods == {kmShift} and not seTyping:
+      result.add @[("Insert", "Insert Line After")]
+      if a.seFind.len > 0: result.add @[("F3", "Previous Match")]
+    elif mods == {kmShift} and a.ui.focusId == "se-find": result.add @[("Enter/F3", "Previous Match")]
+    elif mods == {kmShift} and a.ui.focusId == "se-cell":
+      result.add @[("Tab", "Previous Cell")]
+      if a.seEditCol == "Text": result.add @[("Enter", "Line Break")]
   # Tab's way back through the panels' columns and lists (panelTab), unless a command has Shift+Tab.
   if mods == {kmShift} and a.panelStops.len > 0 and not KeyAction.toSeq.anyIt(
       a.cfg.combos(it).anyIt(it.key == KeyTab and it.mods == {kmShift})):
     result.add @[("Tab", "Previous Column Or List")]
+  # Shift+Menu: the video's menu with the menu bar's menus (menuKey), while no list has the keys.
+  if mods == {kmShift} and a.typingStop == psNone and not seKeys and not KeyAction.toSeq.anyIt(
+      a.cfg.combos(it).anyIt(it.key == KeyMenu and it.mods == {kmShift})):
+    result.add @[("Menu", "Menu Bar's Menus")]
   # The playlist search's way back (handleKeys); Enter only while typing in it.
   if a.plFindOpen and mods == {kmShift}:
     result.add @[((if a.ui.focusId == "pl-find": "Enter/F3" else: "F3"), "Previous Match")]
@@ -15628,6 +16608,7 @@ proc plSelectionLine(a: App): string =
 proc playlistPanel(a: App, r: Rect) =
   let ui = a.ui
   a.plOverEdge = false
+  a.plSelRect = Rect()  # set by the rows drawn below
   # The Playlist Manager (the playlists' side column) collapsed: a border
   # thicker by a pixel, lit while hovered, with an arrow in its middle that
   # restores it, as does a double-click on the edge or the header.
@@ -15909,6 +16890,7 @@ proc playlistPanel(a: App, r: Rect) =
     if a.plIsSelected(i): ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
     elif a.plFindOpen and a.plFindHits.binarySearch(i) >= 0: ui.rect(row, colFindHit)
+    if i == a.plSelected: a.plSelRect = row  # where the context menu key opens its menu
     if a.plArrows and i == a.plSelected: ui.border(row, colAccent)  # where Up/Down go from
     let current = i == a.plIndex
     var shift = 0'f32  # the first column's text moves past a long queue label
@@ -16336,6 +17318,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
   let ui = a.ui
   let ix = a.library
   let w = a.window
+  (a.libCursorRect, a.libPickedRect) = (Rect(), Rect())  # set by the rows drawn below
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y, r.w, 30), colPanelRaised)  # the header: lighter than the body
   ui.rect(rect(r.x, r.y, 1, r.h), colBorder)
@@ -16528,6 +17511,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
       (not clipped or ui.mouse.inside(catFold))
     let hidden = i >= 0 and a.cfg.libraries[i].hidden
     let picked = name == a.cfg.libraryShown and nd.folder == a.cfg.libraryFolder
+    if picked: a.libPickedRect = row  # where the context menu key opens its menu
     if picked: ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
     # The arrow: a click on it expands or collapses, as a double-click on the row does.
@@ -16837,6 +17821,7 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     let sel = f.path in a.libSel
     if sel: ui.rect(row, colPressed)
     elif hov: ui.rect(row, colHover)
+    if f.path == a.libCursor: a.libCursorRect = row  # where the context menu key opens its menu
     if a.libArrows and f.path == a.libCursor: ui.border(row, colAccent)  # where Up/Down go from
     let cur = f.path == playing
     if cur: ui.icon("play16", vec2(row.x + 14, row.y + rowH / 2), colAccent)
@@ -17000,6 +17985,339 @@ proc libraryPanel(a: App, r: Rect, under: bool) =
     FontSmall, h = RightAlign)
 
 
+proc seButton(ui: Ui, id: string, r: Rect, label, tip: string, enabled = true): bool =
+  ## A small flat button with a label, as in the panels' headers.
+  let hov = enabled and ui.hover(r)
+  if hov and ui.pressed():
+    ui.pressId = id
+    ui.consumeClick()
+  ui.rect(r, if hov and ui.down() and ui.pressId == id: colPressed
+             elif hov: colHover else: colPanelRaised)
+  ui.border(r, colBorder)
+  ui.textIn(label, r, if enabled: colText else: colTextDisabled, FontSmall, h = CenterAlign)
+  if tip.len > 0: ui.tip(r, tip)
+  hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == id
+
+proc seCellText(a: App, l: SubLine, col: string): string =
+  ## What a cell shows to be typed over: times as H:MM:SS.mmm, the text's
+  ## line breaks as SeBreak.
+  case col
+  of "Start": editTime(l.start)
+  of "End": editTime(l.stop)
+  of "Duration": editTime(max(0.0, l.stop - l.start))
+  of "Style": a.seDoc.style(l)
+  of "Actor": a.seDoc.actor(l)
+  else: l.text.replace("\n", SeBreak)
+
+proc seApplyCell(a: App, l: var SubLine, col, buf: string): bool =
+  ## buf typed in line l's cell col, into l. False when it doesn't read as
+  ## one (a time not finished yet).
+  case col
+  of "Start", "End", "Duration":
+    var t: float
+    try: t = parseTime(buf)
+    except ValueError: return false
+    if col == "Start":
+      l.start = t
+      if l.stop < t: l.stop = t
+    elif col == "End":
+      l.stop = t
+      if l.start > t: l.start = t
+    else: l.stop = l.start + t
+  of "Style": a.seDoc.setField(l, "Style", buf.strip)
+  of "Actor": a.seDoc.setField(l, (if a.seDoc.fieldIndex("Name") >= 0: "Name" else: "Actor"), buf.strip)
+  else: l.text = buf.replace(SeBreak, "\n")
+  true
+
+proc subEditorPanel(a: App, r: Rect) =
+  ## The subtitle editor, Aegisub's way: a search bar, the selected line's
+  ## times and text, and every line in a grid under them.
+  let ui = a.ui
+  a.seSelRect = Rect()  # set by the rows drawn below
+  ui.rect(r, colPanel)
+  ui.rect(rect(r.x, r.y, r.w, SeHeaderH), colPanelRaised)  # the header: lighter than the body
+  ui.rect(rect(r.x, r.y + r.h - 1, r.w, 1), colBorder)
+  # Dragging the bottom edge resizes the panel; the video frame takes the rest.
+  let grip = rect(r.x, r.y + r.h - SeGripH, r.w, SeGripH)
+  if ui.hover(grip) and ui.pressed():
+    ui.activeId = "seresize"
+    a.seResizeFrom = (ui.mouse.y, r.h)
+    ui.consumeClick()
+  if ui.activeId == "seresize":
+    let (y0, h0) = a.seResizeFrom
+    let below = (if a.fullscreen: 0'f32 else: a.menuBarHeight + a.bottomHeight +
+      (if a.cfg.showRunLog: a.runLogHeight else: 0)) + MinWindow.y.float32 / 2
+    a.cfg.subEditorHeight = clamp(h0 + ui.mouse.y - y0, SubEditorMinHeight,
+      max(SubEditorMinHeight, ui.size.y - below))
+  let ls = a.seDoc.lines
+  if a.seSel >= ls.len: a.seSel = ls.high
+  let sel = a.seSel
+  let has = sel in 0 ..< ls.len
+  let ass = a.seDoc.format == sfAss
+
+  # Header: what's edited; New, Open..., Save, Save As... and Close on the right.
+  let header = rect(r.x, r.y, r.w, SeHeaderH)
+  if ui.iconButton("se-close", rect(r.x + r.w - 30, header.y + 2, 24, 24), "close16", a.closeTip(kaSubEditor)):
+    a.setSubEditorShown(false)
+    return
+  var bx = r.x + r.w - 38
+  proc headerButton(id, label, tip: string, w = 64'f32, enabled = true): bool =
+    let b = rect(bx - w, header.y + 4, w, header.h - 8)
+    bx -= w + 6
+    ui.seButton(id, b, label, tip, enabled)
+  let saveKey = a.cfg.keyText(kaSave)
+  if headerButton("se-saveas", "Save As...", "Save the subtitles as another file (.srt, .ass, .vtt)", 74):
+    a.seSaveAs()
+  if headerButton("se-save", "Save", "Save the subtitles" & (if a.sePath.len > 0: " to " & a.sePath.extractFilename else: "") &
+      (if saveKey.len > 0: " (" & saveKey & ")" else: ""), 52, a.seDirty or a.sePath.len == 0 and ls.len > 0):
+    a.seSave()
+  if headerButton("se-open", "Open...", "Edit a subtitle file (shown over the video)", 64):
+    a.seConfirmDiscard("Open another file without saving them?", proc () =
+      a.ask(dkOpenFile, "subopen", "Edit Subtitles", exts = @SeTextExtensions, filterName = "Subtitles"))
+  if headerButton("se-new", "New", "Start new subtitles", 48):
+    a.seConfirmDiscard("Start new subtitles without saving them?", proc () = a.seNew())
+  # Tied to playback (lit): selecting a line seeks the video there.
+  let tied = a.cfg.subEditorSeek
+  if ui.iconButton("se-tie", rect(bx - 24, header.y + 2, 24, 24), "link16",
+      if tied: "Tied to playback: selecting a line goes there (click to untie)"
+      else: "Untied from playback: selecting a line leaves the video where it is (click to tie)",
+      toggled = tied):
+    a.setSubEditorSeek(not tied)
+  bx -= 30
+  ui.icon("subtitles16", vec2(r.x + 18, header.y + header.h / 2), colAccent)
+  let name = if a.seName.len > 0: a.seName else: "New subtitles"
+  let title = "Subtitle editor  —  " & name & "  (" & $a.seDoc.format & ", " &
+    (if ls.len == 1: "1 line" else: $ls.len & " lines") & ")"
+  let titleR = rect(r.x + 32, header.y, max(0'f32, bx - r.x - 32), header.h)
+  let shown = ui.ellipsize(title, titleR.w - (if a.seDirty: 70 else: 0))
+  ui.textIn(shown, titleR, colText)
+  if a.seDirty:
+    let tw = ui.textSize(shown).x
+    ui.textIn("modified", rect(titleR.x + tw + 10, header.y, 70, header.h), colWarning, FontSmall)
+  ui.rect(rect(r.x, header.y + header.h - 1, r.w, 1), colBorder)
+
+  # The search bar: matches tinted in the grid; Enter, F3 and the arrows step
+  # through them. Replace swaps them in the selected line, then goes on.
+  let bar = rect(r.x, header.y + header.h, r.w, SeFindH)
+  let hits = a.seHits
+  block:
+    let y = bar.y + 3
+    var x = bar.x + r.w - 8
+    proc rightButton(id, label, tip: string, w: float32, enabled = true): bool =
+      x -= w
+      result = ui.seButton(id, rect(x, y + 1, w, 22), label, tip, enabled)
+      x -= 4
+    let some = hits.len > 0
+    if rightButton("se-replall", "Replace All", "Replace every match", 80, some): a.seReplaceAll()
+    if rightButton("se-repl", "Replace", "Replace the matches in the selected line, then go to the next line with some (Enter in the Replace field)", 60, some):
+      a.seReplaceOne()
+    let fieldsW = max(0'f32, x - (bar.x + 26) - 24 * 2 - 30 - 4 - 8)
+    let findW = clamp(fieldsW * 0.55, 60, 340)
+    let replW = max(40'f32, fieldsW - findW - 8)
+    x -= replW
+    discard ui.textField("se-replace", rect(x, y, replW, 24), a.seReplace, "Replace with")
+    x -= 8
+    # Match case: Aa, lit while on.
+    x -= 30
+    let cb = rect(x, y, 30, 24)
+    if ui.seButton("se-case", cb, "", "Match case: " & (if a.cfg.subFindCase: "on" else: "off")):
+      a.cfg.subFindCase = not a.cfg.subFindCase
+    ui.textIn("Aa", cb, if a.cfg.subFindCase: colAccent else: colTextDim, FontSmall, h = CenterAlign)
+    if a.cfg.subFindCase: ui.border(cb, colAccent)
+    x -= 4
+    x -= 24
+    if ui.iconButton("se-find-next", rect(x, y, 24, 24), "chevdown16", "Next match (Enter, F3)", enabled = some):
+      a.seFindGo(1)
+    x -= 26
+    if ui.iconButton("se-find-prev", rect(x, y, 24, 24), "chevup16",
+        "Previous match (Shift+Enter, Shift+F3)", enabled = some):
+      a.seFindGo(-1)
+    let hitAt = hits.find(sel)
+    let count =
+      if a.seFind.len == 0: ""
+      elif not some: "No matches"
+      elif hitAt >= 0: &"{hitAt + 1} of {hits.len}"
+      else: &"{hits.len} found"
+    let countW = if count.len > 0: ui.textSize(count, FontSmall).x + 12 else: 0'f32
+    let fx = bar.x + 26
+    let field = rect(fx, y, max(40'f32, min(findW, x - 4 - countW - fx)), 24)
+    ui.icon("search16", vec2(bar.x + 14, bar.y + bar.h / 2), colTextDim)
+    let ev = ui.textField("se-find", field, a.seFind, "Find in subtitles")
+    if a.seFindKeep:  # Enter stepped: keep typing
+      a.seFindKeep = false
+      ui.focusId = "se-find"
+    if eeChanged in ev: a.seFindGo(0)
+    ui.textIn(count, rect(field.x + field.w, bar.y, countW, bar.h),
+      if some: colTextDim else: colError, FontSmall, h = CenterAlign)
+  ui.rect(rect(r.x, bar.y + bar.h - 1, r.w, 1), colBorder)
+
+  # The grid: a row per line, and where they're edited. A click selects a
+  # line and seeks there, a double-click edits the cell; the lines on screen
+  # now are marked.
+  let ls2 = a.seDoc.lines
+  let cols = block:
+    var c = @[("#", 46'f32, true), ("Start", 100'f32, false), ("End", 100'f32, false),
+              ("Duration", 92'f32, false), ("CPS", 44'f32, true)]
+    if ass:
+      c.add ("Style", 110'f32, false)
+      if ls2.anyIt(a.seDoc.actor(it).len > 0): c.add ("Actor", 90'f32, false)
+    c.add ("Text", 0'f32, false)
+    c
+  let gh = rect(r.x, bar.y + bar.h, r.w, SeGridHeaderH)
+  let list = rect(r.x, gh.y + gh.h, r.w, max(0'f32, r.y + r.h - SeGripH - gh.y - gh.h))
+  let rowH = SeRowH
+  let contentH = ls2.len.float32 * rowH
+  let maxScroll = max(0'f32, contentH - list.h)
+  let barW = if maxScroll > 0: RunLogBarW + 4 else: 0'f32
+  let rows = rect(list.x, list.y, list.w - barW, list.h)
+  ui.rect(list, colBackground)
+  ui.rect(gh, colPanel)
+  ui.rect(rect(gh.x, gh.y + gh.h - 1, gh.w, 1), colBorder)
+  block:
+    var x = gh.x + 6
+    for (name, w, right) in cols:
+      let cw = if w > 0: w else: max(0'f32, rows.x + rows.w - x - 6)
+      ui.textIn(name, rect(x + 4, gh.y, cw - 8, gh.h), colTextDim, FontSmall,
+        h = if right: RightAlign else: LeftAlign)
+      x += cw
+  if ls2.len == 0:
+    let subs = if a.player.loaded and a.sePath.len == 0 and a.seKey.endsWith("|none"):
+                 a.player.tracks.countIt(it.kind == "sub" and it.file != a.sePreview) else: 0
+    let msg =
+      if a.seNote.len > 0: a.seNote
+      elif subs > 0:
+        (if subs == 1: "The file has a subtitle track" else: &"The file has {subs} subtitle tracks") &
+          ": pick one in Play > Subtitle Track to edit it, or Insert to start new ones."
+      else: "No lines. Insert adds one at the video's time; Open... edits a subtitle file."
+    ui.textIn(msg, list, if a.seNote.len > 0 and a.seExtract == nil: colWarning else: colTextDim,
+      FontSmall, h = CenterAlign)
+    a.seRows = list
+    if ui.hover(list) and ui.released(MouseRight):
+      a.ctxMenu = cmSubEditor
+      a.menus.openContext(ui.mouse)
+    return
+  if ui.hover(list) and ui.scroll() != 0:
+    a.seScroll = clamp(a.seScroll + ui.wheelNotches * rowH * 3, 0, maxScroll)
+    ui.scrollConsumed = true
+  if a.seReveal and has:
+    a.seReveal = false
+    let y = sel.float32 * rowH
+    if y < a.seScroll: a.seScroll = y
+    elif y + rowH > a.seScroll + list.h: a.seScroll = y + rowH - list.h
+  # The scroll bar: drag the thumb, or click the track to jump there.
+  let track = rect(list.x + list.w - RunLogBarW - 2, list.y + 2, RunLogBarW, max(0'f32, list.h - 4))
+  if maxScroll > 0 and track.h > 0:
+    let thumbH = max(24'f32, track.h * list.h / contentH).min(track.h)
+    let span = track.h - thumbH
+    if ui.hover(track) and ui.pressed():
+      ui.consumeClick()
+      var thumb = rect(track.x, track.y + span * a.seScroll / maxScroll, track.w, thumbH)
+      if not ui.hover(thumb):
+        a.seScroll = clamp((ui.mouse.y - track.y - thumbH / 2) / span * maxScroll, 0, maxScroll)
+      ui.activeId = "sescroll"
+      a.seThumbFrom = (ui.mouse.y, a.seScroll)
+    if ui.activeId == "sescroll" and span > 0:
+      let (y0, s0) = a.seThumbFrom
+      a.seScroll = clamp(s0 + (ui.mouse.y - y0) / span * maxScroll, 0, maxScroll)
+    a.seScroll = clamp(a.seScroll, 0, maxScroll)
+    let thumb = rect(track.x, track.y + span * a.seScroll / maxScroll, track.w, thumbH)
+    ui.rect(track, colTrack)
+    ui.rect(thumb, if ui.activeId == "sescroll": colAccent
+      elif ui.hover(thumb): colTextDim else: colTextDisabled)
+  a.seScroll = clamp(a.seScroll, 0, maxScroll)
+  a.seRows = rows
+
+  let now = a.player.posNow - a.seDelay
+  var editDrawn = false
+  let editBefore = a.seEditLine  # not one a click starts below, drawn from the next frame on
+  ui.sk.pushClipRect(rows)
+  let first = max(0, int(a.seScroll / rowH))
+  let last = min(ls2.len, first + int(list.h / rowH) + 2) - 1
+  for i in first .. last:
+    let row = rect(rows.x, rows.y + i.float32 * rowH - a.seScroll, rows.w, rowH)
+    let l = ls2[i]
+    let hov = ui.hover(row) and ui.hover(rows)
+    if i == sel: ui.rect(row, colPressed)
+    elif hov: ui.rect(row, colHover)
+    elif hits.binarySearch(i) >= 0: ui.rect(row, colFindHit)
+    if i == sel: a.seSelRect = row  # where the context menu key opens its menu
+    if a.seFocused and ui.focusId.len == 0 and i == sel: ui.border(row, colAccent)  # where Up/Down go from
+    let onNow = a.player.loaded and not l.comment and now >= l.start and now < l.stop
+    if onNow: ui.rect(rect(row.x, row.y + 2, 3, rowH - 4), colAccent)
+    # Overlapping lines show together; in ASS that's normal unless they share a style.
+    let overlap = i > 0 and not l.comment and not ls2[i - 1].comment and l.start < ls2[i - 1].stop - 0.0005 and
+      (not ass or a.seDoc.style(l) == a.seDoc.style(ls2[i - 1]))
+    let dim = if l.comment: colTextDisabled else: colTextDim
+    var x = row.x + 6
+    var hovCol = ""
+    for (name, w, right) in cols:
+      let cw = if w > 0: w else: max(0'f32, row.x + row.w - x - 6)
+      let cell = rect(x + 4, row.y, cw - 8, rowH)
+      if hov and ui.mouse.x >= x and ui.mouse.x < x + cw: hovCol = name
+      if i == a.seEditLine and name == a.seEditCol:
+        # Being typed in: every change shows on the video as it's typed.
+        editDrawn = true
+        let ev = ui.textField("se-cell", rect(x + 1, row.y + 1, cw - 2, rowH - 2), a.seEditBuf,
+          shiftEnter = if name == "Text": SeBreak else: "")
+        if eeChanged in ev:
+          var nl = a.seDoc.lines[i]
+          if a.seApplyCell(nl, name, a.seEditBuf) and nl != a.seDoc.lines[i]:
+            if not a.seEditSnapped:
+              a.seSnap()
+              a.seEditSnapped = true
+            a.seDoc.lines[i] = nl
+            a.seChanged()
+        if eeCommitted in ev or ui.focusId != "se-cell" or a.seEditKey in ["up", "down"]:
+          let (key, col) = (a.seEditKey, a.seEditCol)
+          a.seEndEdit(cancel = key == "esc")
+          # Tab goes on to the next cell, the arrows to the line above or below.
+          if key in ["tab", "backtab"]:
+            let ed = cols.filterIt(it[0] in SeEditCols).mapIt(it[0])
+            let k = ed.find(col)
+            if k >= 0: a.seEditCell(i, ed[(k + (if key == "tab": 1 else: ed.len - 1)) mod ed.len])
+          elif key in ["up", "down"]:
+            let j = i + (if key == "down": 1 else: -1)
+            if j in 0 ..< a.seDoc.lines.len: a.seEditCell(j, col)
+        x += cw
+        continue
+      case name
+      of "#": ui.textIn($(i + 1), cell, if onNow: colAccent else: dim, FontSmall, h = RightAlign)
+      of "Start":
+        ui.textIn(editTime(l.start), cell, if overlap: colWarning else: dim, FontSmall)
+        if overlap: ui.tip(cell, "Starts before the line above ends")
+      of "End": ui.textIn(editTime(l.stop), cell,
+        if l.stop < l.start: colError else: dim, FontSmall)
+      of "Duration": ui.textIn(editTime(max(0.0, l.stop - l.start)), cell, dim, FontSmall)
+      of "CPS":
+        let c = a.seDoc.cps(l)
+        ui.textIn($int(round(c)), cell, if l.comment: colTextDisabled elif c >= 20: colError
+          elif c >= 15: colWarning else: colTextDim, FontSmall, h = RightAlign)
+      of "Style": ui.textIn(ui.ellipsize(a.seDoc.style(l), cell.w, FontSmall), cell, dim, FontSmall)
+      of "Actor": ui.textIn(ui.ellipsize(a.seDoc.actor(l), cell.w, FontSmall), cell, dim, FontSmall)
+      else:
+        let t = a.seDoc.plain(l.text).replace("\n", " " & SeBreak & " ")
+        ui.textIn(ui.ellipsize(t, cell.w, FontSmall), cell,
+          if l.comment: colTextDisabled else: colText, FontSmall)
+      x += cw
+    if hov and ui.pressed():
+      ui.consumeClick()
+      if ui.countClick("serow") >= 2 and i == sel:
+        a.seEditCell(i, if hovCol in SeEditCols: hovCol else: "Text")
+      else: a.seSelect(i)
+    if hov and ui.released(MouseRight):
+      if i != sel: a.seSelect(i, seek = false)
+      a.ctxMenu = cmSubEditor
+      a.menus.openContext(ui.mouse)
+  ui.sk.popClipRect()
+  # A cell being edited that went out of view (or away) keeps what was typed.
+  if editBefore >= 0 and a.seEditLine == editBefore and not editDrawn:
+    a.seEndEdit(cancel = false)
+    if ui.focusId == "se-cell": ui.focusId = ""
+  # Under the last row: the menu too.
+  if ui.hover(rows) and ui.released(MouseRight) and ui.mouse.y >= rows.y + contentH - a.seScroll:
+    a.ctxMenu = cmSubEditor
+    a.menus.openContext(ui.mouse)
+
 proc runLogPanel(a: App, r: Rect) =
   ## The Run menu's command lines and what they printed, newest at the bottom.
   let ui = a.ui
@@ -17014,8 +18332,8 @@ proc runLogPanel(a: App, r: Rect) =
     ui.consumeClick()
   if ui.activeId == "rlresize":
     let (y0, h0) = a.rlResizeFrom
-    let below = (if a.fullscreen: 0'f32 else: a.menuBarHeight + a.bottomHeight) +
-      MinWindow.y.float32 / 2
+    let below = (if a.fullscreen: 0'f32 else: a.menuBarHeight + a.bottomHeight +
+      (if a.cfg.showSubEditor: a.subEditorHeight else: 0)) + MinWindow.y.float32 / 2
     a.cfg.runLogHeight = clamp(h0 + ui.mouse.y - y0, RunLogMinHeight,
       max(RunLogMinHeight, ui.size.y - below))
 
@@ -17483,6 +18801,8 @@ proc renderOptions(a: App, shot: string) =
     a.ask(dkOpenDir, "optopendir", "Start Folder",
       if d.len > 0 and dirExists(d): d else: a.startDir)
   of prShowSettings: a.openFolder(configDir())
+  of prDesktopKeys:
+    if not a.globalKeys.configure(): a.osd("The desktop can't show its key settings")
   of prBrowseMkvpropedit:
     let f = findMkvpropedit(a.cfg.mkvpropedit)
     a.ask(dkOpenFile, "optmkvpe", "mkvpropedit", if f.len > 0: f.parentDir else: "",
@@ -18395,7 +19715,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Go to last frame", @[kaGoEnd], ""),
       ("Jump to 10% ... 90%", @SeekActions, "1 ... 9"),
       ("Next / previous chapter", @[kaNextChapter, kaPrevChapter], ""),
-      ("Next / previous file", @[kaNextFile, kaPrevFile], ""),
+      ("Next / previous file", @[kaNextFile, kaPrevFile],
+        "Page Down / Page Up, Media Next / Media Previous"),
       ("Add bookmark", @[kaAddBookmark], ""),
       ("Remove bookmark at current frame / selected playlist item", @[kaRemoveFromPlaylist], "")]),
     a.keyRows("Subtitles", [
@@ -18421,7 +19742,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Select previous / next entry", "Up / Down"),
       ("Play the selected entry", "Enter"),
       ("Properties (tags) of the selected entries", "Shift+Enter"),
-      ("Give the keys back to their commands (volume...)", "Esc"),
+      ("Jump to the entry whose name begins with what's typed", "Type"),
+      ("Side column: jump to the playlist typed", "Type"),
+      ("The selection's menu (side column: the playlist's)", "Menu"),
+      ("Give the keys back to their commands (letters, arrows...)", "Esc"),
       ("Select all entries", "Ctrl+A"),
       ("Duplicate selected entries", "Ctrl+D"),
       ("Move selected entries up / down", "Ctrl+Shift+Up / Down"),
@@ -18463,6 +19787,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Play the selected files in a new player", "Shift+Enter"),
       ("Select all files", "Ctrl+A"),
       ("Search the libraries", "Ctrl+F"),
+      ("Jump to the file whose name begins with what's typed", "Type"),
+      ("Libraries' column: jump to the library or folder typed", "Type"),
+      ("The selection's menu (libraries' column: the one picked)", "Menu"),
       ("Clear the search to the library or folder selected, then to All, then give the keys back", "Esc")]),
     ("Library search", @[
       ("Highlight the next / previous suggestion", "Down / Up"),
@@ -18477,7 +19804,16 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Change the selected folder or file", "F2 / Enter"),
       ("Add a folder / remove the selected one", "Insert / Delete"),
       ("Move it up / down", "Ctrl+Shift+Up / Down"),
-      ("Move it to the top / bottom", "Ctrl+Shift+Home / End")])]
+      ("Move it to the top / bottom", "Ctrl+Shift+Home / End")]),
+    ("Menus", @[
+      ("Context menu of the selection (else the video's)", "Menu"),
+      ("Context menu with the menu bar's menus", "Shift+Menu"),
+      ("Light the next / previous item", "Down / Up"),
+      ("Light the first / last item", "Home / End"),
+      ("Open a submenu / go back from it", "Right / Left"),
+      ("Menu bar: the next / previous menu", "Right / Left"),
+      ("Run the item lit", "Enter"),
+      ("Close the menu", "Esc / Menu")])]
   var view = a.keyRows("View", [
     ("Compact mode", @[kaCompact], ""),
     ("Seek bar", @[kaSeekBar], ""), ("Controls", @[kaControls], ""),
@@ -18486,6 +19822,7 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
     ("Cycle them in reverse", @[kaCycleBarsBack], ""), ("Playlist", @[kaPlaylist], ""),
     ("Find in playlist", @[kaFindPlaylist], ""),
     ("Library", @[kaLibrary], ""), ("Search library", @[kaSearchLibrary], ""),
+    ("Subtitle editor", @[kaSubEditor], ""),
     ("Run log", @[kaRunLog], ""), ("Show OSD", @[kaShowOsd], ""),
     ("Full screen", @[kaFullScreen], "")])
   view.rows.add ("Leave full screen / close dialog", "Esc")
@@ -18525,6 +19862,27 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("First / last field", "Ctrl+Home / Ctrl+End"),
       ("Clear the selected value", "Delete"),
       ("Copy / paste the selected value", "Ctrl+C / Ctrl+V")]),
+    ("Subtitle editor (after clicking it)", @[
+      ("Select the previous / next line (the video goes there)", "Up / Down"),
+      ("Select a page up / down, first / last line", "Page Up / Page Down, Home / End"),
+      ("Edit the selected line's text", "Enter / F2"),
+      ("Cell: keep what's typed / put it back", "Enter / Esc"),
+      ("Cell: line break in a text", "Shift+Enter"),
+      ("Cell: on to the next / previous cell", "Tab / Shift+Tab"),
+      ("Cell: on to the line above / below", "Up / Down"),
+      ("Insert a line at the video's time / after the selected one", "Insert / Shift+Insert"),
+      ("Delete the selected line", "Delete"),
+      ("Duplicate the selected line", "Ctrl+D"),
+      ("Split the selected line at the video's time", "Ctrl+K"),
+      ("Join the selected line with the next", "Ctrl+J"),
+      ("Start / end the selected line at the video's time", "[ / ]"),
+      ("Undo / redo (also while typing)", "Ctrl+Z / Ctrl+Y"),
+      ("Save / save as (also while typing)", "Ctrl+S / Ctrl+Shift+S"),
+      ("Search / replace", "Ctrl+F / Ctrl+H"),
+      ("Next / previous match", "Enter / Shift+Enter, F3 / Shift+F3"),
+      ("Previous / next match (typing in the search)", "Up / Down"),
+      ("Replace in the selected line, then go to the next", "Enter in Replace"),
+      ("Give the keys back to their commands", "Esc")]),
     ("Run window file list (after clicking it or Tab)", @[
       ("Select previous / next file, first / last file", "Up / Down, Home / End"),
       ("Extend the selection", "Shift+Up / Down / Home / End"),
@@ -18532,6 +19890,10 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move selected files up / down", "Ctrl+Shift+Up / Down"),
       ("Move selected files to top / bottom", "Ctrl+Shift+Home / End"),
       ("Remove selected files from the list", "Delete")]),
+    ("Options > Keys (after clicking the list)", @[
+      ("Give the selected command another key", "Enter / Space"),
+      ("Remove its keys", "Delete / Backspace"),
+      ("Make it global (works in other programs) or not", "G")]),
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click / Middle-click video"),
       ("Move window", "Drag video or empty controls bar"), ("Context menu", "Right-click"),
@@ -18569,6 +19931,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Library search: select all after within: / all", "Double / Triple-click search"),
       ("Step a timestamp field by one frame", "Wheel over it"),
       ("Select run log text / extend selection", "Drag / Shift+Click run log"),
+      ("Subtitle editor: select a line and go to it / edit a cell", "Click line / Double-click cell"),
+      ("Subtitle editor: line menu", "Right-click line"),
+      ("Resize the subtitle editor or run log", "Drag its bottom edge"),
       ("Add or remove a playlist entry from the selection", "Ctrl+Click playlist"),
       ("Select playlist entries up to the clicked one", "Shift+Click playlist"),
       ("Move the selected playlist entries", "Drag playlist entry"),
@@ -18718,11 +20083,14 @@ proc frame(a: App) =
   let W = ui.size.x
   let H = ui.size.y
   let plW = if a.sideShown: min(a.playlistWidth, W) else: 0
-  # The run log spans the window's width under the menu bar (in full screen,
-  # over the top of the video).
-  let rlH = if a.cfg.showRunLog: min(a.runLogHeight, max(0'f32, H - menuH - bottomH)) else: 0
-  let rlRect = rect(0, menuH, W, rlH)
-  let top = menuH + rlH
+  # The subtitle editor and the run log under it span the window's width
+  # under the menu bar (in full screen, over the top of the video).
+  let seH = if a.cfg.showSubEditor: min(a.subEditorHeight, max(0'f32, H - menuH - bottomH)) else: 0
+  let seRect = rect(0, menuH, W, seH)
+  let rlH = if a.cfg.showRunLog: min(a.runLogHeight, max(0'f32, H - menuH - seH - bottomH)) else: 0
+  let rlRect = rect(0, menuH + seH, W, rlH)
+  let topH = seH + rlH  ## the panels at the top, together
+  let top = menuH + topH
   let videoArea =
     if fs: rect(0, 0, W, H)
     else: rect(0, top, max(0'f32, W - plW), max(0'f32, H - top - bottomH))
@@ -18736,7 +20104,7 @@ proc frame(a: App) =
   # The column right of the video: the playlist, the library under it, or
   # either alone.
   let sideRect =
-    if fs: rect(W - plW, rlH, plW, (if bottomVisible: H - bottomH else: H) - rlH)
+    if fs: rect(W - plW, topH, plW, (if bottomVisible: H - bottomH else: H) - topH)
     else: rect(W - plW, top, plW, H - top - bottomH)
   let both = a.cfg.showPlaylist and a.cfg.showLibrary
   let libH =
@@ -18749,7 +20117,7 @@ proc frame(a: App) =
   a.plPanelRect = if a.cfg.showPlaylist and plW > 0: plRect else: Rect()
   # In full screen the run log, the side column and the bottom bars lie over the frame.
   a.videoClearRect =
-    if fs: rect(0, rlH, max(0'f32, W - plW), max(0'f32, (if bottomVisible: H - bottomH else: H) - rlH))
+    if fs: rect(0, topH, max(0'f32, W - plW), max(0'f32, (if bottomVisible: H - bottomH else: H) - topH))
     else: videoArea
   let sideOn = a.sideShown
 
@@ -18784,7 +20152,8 @@ proc frame(a: App) =
   let overVideo = ui.mouse.inside(videoArea) and
     not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
     not (sideOn and ui.mouse.inside(sideRect)) and
-    not (a.cfg.showRunLog and ui.mouse.inside(rlRect))
+    not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
+    not (a.cfg.showSubEditor and ui.mouse.inside(seRect))
   if a.rectEdit != nil:
     let err = a.rectBlocker
     if err.len > 0:
@@ -18806,7 +20175,8 @@ proc frame(a: App) =
   # Video-frame mouse handling: click = play/pause, drag = move window.
   if ui.hover(videoArea) and not (fs and bottomVisible and ui.mouse.y >= H - bottomH) and
      not (sideOn and ui.mouse.inside(sideRect)) and
-     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)):
+     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
+     not (a.cfg.showSubEditor and ui.mouse.inside(seRect)):
     if ui.pressed() and w.ctrl and a.chartShown and a.rectEdit == nil:
       a.chartPanDrag = true
       a.chartPanLast = ui.mouse
@@ -18907,6 +20277,7 @@ proc frame(a: App) =
     a.libFocused = a.cfg.showLibrary and ui.mouse.inside(libRect)
     a.libCatKeys = a.libFocused and ui.mouse.inside(a.libCatRect)
     if not a.libFocused or a.libCatKeys: a.libArrows = false
+    a.seFocused = a.cfg.showSubEditor and ui.mouse.inside(seRect)
   if a.cfg.showLibrary and libRect.h > 0: a.libraryPanel(libRect, both)
   else:
     a.libListRect = Rect()
@@ -18931,6 +20302,8 @@ proc frame(a: App) =
     ui.border(a.libListRect, colAccentDim)
   if a.libCatKeys and a.cfg.showLibrary and a.libCatRect.w > 0 and ui.focusId != "lib-search":
     ui.border(a.libCatRect, colAccentDim)
+  if a.cfg.showSubEditor and seH > 0: a.subEditorPanel(seRect)
+  else: a.seRows = Rect()
   if a.cfg.showRunLog: a.runLogPanel(rlRect)
   a.tkButton = Rect()
   a.seekGrip = Rect()
@@ -19001,6 +20374,7 @@ proc frame(a: App) =
   let hide = a.player.playing and a.player.hasVideo and
     ui.mouse.inside(videoArea) and not a.menus.isOpen and a.overlay == ovNone and
     not (a.cfg.showRunLog and ui.mouse.inside(rlRect)) and
+    not (a.cfg.showSubEditor and ui.mouse.inside(seRect)) and
     not (fs and bottomVisible) and now() - a.lastMouseMove > 1.0
   let resize = ui.activeId in ["plresize", "plwidth", "plside", "libcol", "libwidth"] or sideOn and
     (ui.hover(rect(sideRect.x, sideRect.y, PlaylistGripW, sideRect.h)) and not ui.hover(a.plRestoreRect) or
@@ -19011,8 +20385,9 @@ proc frame(a: App) =
   let libSplitHover = ui.activeId == "libsplit" or both and
     ui.hover(rect(libRect.x, libRect.y - 2, libRect.w, LibrarySplitGrip)) and
     a.overlay == ovNone and not a.menus.isOpen
-  let resizeV = ui.activeId in ["rlresize", "seekresize"] or
+  let resizeV = ui.activeId in ["rlresize", "seekresize", "seresize"] or
     (a.cfg.showRunLog and ui.hover(rect(0, rlRect.y + rlRect.h - RunLogGripH, W, RunLogGripH)) or
+     seH > 0 and ui.hover(rect(0, seRect.y + seRect.h - SeGripH, W, SeGripH)) or
      a.seekGrip.h > 0 and ui.hover(a.seekGrip) and not a.seekDragging) and
     a.overlay == ovNone and not a.menus.isOpen
   let overLog = ui.activeId == "rlselect" or a.cfg.showRunLog and a.runLog.len > 0 and
@@ -19229,6 +20604,7 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "playdump": stderr.writeLine "play paused=", a.player.paused, " stopped=", a.player.stopped,
     " fullscreen=", a.fullscreen, " t=", a.player.timePos.formatFloat(ffDecimal, 2)
   of "pldump": stderr.writeLine "playlist ", a.plIndex, " ", $a.playlist.mapIt(it.extractFilename)
+  of "gkdump": stderr.writeLine a.globalKeys.dump  # the global keys held, and how each fares
   of "plgroupdump":  # the playlist's groups as last drawn: text, first entry, count
     stderr.writeLine "plgroups ", $a.plGroups, " lines=", $a.plLines, " sel=", $a.plSelection
   of "m2cdump":  # tags as the playlist's columns, the Library, the title and media controls have them
@@ -19347,6 +20723,46 @@ proc runScriptStep(a: App, st: ScriptStep) =
   of "plautosave": a.setPlaylistAutosave(arg == "on")  # the playlist's Autosave checkbox
   of "plfiledump": stderr.writeLine "plfile ", a.plFile, " autosave=", a.playlistAutosaves,
     " writable=", a.plFileWritable, " online=", a.plOnline
+  of "sedump":  # the subtitle editor: its document, selection and working copy
+    stderr.writeLine "se lines=", a.seDoc.lines.len, " sel=", a.seSel, " dirty=", a.seDirty,
+      " fmt=", a.seDoc.format, " name=", a.seName, " path=", a.sePath, " preview=", a.sePreviewId,
+      " key=", a.seKey, " note=", a.seNote, " focused=", a.seFocused, " undo=", a.seUndo.len,
+      " shown=", a.cfg.showSubEditor, " tied=", a.cfg.subEditorSeek, " pos=", a.player.timePos
+    for i, l in a.seDoc.lines:
+      stderr.writeLine "se[", i, "] ", editTime(l.start), " ", editTime(l.stop),
+        (if l.comment: " comment" else: ""), " ", a.seDoc.style(l), " ", l.text.escape
+    for t in a.player.tracks:
+      if t.kind == "sub": stderr.writeLine "se track ", t.id, " sel=", t.selected, " ", t.title, " ", t.file
+  of "seaction":  # a subtitle editor command, as its menu or keys run it
+    case arg
+    of "insert": a.seInsert(true)
+    of "insertafter": a.seInsert(false)
+    of "dup": a.seDuplicate()
+    of "delete": a.seDelete()
+    of "split": a.seSplit()
+    of "join": a.seJoin()
+    of "start": a.seSetTime(false)
+    of "end": a.seSetTime(true)
+    of "sort": a.seSort()
+    of "undo": a.seUndoStep(false)
+    of "redo": a.seUndoStep(true)
+    of "save": a.seSave()
+    of "new": a.seNew()
+    of "reload": a.seLoadTrack()
+    of "replace": a.seReplaceOne()
+    of "replaceall": a.seReplaceAll()
+    of "findnext": a.seFindGo(1)
+    of "findprev": a.seFindGo(-1)
+    else: stderr.writeLine "script: unknown seaction ", arg
+  of "sefind": a.seFind = arg
+  of "sereplace": a.seReplace = arg
+  of "sesel": a.seSelect(parseInt(arg))
+  of "setie": a.setSubEditorSeek(arg == "on")  # its header's link button
+  of "setext":  # the selected line's text, \n for a line break
+    if a.seSel in 0 ..< a.seDoc.lines.len:
+      a.seSnap()
+      a.seDoc.lines[a.seSel].text = arg.replace("\\n", "\n")
+      a.seChanged()
   of "panelsdump":  # which panel has the keyboard (Tab, Escape), its cursor, the volume
     stderr.writeLine "panels pl=", a.plFocused, "/", a.plArrows, " lib=", a.libFocused, "/",
       a.libArrows, " plsel=", a.plSelected, " libcur=", a.libCursorRow, " playing=", a.plIndex, " vol=", a.player.volume,
@@ -19764,7 +21180,8 @@ proc crashState(a: App): string =
   ## keys of the frame that crashed and the control taking them.
   if a.player != nil: result.add "File: " & a.player.path & "\n"
   result.add "Shown: overlay " & $a.overlay & ", playlist " & $a.cfg.showPlaylist &
-    ", library " & $a.cfg.showLibrary & ", run log " & $a.cfg.showRunLog & "\n"
+    ", library " & $a.cfg.showLibrary & ", subtitle editor " & $a.cfg.showSubEditor &
+    ", run log " & $a.cfg.showRunLog & "\n"
   if a.menus != nil and a.menus.isOpen: result.add "A menu was open (context menu " & $a.ctxMenu & ")\n"
   let ui = a.keyUi
   if ui != nil:
@@ -19878,6 +21295,7 @@ proc main() =
   a.window.icon = appIcon()
   a.window.initMainWindow()
   a.media = newMediaControls(a.window)
+  a.globalKeys = newGlobalKeys(a.window)
   if c.compactMode: a.window.setDecorated(false)
   when defined(windows): setDialogOwner(a.window.getHWND)
   else:
@@ -20192,9 +21610,11 @@ proc main() =
           a.inputPending = true
           a.dirtyUntil = max(a.dirtyUntil, now() + 0.1)
     a.pollLibrary()
+    a.pollSubEditor()
     a.applyOnTop()
     a.applyKeepAwake()
     a.syncMediaControls()
+    a.syncGlobalKeys()
     a.updateAspectHints()
     a.autosave()
 
@@ -20235,7 +21655,10 @@ proc main() =
       enableRunes()
       stepping = false)
 
-  while not a.window.closeRequested:
+  while true:
+    # Unsaved subtitles: asked about first.
+    if a.window.closeRequested and a.seQuitBlocked(): a.window.closeRequested = false
+    if a.window.closeRequested: break
     enableRunes()
     polling = true
     pollAt = now()
@@ -20272,6 +21695,7 @@ proc main() =
   if a.upRestart or a.rdRestart.len > 0: a.saveResume()
   a.instance.close()
   a.peers.close()
+  a.globalKeys.close()
   for c in a.children: c.close()
   if a.avs != nil: a.avs.close()
   if a.preview != nil:

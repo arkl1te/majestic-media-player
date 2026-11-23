@@ -174,6 +174,21 @@ it held, to commit.
 - Menus are override-redirect X11 popup windows (no frame, taskbar entry or
   focus, like a toolkit's menus), so they can extend past the main window.
   They are drawn with the main window's GL context and the same Silky atlas.
+  They take no keyboard focus, so `handleKeys` hands them the keys first (`menuNavKeys` →
+  `MenuSystem.pressKey`, acted on in the next `updatePopups` against the tree built that frame):
+  Up/Down/Home/End light a row of the last popup open (`keyRow`, by `rows`' index; separators,
+  column headings and disabled rows skipped, round the end), Right or Enter opens a submenu, Left
+  closes it, Enter runs the row; in a menu bar menu Right/Left on a plain row go to the menu beside.
+  While the keyboard leads (`keyLed`) the pointer's row isn't lit, hovering opens no submenu and the
+  bar doesn't follow the pointer; moving the pointer over 3 px or clicking gives it back. A key
+  pressed while the pointer leads starts from the pointer's row in the last popup.
+  The context menu key (Menu; `menuKey`, unless a command has it) opens the menu a right-click on
+  what has the keyboard opens: the subtitle editor's, the playlists' side column's (the playlist
+  shown), the playlist's, the libraries' column's (the one picked) or the Library's files', under
+  the selected row (`plSelRect`, `libCursorRect`, `libPickedRect`, `seSelRect`: set while drawing,
+  empty out of view, then the list's top); else the video's (Shift: `cmVideoShift`) at the pointer
+  over the video, else its middle. `openContext(keyboard = true)` lights the first row; Menu again
+  closes it.
 - The command palette (F3, Help > Command Palette; `paletteOverlay` and its neighbours) searches
   one menu tree, `paletteRoot`, rebuilt every frame like the menus (about 0.4 ms), so checkmarks
   and dynamic lists are always current. The tree holds the menu bar's menus; the right-click
@@ -300,6 +315,18 @@ it held, to commit.
   and exclude: tags follow); anywhere else in the Library F2 does nothing, not even Rename Playlist. The
   holder shows a `colAccentDim` edge round its list or column, drawn after both panels, and a
   `colAccent` outline on the row the arrows move from. `panelsdump` (MMP_SCRIPT) prints the state.
+  Typing there jumps to a name (`typeAhead`, after the panels' own keys): while `typingStop` names a
+  list or column shown (the arrows' holder, else the entries or files of the panel clicked last), keys
+  of `TypingKeys` without a modifier, and Space once typing has begun, add their runes (from
+  `typedPending`, control characters dropped; a rune with no button pressed counts too, one with a
+  numpad key doesn't) to `typeText`, lowercase, started over after `TypePause` (1 s) or another
+  place. `typeJump` matches the start of the name shown (`rowName`, the playlist's name, the
+  column's label, `displayName`): one letter from the row after the selected one, more from the
+  selected one on, round the end; a letter repeated that nothing begins with goes on through the
+  names beginning with it. Those keys and the arrows without a modifier then never reach their
+  commands, until Escape (`focusPanel(psNone)`, which also empties `typeText`); Shift with a key
+  bound to a command runs it, else types. Arrows a list has no use for (Left/Right) do nothing; with
+  only the panel clicked, the keys first give its list the arrows (`focusPanel`).
 - The playlist panel's bottom line (`drawStatus` in `playlistPanel`), across the panel under the
   rows and the side column, the body's `colPanel` (not the header's `colPanelRaised`), as tall as
   the Library's (`LibraryStatusH`): the selected entries and their total length (`plSelectionLine`,
@@ -447,6 +474,24 @@ it held, to commit.
   `DesktopEntry`. On Windows it's
   `ITaskbarList3` thumbnail toolbar buttons. `MediaState` follows the Controls
   bar's buttons, read four times a second; commands run from the main loop.
+- Media keys (Play, Stop, Previous, Next, the volume keys) are ordinary keys in
+  `keymap`: patches/windy.patch maps the XF86 keysyms and Windows' `VK_MEDIA_*` /
+  `VK_VOLUME_*` to buttons. A focused window only gets them when the desktop
+  doesn't take them first; Plasma's Media Controller does, and sends them over
+  MPRIS instead.
+- `src/globalkeys.nim` holds the keys of the commands marked Global in Options ▸
+  Keys while other programs have the keyboard, applied when Options closes. One
+  running player holds them (a lock next to the instance socket; the others
+  retry every 2 s). Wayland: the portal's GlobalShortcuts (after
+  `host.portal.Registry.Register`, so the desktop knows the app). KDE keeps the
+  key the user confirmed for a shortcut id and ignores the one asked for later,
+  so each key is its own shortcut, `play-pause:ctrl+alt+p`; a changed key is a
+  new id the desktop asks about once, and ids left out of a bind are dropped.
+  A declined one comes back with no trigger; ConfigureShortcuts (Desktop
+  keys...) opens the desktop's settings, and ShortcutsChanged reports them.
+  X11: `XGrabKey` on the root window through a display connection of its own
+  (BadAccess: another program has the key). Windows: `RegisterHotKey`, with
+  WM_HOTKEY through the main window's message hook.
 - The UI font is IBM Plex Sans (SIL Open Font License), embedded in the binary; the tracker
   chart's cells use IBM Plex Mono (same license).
 - The UI atlas is prebuilt with Latin and basic Cyrillic only. Any other character (kana, kanji,
@@ -1201,10 +1246,11 @@ it held, to commit.
 | `src/options.nim` | Options window (page tree and pages) |
 | `src/assoc*.nim` | File associations (XDG mimeapps.list / Windows registry) |
 | `src/appimage.nim` | Running as an AppImage: its file, for restarts and updates, and its launcher entry |
-| `src/portal.nim` | xdg-desktop-portal requests over libdbus (color picker, file dialog fallback) |
+| `src/portal.nim` | xdg-desktop-portal requests over libdbus (color picker, file dialog fallback, global keys) |
 | `src/instance.nim`, `src/peers.nim`, `src/ipc.nim` | Single-instance hand-over, Synchronize links, local sockets |
 | `src/syncdlg.nim` | Synchronize ▸ Properties window (masters, slaves, offset, looping) |
 | `src/mediactl*.nim` | Task bar media controls (MPRIS / Windows thumbnail toolbar) |
+| `src/globalkeys.nim` | Global keys (portal GlobalShortcuts / XGrabKey / RegisterHotKey) |
 | `src/ui.nim` | Widget helpers on top of Silky's drawing primitives |
 | `src/crashlog.nim` | Writes Nim's report of an unhandled exception or fatal signal to `crash.log`, with the app's state |
 | `src/glyphcache.nim`, `src/fallbackfonts.nim`, `src/emojifont.nim` | Characters the UI atlas lacks, rasterized on demand from Plex or a system font chosen per language; color emoji from CBDT or COLR fonts |

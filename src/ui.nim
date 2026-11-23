@@ -761,13 +761,14 @@ proc afterScope(text: string, chips: ChipRule): int =
 
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
                 placeholder = "", framed = true, lead = 0'f32,
-                chips: ChipRule = nil): set[EditEvent] =
+                chips: ChipRule = nil, shiftEnter = ""): set[EditEvent] =
   ## Single-line text input. Focusing it (click or Tab) selects all of its
   ## text; Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
   ## Dragging or Shift+click/arrows select, a double-click selects a word and
   ## a triple-click everything; Ctrl+arrows move by words, Ctrl+A/C/X/V work
   ## on the selection. Without framed the caller draws its ground; lead
-  ## leaves room left of the text (for an icon).
+  ## leaves room left of the text (for an icon). With shiftEnter,
+  ## Shift+Enter types it (a line break's symbol) instead of ending editing.
   ##
   ## With chips, the comma-separated parts it names tags are drawn as chips
   ## once a comma ends them (unfocused, the last one too), the comma and
@@ -925,8 +926,14 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     if move >= 0:
       ui.caret = move
       if not shift: ui.selAnchor = move
-    if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or
-       w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
+    let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+    if enter and shift and shiftEnter.len > 0:
+      if ui.caret != ui.selAnchor: deleteSelection(text)
+      text.insert(shiftEnter, ui.caret)
+      ui.caret += shiftEnter.len
+      ui.selAnchor = ui.caret
+      result.incl eeChanged
+    elif enter or w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
       ui.focusId = ""
       result.incl eeCommitted
   if framed:

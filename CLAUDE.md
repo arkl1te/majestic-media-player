@@ -26,7 +26,8 @@
         * (Ctrl+2 cycles through every show/hide combination of Seek Bar, Controls and Status; Ctrl+Shift+2 goes in reverse)
         * Playlist (Ctrl+3)
         * Library (Ctrl+4)
-        * Run Log (Ctrl+5)
+        * Subtitle Editor (Ctrl+5)
+        * Run Log (Ctrl+6)
         * (separator)
         * Show OSD
         * Full Screen
