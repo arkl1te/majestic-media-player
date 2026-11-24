@@ -924,8 +924,8 @@ type
     videoPress: bool
     videoPressPos: Vec2
     videoClickAt: float       ## when a click on the video last played or paused it (a double-click's first click), 0: none
-    ctlPress: bool            ## left button went down on the controls bar's empty part
-    ctlPressPos: Vec2
+    movePress: bool           ## left button went down on an empty part that moves the window (dragWindowFrom)
+    movePressPos: Vec2
     rotDrag: bool             ## Alt+Middle drag is turning the frame
     rotPivot: Vec2            ## window pixels the frame turns around
     rotStart: VideoTransform  ## transform when the drag began
@@ -1047,7 +1047,7 @@ type
     media: MediaControls      # the task bar's play/pause, previous and next
     mediaPollAt, mediaStateAt: float  # when to look at each next, see syncMediaControls
     globalKeys: GlobalKeys    # commands' keys that work while other programs have the keyboard
-    heldKeys: (Table[string, string], seq[string])  # cfg.keys and cfg.globalKeys as globalKeys holds them
+    heldKeys: seq[AddedKey]   # cfg.addedKeys as globalKeys holds them
     title: string
     hintsKey: string
     fitPending: bool
@@ -1384,9 +1384,10 @@ proc flexPanel(a: App) =
   ## Each frame: a change in the window's width Majestic didn't ask for goes
   ## to the side column or the video frame. Dragging the window's right edge
   ## (its left edge staying put), to the side column; its left edge, to the
-  ## video frame (edgeFlexedPanel). Any other (maximizing, tiling), to
-  ## whichever is wider (flexedPanel). Maximized, the side column's width is
-  ## kept apart (maxPanelW), so the config keeps the normal window's.
+  ## video frame (edgeFlexedPanel); with Shift held, the other way around.
+  ## Any other (maximizing, tiling), to whichever is wider (flexedPanel).
+  ## Maximized, the side column's width is kept apart (maxPanelW), so the
+  ## config keeps the normal window's.
   if a.fullscreen or a.window.minimized: return
   let w = a.window.size.x
   if w <= 0: return
@@ -1416,7 +1417,10 @@ proc flexPanel(a: App) =
       let p =
         if a.window.maximized or t - a.unmaxAt < 0.5 or leftStays == rightStays:
           flexedPanel(a.panelW, oldW, newW)
-        else: edgeFlexedPanel(a.panelW, oldW, newW, rightEdge = leftStays)
+        else:
+          # Shift swaps the edges' roles: the right edge's drag goes to the
+          # video frame, the left edge's to the side column.
+          edgeFlexedPanel(a.panelW, oldW, newW, rightEdge = leftStays xor shiftHeld())
       if a.maxPanelW > 0: a.maxPanelW = p
       else:
         (a.flexFrom, a.flexAt, a.flexFromW) = (a.cfg.playlistWidth, t, oldW)
@@ -3534,8 +3538,8 @@ proc syncGlobalKeys(a: App) =
   ## Options' live edits wait for OK, so the desktop doesn't ask about each
   ## tick (KDE asks to confirm every new global key).
   let g = a.globalKeys
-  if a.overlay != ovOptions and (a.cfg.keys, a.cfg.globalKeys) != a.heldKeys:
-    a.heldKeys = (a.cfg.keys, a.cfg.globalKeys)
+  if a.overlay != ovOptions and a.cfg.addedKeys != a.heldKeys:
+    a.heldKeys = a.cfg.addedKeys
     g.setKeys(a.cfg.wantedKeys)
   for id in g.poll():
     let (ok, act) = actionOf(id)
@@ -8220,7 +8224,7 @@ proc closeOptions(a: App, ok: bool) =
   if a.optMenus != nil: a.optMenus.close()
   if ok:
     a.cfg.save(ownKeys = a.cfg.keys != a.cfgBefore.keys or
-      a.cfg.globalKeys != a.cfgBefore.globalKeys)
+      a.cfg.addedKeys != a.cfgBefore.addedKeys)
     a.rendererChanged(a.cfgBefore.renderMode)
     # Another folder for links: its own index, the current one left as is.
     let dir = a.cfg.webDir.expandPath
@@ -8294,7 +8298,8 @@ proc ensureOptionsWindow(a: App) =
   a.optionsDlg.globalInfo = proc (act: KeyAction, k: KeyCombo): tuple[known: bool,
       state: GlobalKeyState, trigger: string] =
     # Only as held: a key changed in Options is "from OK on".
-    if a.heldKeys[1].contains($act): a.globalKeys.state(globalId(act, k))
+    if a.heldKeys.anyIt(it.global and it.action == $act and parseCombo(it.key) == k):
+      a.globalKeys.state(globalId(act, k))
     else: (false, gkWaiting, "")
 
 proc showDialog(a: App, w: Window, size: IVec2, minSize = ivec2(0, 0)) =
@@ -13289,8 +13294,10 @@ proc libraryKeys(a: App): bool  # below
 
 const
   TypingKeys = {Key0 .. KeyZ, KeyBacktick, KeyMinus, KeyEqual, KeyLeftBracket, KeyRightBracket,
-                KeyBackslash, KeySemicolon, KeyApostrophe, KeyComma, KeyPeriod, KeySlash}
-    ## The keys that type into typeAhead (Space too, once it has begun)
+                KeyBackslash, KeySemicolon, KeyApostrophe, KeyComma, KeyPeriod, KeySlash,
+                Numpad0 .. Numpad9}
+    ## The keys that type into typeAhead (Space too, once it has begun);
+    ## the numpad's digits type while Num Lock is on, else do nothing
   TypePause = 1.0  ## seconds without typing after which typing starts over
 
 proc typeJump(a: App, stop: PanelStop) =
@@ -15214,6 +15221,20 @@ proc controlsTier(a: App, w: float32): int =
     full -= need[i]
     inc result
 
+proc dragWindowFrom(a: App, area: Rect) =
+  ## A press in area (an empty part of the window, not taken by something
+  ## drawn before) that moves more than 4 pixels moves the window, as on the
+  ## video frame; a click alone does nothing. Not in full screen.
+  let ui = a.ui
+  if not a.fullscreen and area.w > 0 and area.h > 0 and ui.hover(area) and ui.pressed():
+    a.movePress = true
+    a.movePressPos = ui.mouse
+  if a.movePress:
+    if not ui.down() or a.fullscreen: a.movePress = false
+    elif (ui.mouse - a.movePressPos).length > 4:
+      a.movePress = false
+      a.window.startWindowDrag()
+
 proc controls(a: App, r: Rect) =
   ## The playback buttons and the volume. A narrow bar drops buttons in
   ## the order controlsTier gives; past that, the volume clips at the right.
@@ -15359,15 +15380,7 @@ proc controls(a: App, r: Rect) =
   ui.sk.popClipRect()
   # The empty stretch between the buttons and the volume moves the window
   # when dragged, like the video frame (not in full screen).
-  let gap = rect(x + 2, r.y, shieldX - 2 - (x + 2), r.h)
-  if not a.fullscreen and gap.w > 0 and ui.hover(gap) and ui.pressed():
-    a.ctlPress = true
-    a.ctlPressPos = ui.mouse
-  if a.ctlPress:
-    if not ui.down() or a.fullscreen: a.ctlPress = false
-    elif (ui.mouse - a.ctlPressPos).length > 4:
-      a.ctlPress = false
-      a.window.startWindowDrag()
+  a.dragWindowFrom(rect(x + 2, r.y, shieldX - 2 - (x + 2), r.h))
 
 type KeyHint = tuple[key, label: string]
 
@@ -15502,6 +15515,7 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
     if a.cfg.showLibrary and a.libRows.len > 0: mouse.add ("LMB", "Select Library Range")
     if a.cfg.showLibrary: mouse.add ("LMB", "Toggle Library Folder With Subfolders")
     if plShown and a.tabs.len > 1: mouse.add ("Drag", "Move Entries To A Tab")
+    if a.sideShown: mouse.add ("Drag", "Window Edge: Swap Video / Playlist Sizing")
   # Mouse shortcuts lead the bar, before any key group.
   if mouse.len > 0: result.insert(mouse, 0)
 
@@ -16611,8 +16625,10 @@ proc playlistPanel(a: App, r: Rect) =
   a.plSelRect = Rect()  # set by the rows drawn below
   # The Playlist Manager (the playlists' side column) collapsed: a border
   # thicker by a pixel, lit while hovered, with an arrow in its middle that
-  # restores it, as does a double-click on the edge or the header.
+  # restores it. A double-click on the edge or the header collapses or
+  # restores it.
   let collapsed = a.sideCollapsed and not a.playlistLocked
+  let foldable = a.cfg.playlistTabsSide and not a.playlistLocked
   let border = if collapsed: 2'f32 else: 1'f32
   let grip = rect(r.x, r.y, PlaylistGripW, r.h)
   a.plRestoreRect = if collapsed: rect(r.x + border, round(r.y + r.h / 2 - 18), 12, 36) else: Rect()
@@ -16627,9 +16643,9 @@ proc playlistPanel(a: App, r: Rect) =
   if onRestore and ui.pressed():  # the arrow, drawn over the rows by restoreArrow
     ui.pressId = "pl-restore"
     ui.consumeClick()
-  if collapsed and ui.hover(grip) and not onRestore and a.window.buttonPressed[DoubleClick]:
+  if foldable and ui.hover(grip) and not onRestore and a.window.buttonPressed[DoubleClick]:
     ui.consumeClick()  # on the press or, on X11, its release
-    a.setSideCollapsed(false)
+    a.setSideCollapsed(not collapsed)
   # Dragging the left edge resizes the panel; the video frame takes the rest.
   if ui.hover(grip) and not onRestore and ui.pressed():
     ui.activeId = "plresize"
@@ -16666,10 +16682,10 @@ proc playlistPanel(a: App, r: Rect) =
   let closeR = rect(r.x + r.w - 30, header.y + 3, 24, 24)
   if ui.iconButton("pl-close", closeR, "close16", a.closeTip(kaPlaylist)):
     a.setPlaylistShown(false)
-  if collapsed and ui.hover(header) and not ui.hover(grip) and not ui.hover(closeR) and
+  if foldable and ui.hover(header) and not ui.hover(grip) and not ui.hover(closeR) and
       not ui.hover(rect(asPos.x, asPos.y, asW, 22)) and a.window.buttonPressed[DoubleClick]:
     ui.consumeClick()
-    a.setSideCollapsed(false)
+    a.setSideCollapsed(not collapsed)
   ui.rect(rect(r.x + border, header.y + 29, r.w - border, 1), colBorder)
   if a.playlistLocked:
     a.plListRect = Rect()
@@ -16854,6 +16870,7 @@ proc playlistPanel(a: App, r: Rect) =
     if ui.activeId == "plrow" and a.plRowFrom.moved and a.shownId != a.rowDragTab:
       ui.border(list, colAccent)
       if ui.released() and ui.hover(list): a.dropRows(0)
+    a.dragWindowFrom(list)  # like the video frame: dragged, it moves the window
     drawStatus()
     return
   if ui.activeId == "plscroll":  # the drag wins over playback moving on
@@ -16984,6 +17001,9 @@ proc playlistPanel(a: App, r: Rect) =
         if order != toSeq(0 ..< n): a.reorderPlaylist(order)
       elif a.plRowFrom.reselect: a.selectOnly(a.plRowFrom.index)
   ui.sk.popClipRect()
+  # Below the last row, the list is like the video frame: dragged, it moves the window.
+  let rowsEnd = max(rows.y, rows.y + a.plLineCount.float32 * rowH - a.plScroll)
+  a.dragWindowFrom(rect(rows.x, rowsEnd, rows.w, rows.y + rows.h - rowsEnd))
   if ui.activeId == "plscroll":
     # Which rows the thumb has reached, beside it.
     let seen = a.plVisible(first, first + int(list.h / rowH) - 1)
@@ -19891,12 +19911,14 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Move selected files to top / bottom", "Ctrl+Shift+Home / End"),
       ("Remove selected files from the list", "Delete")]),
     ("Options > Keys (after clicking the list)", @[
-      ("Give the selected command another key", "Enter / Space"),
-      ("Remove its keys", "Delete / Backspace"),
-      ("Make it global (works in other programs) or not", "G")]),
+      ("Add a key of your own (it can be global)", "Insert"),
+      ("Press a new key for the selected row", "Enter / Space"),
+      ("Remove its key", "Delete / Backspace"),
+      ("Added key: pick another command", "F2"),
+      ("Added key: make it global (works in other programs) or not", "G")]),
     ("Mouse", @[
       ("Play / Pause", "Click video"), ("Full screen", "Double-click / Middle-click video"),
-      ("Move window", "Drag video or empty controls bar"), ("Context menu", "Right-click"),
+      ("Move window", "Drag video, empty controls bar or empty playlist area"), ("Context menu", "Right-click"),
       ("Context menu with the menu bar's menus", "Shift+Right-click video"),
       ("Move playlist or library column", "Drag column header"),
       ("Resize playlist or library column", "Drag column edge"),
@@ -19907,6 +19929,8 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("Expand / collapse a library or folder in the libraries' column", "Click its arrow / Double-click it"),
       ("Expand / collapse it with its subfolders", "Shift+Click its arrow / Shift+Double-click it"),
       ("Resize window (compact mode)", "Drag window edge"),
+      ("Resize window: right edge sizes the playlist, left edge the video", "Drag window side edge"),
+      ("Resize window: right edge sizes the video, left edge the playlist", "Shift+Drag window side edge"),
       ("Quick cover (music, video track off)", "Drop picture on video"),
       ("Run window file list: select several / a range", "Ctrl+Click / Shift+Click"),
       ("Run window file list: move the selected files", "Drag them"),
@@ -19950,8 +19974,9 @@ proc shortcutColumns(a: App): array[2, seq[ShortcutGroup]] =
       ("New playlist", "Double-click beside tabs"),
       ("Next / previous playlist", "Wheel over tabs"),
       ("Keyboard to the playlists' or libraries' column", "Click the column"),
-      ("Collapse the Playlist Manager (playlists' side column)", "Drag its right edge far left"),
-      ("Restore the Playlist Manager", "Click edge arrow / Double-click playlist header or left edge"),
+      ("Collapse / restore the Playlist Manager (playlists' side column)", "Double-click playlist header or left edge"),
+      ("Collapse the Playlist Manager", "Drag its right edge far left"),
+      ("Restore the Playlist Manager", "Click edge arrow"),
       ("Play a library file", "Double-click library file"),
       ("Add library files to the playlist there", "Drag library file onto playlist"),
       ("Add library files to a playlist / a new one", "Drag library file onto tab / +"),
@@ -20795,7 +20820,9 @@ proc runScriptStep(a: App, st: ScriptStep) =
           a.optionsDlg.assignKeys(a.cfg, act, if k.key == ButtonUnknown: @[] else: @[k])
         else: a.optionsDlg.startCapture(a.optUi, act)
   of "optok": a.closeOptions(true)  # the Options window's OK button
-  of "keysdump": stderr.writeLine "keys ", $a.cfg.keys
+  of "keysdump": stderr.writeLine "keys ", $a.cfg.keys, " added ", $a.cfg.addedKeys
+  of "optaddkey":  # id combo [global]: a key added in Options > Keys, as Add, picking and pressing make it
+    a.cfg.addedKeys.add AddedKey(action: st.args[0], key: st.args[1], global: st.args.len > 2)
   of "key":  # combo: runs the command bound to it, as pressing it would
     let k = parseCombo(arg)
     for act in KeyAction:
@@ -21266,11 +21293,15 @@ proc main() =
   # whole seconds when KWin withholds frame callbacks (hidden/occluded window),
   # freezing UI and video. The compositor presents our buffers tear-free, mpv
   # paces video frames, and UI-only redraws are rate-capped in the main loop.
+  # The run log always starts closed. A window saved with it open was taller
+  # by its height: that comes off, so the video keeps its size.
+  let logH = if a.cfg.showRunLog: int32(round(a.runLogHeight * a.uiScale)) else: 0'i32
+  a.cfg.showRunLog = false
   let c = a.cfg
   let minSize = if c.compactMode: MinCompactWindow else: MinWindow
   let startSize =
     if c.rememberWindowSize and c.windowW >= minSize.x and c.windowH >= minSize.y:
-      ivec2(c.windowW.int32, c.windowH.int32)
+      ivec2(c.windowW.int32, max(minSize.y, c.windowH.int32 - logH))
     else: ivec2(1024, 640)
   # Ties the window to majestic-media-player.desktop (taskbar icon, audio
   # stream matching), whatever the binary is called.
@@ -21311,7 +21342,7 @@ proc main() =
       a.window.moveFrame(p)
   if resumed:
     if rs.windowW >= minSize.x and rs.windowH >= minSize.y:
-      let size = ivec2(rs.windowW.int32, rs.windowH.int32)
+      let size = ivec2(rs.windowW.int32, max(minSize.y, rs.windowH.int32 - logH))
       # Maximized next, which the side column takes as a resize, as it did.
       if rs.maximized: a.window.setClientSize(size) else: a.ownResize(size)
       a.window.moveFrame(ivec2(rs.windowX.int32, rs.windowY.int32))

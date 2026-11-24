@@ -69,6 +69,13 @@ type
     scaleX*: float = 1
     scaleY*: float = 1
 
+  AddedKey* = object
+    ## Options > Keys: a key the user added (Add) to a command, besides the
+    ## command's own keys. Only these can be global.
+    action*: string                # command id, "" until one is picked
+    key*: string                   # "Ctrl+Alt+P", "" until one is pressed
+    global*: bool                  # works while other programs have the keyboard
+
   Config* = object
     recentFiles*: seq[string]
     recentTitles*: Table[string, string]  # its links' titles
@@ -176,7 +183,7 @@ type
     ytdlp*: string = ""            # "" = found automatically (ytdlp.findYtdlp)
     # Options > Player > Keys
     keys*: Table[string, string]   # command id -> "Home|0" ("" = none); only changed keys
-    globalKeys*: seq[string]       # command ids whose keys work while other programs have the keyboard
+    addedKeys*: seq[AddedKey]      # keys added with Add, in their order
     # Options > Playback
     keepDisplayOn*: bool = true    # inhibit screen blanking while video plays
     rateStep*: float = 0.25
@@ -433,13 +440,13 @@ proc loadConfig*(): Config =
       result.avsStarRatings[id] = clamp(int(round(fifths * 4 / 5)), 1, 20)
   result.avsRatings.clear()
 
-proc readKeys(keys: var Table[string, string], global: var seq[string]): bool =
-  ## The file's keys and which are global; false, leaving them as they are,
+proc readKeys(keys: var Table[string, string], added: var seq[AddedKey]): bool =
+  ## The file's keys and the keys added; false, leaving them as they are,
   ## when it can't be read.
   try:
     let file = readFile(configPath()).fromJson(Config)
     keys = file.keys
-    global = file.globalKeys
+    added = file.addedKeys
     dropOldKeys(keys)
     true
   except CatchableError:
@@ -451,7 +458,7 @@ proc save*(c: Config, ownKeys = false) =
   ## the old keys mustn't undo that.
   let path = configPath()
   var c = c
-  if not ownKeys: discard readKeys(c.keys, c.globalKeys)
+  if not ownKeys: discard readKeys(c.keys, c.addedKeys)
   try:
     createDir(path.parentDir)
     writeAtomic(path, c.toJson)
@@ -465,7 +472,7 @@ proc reloadKeys*(c: var Config) =
   let t = try: getLastModificationTime(configPath()) except OSError: Time()
   if t != keysStamp:
     keysStamp = t
-    discard readKeys(c.keys, c.globalKeys)
+    discard readKeys(c.keys, c.addedKeys)
 
 # --- Open Recent, shared by every running player -----------------------------
 # Kept apart from the config, which each player saves whole (the last one to

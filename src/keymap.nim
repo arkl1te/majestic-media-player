@@ -355,8 +355,27 @@ proc parseCombos*(s: string): seq[KeyCombo] =
 
 proc defaults*(a: KeyAction): seq[KeyCombo] = parseCombos(Actions[a].default)
 
-proc combos*(c: Config, a: KeyAction): seq[KeyCombo] =
+proc findAction*(id: string): tuple[ok: bool, action: KeyAction] =
+  ## The command whose id is id.
+  for a in KeyAction:
+    if $a == id: return (true, a)
+
+proc builtinCombos*(c: Config, a: KeyAction): seq[KeyCombo] =
+  ## The command's own keys (its defaults, or as changed), not those added.
   parseCombos(c.keys.getOrDefault($a, Actions[a].default))
+
+proc addedCombos*(c: Config, a: KeyAction): seq[KeyCombo] =
+  ## The keys added to the command (Options > Keys > Add).
+  for x in c.addedKeys:
+    if x.action == $a:
+      let k = parseCombo(x.key)
+      if k.key != ButtonUnknown and k notin result: result.add k
+
+proc combos*(c: Config, a: KeyAction): seq[KeyCombo] =
+  ## Every key of the command: its own, then those added.
+  result = c.builtinCombos(a)
+  for k in c.addedCombos(a):
+    if k notin result: result.add k
 
 proc keyText*(c: Config, a: KeyAction): string =
   ## The action's first key as menus show it, "" when it has none.
@@ -368,27 +387,19 @@ proc keysText*(c: Config, a: KeyAction, sep = " / "): string =
   c.combos(a).mapIt($it).join(sep)
 
 proc isDefault*(c: Config, a: KeyAction): bool =
-  c.combos(a) == a.defaults
+  c.builtinCombos(a) == a.defaults
 
 proc setCombos*(c: var Config, a: KeyAction, ks: seq[KeyCombo]) =
-  ## Stores only what differs from the defaults.
+  ## The command's own keys. Stores only what differs from the defaults.
   if ks == a.defaults: c.keys.del($a)
   else: c.keys[$a] = ks.mapIt($it).join("|")
 
 proc setCombo*(c: var Config, a: KeyAction, k: KeyCombo) =
-  ## Makes k the action's only key (none for an empty combo).
+  ## Makes k the action's only own key (none for an empty combo).
   c.setCombos(a, if k.key == ButtonUnknown: @[] else: @[k])
 
 proc removeCombo*(c: var Config, a: KeyAction, k: KeyCombo) =
-  c.setCombos(a, c.combos(a).filterIt(it != k))
-
-proc isGlobal*(c: Config, a: KeyAction): bool = $a in c.globalKeys
-
-proc setGlobal*(c: var Config, a: KeyAction, on: bool) =
-  ## Global keys work while another program has the keyboard (Options >
-  ## Player > Keys); none is by default.
-  if on and not c.isGlobal(a): c.globalKeys.add $a
-  elif not on: c.globalKeys.keepItIf(it != $a)
+  c.setCombos(a, c.builtinCombos(a).filterIt(it != k))
 
 proc actionsUsing*(c: Config, k: KeyCombo): seq[KeyAction] =
   if k.key == ButtonUnknown: return
@@ -403,6 +414,11 @@ proc keyClashes*(c: Config): set[KeyAction] =
       for (other, b) in seen:
         if other == k: result.incl {a, b}
       seen.add (k, a)
+
+proc addedClash*(c: Config, i: int): bool =
+  ## Added key i is another command's key too.
+  let x = c.addedKeys[i]
+  c.actionsUsing(parseCombo(x.key)).anyIt($it != x.action) and findAction(x.action).ok
 
 proc heldMods*(w: Window): set[KeyMod] =
   if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]: result.incl kmCtrl
@@ -508,8 +524,7 @@ proc matchesSearch*(c: Config, a: KeyAction, search: string): bool =
   ## Every word of search begins a word of the command's name, group or
   ## keys; or one of its synonyms begins a word of the name.
   let label = Actions[a].label.toLowerAscii
-  var hay = label & " " & ($Actions[a].group).toLowerAscii & " " & c.keysText(a).toLowerAscii
-  if c.isGlobal(a): hay.add " global"
+  let hay = label & " " & ($Actions[a].group).toLowerAscii & " " & c.keysText(a).toLowerAscii
   for word in strutils.splitWhitespace(search.toLowerAscii):
     if not hay.hasWordStart(word) and not word.alternatives.anyIt(label.hasWordStart(it)):
       return false

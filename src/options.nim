@@ -70,12 +70,20 @@ type
     request*: PathRequest       ## Paths page button pressed; the caller clears it
     keySearch: string
     keyScroll: float32
-    keySel: KeyAction           ## Keys page: selected command
-    capturing: bool             ## Keys page: waiting for the selected command's new key
-    capSlot: int                ## which of its keys that replaces; -1 adds one
+    keySel: KeyAction           ## Keys page: selected command (when selAdded < 0)
+    selAdded: int = -1          ## the added key selected (cfg.addedKeys' index), -1 for a command
+    capturing: bool             ## Keys page: waiting for the selected row's new key
+    capSlot: int                ## which of the command's keys that replaces; -1 adds one
+    capAfter: int = -1          ## the added key to wait for a key for, from the next frame
     keyTaken: bool              ## a key went to the capture this frame
     keyNote: string             ## Keys page: outcome of the last change
     noteFor: KeyAction          ## the command keyNote is about; shown while it's selected
+    noteAdded: int = -1         ## or the added key it's about
+    cmdEdit: int = -1           ## the added key whose command is being picked (typed in its cell)
+    cmdQuery: string            ## what's typed there
+    cmdHi: int                  ## the command lit in the list under it
+    cmdTop: int                 ## the list's first row shown
+    cmdAt: Rect                 ## the cell, where the list hangs
     keyReveal: bool             ## scroll the selected command into view
     web*: WebInfo               ## Media Cache page; the caller refreshes it
     webPicked*: seq[string]     ## Media Cache page: links checked in the list
@@ -155,6 +163,8 @@ proc opened*(d: OptionsDialog, ui: Ui) =
   d.status = ""
   d.keyNote = ""
   d.capturing = false
+  d.cmdEdit = -1
+  d.capAfter = -1
   d.confirmClear = false
   d.picker = ""
   d.fontOpen = false
@@ -170,6 +180,8 @@ proc selectPage*(d: OptionsDialog, ui: Ui, p: OptionsPage) =
   if p == d.page: return
   d.page = p
   d.capturing = false
+  d.cmdEdit = -1
+  d.capAfter = -1
   d.confirmClear = false
   d.fontOpen = false
   ui.focusId = ""
@@ -207,7 +219,7 @@ proc pageChanged(p: OptionsPage, c, before: Config): bool =
   of opFormats: false  # associations apply at once
   of opPaths: differs(mkvpropedit) or differs(openDir) or differs(screenshotDir) or
     differs(screenshotNoAsk) or differs(ytdlp)
-  of opKeys: differs(keys)
+  of opKeys: differs(keys) or differs(addedKeys)
   of opPlayback: differs(audioLangs) or differs(bookmarksAsChapters) or
     differs(keepDisplayOn) or differs(rateStep) or differs(seekPreview) or
     differs(sampleStep) or differs(seekStep) or differs(snapWithShift) or differs(subLangs) or differs(volumeStep)
@@ -706,14 +718,29 @@ proc pathsPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane) =
     p.y += Row + 4
   ui.hint(p, "Settings, remembered positions, bookmarks and Run commands are kept here.")
 
-const KeyCapture = "o-keycap"     ## focusId while waiting for a key
+const
+  KeyCapture = "o-keycap"     ## focusId while waiting for a key
+  CmdFocus = "o-keycmd"       ## focusId while an added key's command is typed in its cell
+  CmdRowH = 22'f32            ## a row of the command list under that cell
+  CmdRows = 12                ## rows the list shows at once
 
 proc startCapture*(d: OptionsDialog, ui: Ui, act: KeyAction, slot = -1) =
+  ## Waits for a new key for the command, in place of its key number slot
+  ## (-1: as another one).
   d.keySel = act
+  d.selAdded = -1
   d.capturing = true
   d.capSlot = slot
   d.keyReveal = true
   ui.focusId = KeyCapture       # the window's own keys (Esc, Enter, Tab) stand back
+  ui.navId = "o-keys-list"
+
+proc startAddedCapture(d: OptionsDialog, ui: Ui, i: int) =
+  ## Waits for added key i's key.
+  d.selAdded = i
+  d.capturing = true
+  d.keyReveal = true
+  ui.focusId = KeyCapture
   ui.navId = "o-keys-list"
 
 proc stopCapture(d: OptionsDialog, ui: Ui) =
@@ -721,20 +748,27 @@ proc stopCapture(d: OptionsDialog, ui: Ui) =
   if ui.focusId == KeyCapture: ui.focusId = ""
 
 proc assignKeys*(d: OptionsDialog, c: var Config, act: KeyAction, ks: seq[KeyCombo]) =
-  ## Gives act the keys ks. A key another command has stays there too: OK
-  ## waits for one of them to give it up.
+  ## Gives act the keys ks as its own. A key another command has stays there
+  ## too: OK waits for one of them to give it up.
   c.setCombos(act, ks)
   d.noteFor = act
+  d.noteAdded = -1
+  let own = c.builtinCombos(act)
   d.keyNote =
-    if ks.len == 0: Actions[act].label & ": no key"
-    else: Actions[act].label & ": " & c.keysText(act)
+    if own.len == 0: Actions[act].label & ": no key"
+    else: Actions[act].label & ": " & own.mapIt($it).join(" / ")
 
-proc addKey(d: OptionsDialog, c: var Config, act: KeyAction, k: KeyCombo, slot = -1) =
-  ## k as another key of act, or in place of its key number slot.
-  var ks = c.combos(act)
+proc setKey(d: OptionsDialog, c: var Config, act: KeyAction, k: KeyCombo, slot = -1) =
+  ## k in place of act's own key number slot, else as another one.
+  var ks = c.builtinCombos(act)
   if slot in 0 .. ks.high: ks[slot] = k
   else: ks.add k
   d.assignKeys(c, act, ks.deduplicate)
+
+proc addedLabel(c: Config, i: int): string =
+  ## Added key i's command, as the list names it.
+  let (ok, act) = findAction(c.addedKeys[i].action)
+  if ok: Actions[act].label else: "No command"
 
 proc sameKeys(desktop: string, k: KeyCombo): bool =
   ## The desktop's name for a key (Qt's "Ctrl+Num+5" on KDE) is k's, in any
@@ -744,43 +778,182 @@ proc sameKeys(desktop: string, k: KeyCombo): bool =
     result.sort()
   parts(desktop) == parts($k)
 
-proc globalStatus(d: OptionsDialog, c: Config, act: KeyAction): tuple[warn: bool, text: string] =
-  ## How a global command's keys fare, for the note and the tip; the one
-  ## doing worst speaks for them all.
-  if not c.isGlobal(act): return
-  let keys = c.combos(act)
-  if keys.len == 0: return (false, "Global once it has a key.")
-  var rank = -1
-  for k in keys:
-    let info = if d.globalInfo != nil: d.globalInfo(act, k) else: (false, gkWaiting, "")
-    let (r, warn, text) =
-      if not info.known:
-        (1, false, "Global from OK on: works while other programs have the keyboard.")
-      else:
-        case info.state
-        of gkActive:
-          if info.trigger.len > 0 and not sameKeys(info.trigger, k):
-            (2, false, "Global: the desktop gave " & $k & " the key " & info.trigger & " instead.")
-          else: (0, false, "Global: works while other programs have the keyboard.")
-        of gkWaiting: (3, false, "Global: waiting for the desktop to confirm " & $k & ".")
-        of gkOtherPlayer: (4, false, "Global: another running player has the global keys.")
-        of gkUnsupported: (5, true, "Global: " & $k & " can't be global on this desktop.")
-        of gkTaken: (6, true, "Global: another program has " & $k & ".")
-        of gkDeclined:
-          (6, true, "Global: the desktop gave " & $k & " no key" &
-            (if d.canConfigureGlobal: "; Desktop keys... sets one." else: "."))
-    if r > rank:
-      rank = r
-      result = (warn, text)
+proc globalStatus(d: OptionsDialog, c: Config, i: int): tuple[warn: bool, text: string] =
+  ## How added key i fares as a global key, for the note and the tip.
+  let x = c.addedKeys[i]
+  if not x.global: return
+  let (ok, act) = findAction(x.action)
+  let k = parseCombo(x.key)
+  if not ok or k.key == ButtonUnknown: return (false, "Global once it has a command and a key.")
+  let info = if d.globalInfo != nil: d.globalInfo(act, k) else: (false, gkWaiting, "")
+  if not info.known: return (false, "Global from OK on: works while other programs have the keyboard.")
+  case info.state
+  of gkActive:
+    if info.trigger.len > 0 and not sameKeys(info.trigger, k):
+      (false, "Global: the desktop gave it the key " & info.trigger & " instead.")
+    else: (false, "Global: works while other programs have the keyboard.")
+  of gkWaiting: (false, "Global: waiting for the desktop to confirm " & $k & ".")
+  of gkOtherPlayer: (false, "Global: another running player has the global keys.")
+  of gkUnsupported: (true, "Global: " & $k & " can't be global on this desktop.")
+  of gkTaken: (true, "Global: another program has " & $k & ".")
+  of gkDeclined:
+    (true, "Global: the desktop gave " & $k & " no key" &
+      (if d.canConfigureGlobal: "; Desktop keys... sets one." else: "."))
 
-proc toggleGlobal(d: OptionsDialog, c: var Config, act: KeyAction) =
-  c.setGlobal(act, not c.isGlobal(act))
-  d.keySel = act
-  d.noteFor = act
+proc toggleGlobal(d: OptionsDialog, c: var Config, i: int) =
+  c.addedKeys[i].global = not c.addedKeys[i].global
+  d.selAdded = i
+  d.noteAdded = i
+  let x = c.addedKeys[i]
   d.keyNote =
-    if not c.isGlobal(act): Actions[act].label & ": no longer global"
-    elif c.combos(act).len == 0: Actions[act].label & ": global once it has a key"
-    else: Actions[act].label & ": global from OK on"
+    if not x.global: c.addedLabel(i) & ": works only in the player"
+    elif not findAction(x.action).ok or parseCombo(x.key).key == ButtonUnknown:
+      c.addedLabel(i) & ": global once it has a command and a key"
+    else: c.addedLabel(i) & ": global from OK on"
+
+proc removeAdded(d: OptionsDialog, c: var Config, i: int) =
+  ## Added key i goes; the one after it (else before it) is selected.
+  c.addedKeys.delete(i)
+  d.keyNote = ""
+  d.noteAdded = -1
+  d.selAdded = if c.addedKeys.len == 0: -1 else: min(i, c.addedKeys.high)
+  d.keyReveal = true
+
+proc addedMatches(d: OptionsDialog, c: Config, i: int): bool =
+  ## Added key i is found by the list's search: its command, group, key, or
+  ## the words added and global.
+  let x = c.addedKeys[i]
+  let (ok, act) = findAction(x.action)
+  let hay = ("added " & (if ok: Actions[act].label & " " & $Actions[act].group else: "") &
+    " " & x.key & (if x.global: " global" else: "")).toLowerAscii
+  strutils.splitWhitespace(d.keySearch.toLowerAscii).allIt(it in hay)
+
+proc cmdMatches(d: OptionsDialog, c: Config): seq[KeyAction] =
+  ## The commands what's typed in the cell finds, best first; with nothing
+  ## typed every one, in the list's order.
+  let q = d.cmdQuery.strip
+  if q.len == 0:
+    for g in KeyGroup:
+      for a in KeyAction:
+        if Actions[a].group == g: result.add a
+    return
+  var scored: seq[(int, int, KeyAction)]
+  for a in KeyAction:
+    let sc = searchScore(Actions[a].label, $Actions[a].group & " " & c.keysText(a), q)
+    if sc >= 0: scored.add (-sc, scored.len, a)
+  scored.sort()
+  result = scored.mapIt(it[2])
+
+proc showCmdHi(d: OptionsDialog, n: int) =
+  ## Scrolls the command list so its lit row is in it.
+  if d.cmdHi >= 0:
+    if d.cmdHi < d.cmdTop: d.cmdTop = d.cmdHi
+    elif d.cmdHi >= d.cmdTop + CmdRows: d.cmdTop = d.cmdHi - CmdRows + 1
+  d.cmdTop = clamp(d.cmdTop, 0, max(0, n - CmdRows))
+
+proc cmdListRect(d: OptionsDialog, ui: Ui, n: int): Rect =
+  ## Under the cell, or over it when the window ends first.
+  let h = max(1, min(n, CmdRows)).float32 * CmdRowH + 2
+  let a = d.cmdAt
+  let y = if a.y + a.h + 2 + h <= ui.size.y - 4: a.y + a.h + 2 else: max(4'f32, a.y - 2 - h)
+  rect(a.x, y, max(a.w, 320'f32), h)
+
+proc openCmd(d: OptionsDialog, ui: Ui, c: Config, i: int) =
+  ## Starts picking added key i's command: typed in its cell, from the list
+  ## under it, which starts at its command (or the one selected before).
+  d.stopCapture(ui)
+  d.cmdEdit = i
+  d.selAdded = i
+  d.cmdQuery = ""
+  let m = d.cmdMatches(c)
+  let (ok, act) = findAction(c.addedKeys[i].action)
+  d.cmdHi = max(0, m.find(if ok: act else: d.keySel))
+  d.cmdTop = d.cmdHi - CmdRows div 2
+  d.showCmdHi(m.len)
+  ui.focusId = CmdFocus
+  ui.navId = "o-keys-list"
+  d.keyReveal = true
+
+proc endCmd(d: OptionsDialog, ui: Ui) =
+  ## Stops picking the command, keeping the one it had.
+  d.cmdEdit = -1
+  if ui.focusId == CmdFocus: ui.focusId = ""
+
+proc pickCmd(d: OptionsDialog, ui: Ui, c: var Config, act: KeyAction) =
+  ## The command picked for the added key; then its key, unless it has one.
+  let i = d.cmdEdit
+  d.endCmd(ui)
+  if i notin 0 ..< c.addedKeys.len: return
+  c.addedKeys[i].action = $act
+  d.noteAdded = i
+  d.keyNote = Actions[act].label & (if c.addedKeys[i].key.len > 0: ": " & c.addedKeys[i].key else: "")
+  if parseCombo(c.addedKeys[i].key).key == ButtonUnknown: d.capAfter = i
+
+proc addRow(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## Add: an empty added key, its command picked first, then its key.
+  if d.cmdEdit >= 0: d.endCmd(ui)
+  c.addedKeys.add AddedKey()
+  d.keySearch = ""              # so that it shows
+  d.openCmd(ui, c, c.addedKeys.high)
+
+proc cmdInput(d: OptionsDialog, ui: Ui, c: var Config) =
+  ## Before anything else is drawn: the command list under an added key's
+  ## cell takes the mouse over it and the arrows (Enter, Tab and Esc are the
+  ## cell's: keysPage).
+  if d.cmdEdit < 0 or d.page != opKeys or d.find.len > 0: return
+  let w = ui.window
+  let m = d.cmdMatches(c)
+  let r = d.cmdListRect(ui, m.len)
+  let mouse = ui.mouse
+  if mouse.inside(r):
+    if ui.scroll() != 0:
+      d.cmdTop += (if ui.scroll() < 0: -3 else: 3)
+      d.cmdTop = clamp(d.cmdTop, 0, max(0, m.len - CmdRows))
+      ui.scrollConsumed = true
+    if w.buttonPressed[MouseLeft]:
+      let i = d.cmdTop + int((mouse.y - r.y - 1) / CmdRowH)
+      if i in 0 ..< m.len: d.pickCmd(ui, c, m[i])
+    ui.captured = true          # nothing under the list reacts
+  if m.len == 0: return
+  if w.buttonPressed[KeyDown]: d.cmdHi = min(d.cmdHi + 1, m.high)
+  elif w.buttonPressed[KeyUp]: d.cmdHi = max(d.cmdHi - 1, 0)
+  elif w.buttonPressed[KeyPageDown]: d.cmdHi = min(d.cmdHi + CmdRows, m.high)
+  elif w.buttonPressed[KeyPageUp]: d.cmdHi = max(d.cmdHi - CmdRows, 0)
+  else: return
+  d.showCmdHi(m.len)
+
+proc drawCmds(d: OptionsDialog, ui: Ui, c: Config) =
+  if d.cmdEdit < 0 or d.page != opKeys or d.find.len > 0: return
+  let m = d.cmdMatches(c)
+  let r = d.cmdListRect(ui, m.len)
+  ui.sk.pushLayer(PopupsLayer)
+  defer: ui.sk.popLayer()
+  ui.rect(rect(r.x + 3, r.y + 3, r.w, r.h), rgbx(0, 0, 0, 90))  # shadow
+  ui.rect(r, colPopup)
+  ui.border(r, colBorder)
+  ui.sk.pushClipRect(r)
+  defer: ui.sk.popClipRect()
+  if m.len == 0:
+    ui.textIn("No matching commands", rect(r.x + 8, r.y + 1, r.w - 16, CmdRowH), colTextDim)
+    return
+  let mouse = ui.mouse
+  for row in 0 ..< min(CmdRows, m.len - d.cmdTop):
+    let i = d.cmdTop + row
+    let rr = rect(r.x + 1, r.y + 1 + row.float32 * CmdRowH, r.w - 2, CmdRowH)
+    let hi = i == d.cmdHi
+    if hi: ui.rect(rr, colAccent)
+    elif mouse.inside(rr): ui.rect(rr, colHover)
+    # Its group on the right, dim.
+    let g = $Actions[m[i]].group
+    let gw = ui.textSize(g, FontSmall).x
+    ui.textIn(g, rect(rr.x + rr.w - gw - 14, rr.y, gw + 4, rr.h),
+      if hi: colOnAccent else: colTextDim, FontSmall)
+    ui.textIn(ui.ellipsize(Actions[m[i]].label, rr.w - gw - 36),
+      rect(rr.x + 8, rr.y, rr.w - gw - 28, rr.h), if hi: colOnAccent else: colText)
+  if m.len > CmdRows:
+    let th = max(16'f32, r.h * CmdRows / m.len.float32)
+    let ty = r.y + (r.h - th) * (d.cmdTop.float32 / float32(m.len - CmdRows))
+    ui.rect(rect(r.x + r.w - 5, ty, 3, th), colTrack)
 
 proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
   ## Keys while searching: the matching commands under their groups; a click
@@ -794,14 +967,26 @@ proc keysResults(d: OptionsDialog, ui: Ui, c: Config, p: var Pane) =
          ui.resultRow(p, Actions[act].label, if key.len > 0: key else: "None", 190):
         d.keySearch = ""
         d.keySel = act
+        d.selAdded = -1
         d.keyReveal = true
 
 proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: float32) =
+  ## The commands' own keys under their groups, and over them the keys added
+  ## with Add: a command picked in the row's cell, a key pressed in it, and
+  ## whether it's global. Only added keys can be global.
   let w = ui.window
   d.keyTaken = false
+  # Another player's keys may have come in meanwhile (reloadKeys).
+  if d.selAdded >= c.addedKeys.len: d.selAdded = -1
+  if d.cmdEdit >= c.addedKeys.len: d.endCmd(ui)
+  if d.capAfter >= c.addedKeys.len: d.capAfter = -1
+  # An added key left with neither command nor key (Add, then Esc) goes.
+  if d.cmdEdit < 0 and not d.capturing and d.capAfter < 0:
+    for i in countdown(c.addedKeys.high, 0):
+      if c.addedKeys[i] == AddedKey(): d.removeAdded(c, i)
   let wasCapturing = d.capturing
   if d.capturing:
-    # The next key pressed, with the modifiers held, goes to the command.
+    # The next key pressed, with the modifiers held, goes to the row.
     # Escape or a click cancels.
     let key = w.pressedKey
     if w.buttonPressed[KeyEscape] or w.buttonPressed[MouseLeft] or
@@ -809,32 +994,49 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
       d.stopCapture(ui)
       d.keyTaken = w.buttonPressed[KeyEscape]
     elif key != ButtonUnknown:
-      d.addKey(c, d.keySel, KeyCombo(mods: w.heldMods, key: key), d.capSlot)
+      let k = KeyCombo(mods: w.heldMods, key: key)
+      if d.selAdded >= 0:
+        let i = d.selAdded
+        c.addedKeys[i].key = $k
+        d.noteAdded = i
+        d.keyNote = c.addedLabel(i) & ": " & $k
+      else: d.setKey(c, d.keySel, k, d.capSlot)
       d.stopCapture(ui)
       d.keyTaken = true
+  # A command just picked from the list: its key next (here, so that the
+  # click that picked it doesn't cancel that).
+  if d.capAfter >= 0:
+    d.startAddedCapture(ui, d.capAfter)
+    d.capAfter = -1
 
   ui.group(p, "Keyboard shortcuts")
   discard ui.textField("o-keysearch", rect(p.x + 8, p.y, p.w - 8, 26), d.keySearch,
     "Search commands or keys")
   p.y += 34
 
-  # Rows: a header per group, then its commands matching the search.
-  type KeyRow = tuple[header: bool, group: KeyGroup, act: KeyAction]
-  var rows: seq[KeyRow]
-  var acts: seq[int]            # indexes of the command rows
-  for g in KeyGroup:
-    var first = true
-    for act in KeyAction:
-      let info = Actions[act]
-      if info.group != g: continue
-      if not c.matchesSearch(act, d.keySearch): continue
-      if first:
-        rows.add (true, g, act)
-        first = false
-      acts.add rows.len
-      rows.add (false, g, act)
+  # Rows: the added keys under their header, then a header per group and
+  # its commands, those matching the search.
+  type
+    RowKind = enum rkHeader, rkAddedHeader, rkCmd, rkAdded
+    KeyRow = tuple[kind: RowKind, group: KeyGroup, act: KeyAction, i: int]
+  proc buildRows(d: OptionsDialog, c: Config): tuple[rows: seq[KeyRow], sels: seq[int]] =
+    ## The rows, and the indexes of those that can be selected.
+    for i in 0 ..< c.addedKeys.len:
+      if i != d.cmdEdit and not d.addedMatches(c, i): continue
+      if result.rows.len == 0: result.rows.add (rkAddedHeader, KeyGroup.low, KeyAction.low, -1)
+      result.sels.add result.rows.len
+      result.rows.add (rkAdded, KeyGroup.low, KeyAction.low, i)
+    for g in KeyGroup:
+      var first = true
+      for act in KeyAction:
+        if Actions[act].group != g or not c.matchesSearch(act, d.keySearch): continue
+        if first:
+          result.rows.add (rkHeader, g, act, -1)
+          first = false
+        result.sels.add result.rows.len
+        result.rows.add (rkCmd, g, act, -1)
+  var (rows, sels) = d.buildRows(c)
 
-  let clashes = c.keyClashes
   let footer = 8'f32 + 34 + 18  # buttons and the status line below the list
   let list = rect(p.x + 8, p.y, p.w - 8, max(120'f32, bottom - p.y - footer))
   ui.rect(list, colBackground)
@@ -842,22 +1044,43 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   const rowH = 24'f32
   const keyW = 220'f32
   const globalW = 48'f32        # the Global column, left of the keys
-  let inner = rect(list.x + 1, list.y + 1, list.w - 2, list.h - 2)
-  let maxScroll = max(0'f32, rows.len.float32 * rowH - inner.h)
+  const headH = 22'f32          # the column names, over the rows
+  # The column names: the command, Global (added keys only), the key.
+  block:
+    let h = rect(list.x + 1, list.y + 1, list.w - 2, headH)
+    ui.rect(h, colPanel)
+    ui.rect(rect(h.x, h.y + h.h - 1, h.w, 1), colBorder)
+    ui.textIn("Command", rect(h.x + 20, h.y, h.w - keyW - 28 - globalW, h.h), colTextDim, FontSmall)
+    let gr = rect(h.x + h.w - keyW - 6 - globalW, h.y, globalW, h.h)
+    ui.textIn("Global", gr, colTextDim, FontSmall, h = CenterAlign)
+    if ui.hover(gr): ui.tip(gr, "Added keys can be global: working while other programs have the keyboard")
+    ui.textIn("Key", rect(h.x + h.w - keyW - 6 + 8, h.y, keyW - 16, h.h), colTextDim, FontSmall)
+  let inner = rect(list.x + 1, list.y + 1 + headH, list.w - 2, list.h - 2 - headH)
   let listFocused = ui.tabStop("o-keys-list", list)
-  var cur = -1                  # position of the selected command in acts
-  for n, i in acts:
-    if rows[i].act == d.keySel: cur = n
+  proc isSel(d: OptionsDialog, row: KeyRow): bool =
+    (row.kind == rkAdded and row.i == d.selAdded) or
+      (row.kind == rkCmd and d.selAdded < 0 and row.act == d.keySel)
+  proc selected(d: OptionsDialog, rows: seq[KeyRow], sels: seq[int]): int =
+    ## The selected row's position in sels, -1 for none shown.
+    result = -1
+    for n, ri in sels:
+      if d.isSel(rows[ri]): return n
+  var cur = d.selected(rows, sels)
+  proc select(d: OptionsDialog, row: KeyRow) =
+    if row.kind == rkAdded: d.selAdded = row.i
+    else:
+      d.selAdded = -1
+      d.keySel = row.act
   proc reveal(d: OptionsDialog, i: int) =
     let top = i.float32 * rowH
     if top < d.keyScroll: d.keyScroll = top
     if top + rowH > d.keyScroll + inner.h: d.keyScroll = top + rowH - inner.h
-  if d.keyReveal and cur >= 0:
-    d.keyReveal = false
-    d.reveal(acts[cur])
-  if listFocused and ui.focusId.len == 0 and acts.len > 0:
-    # Up/Down/PageUp/PageDown/Home/End move the selection, Enter or Space
-    # asks for another key, Delete or Backspace removes its keys.
+  # Not in the frame a key went to a row: that key isn't the list's too
+  # (Delete would remove the row it was just given to).
+  if listFocused and ui.focusId.len == 0 and not wasCapturing and not d.keyTaken:
+    # Up/Down/PageUp/PageDown/Home/End move the selection; Enter or Space
+    # asks for a key, Delete or Backspace removes it; Insert adds a key; on
+    # an added one F2 picks its command, G makes it global.
     let page = max(1, int(inner.h / rowH) - 1)
     var n = max(cur, 0)
     if w.buttonPressed[KeyUp]: dec n
@@ -865,22 +1088,41 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
     if w.buttonPressed[KeyPageUp]: n -= page
     if w.buttonPressed[KeyPageDown]: n += page
     if w.buttonPressed[KeyHome]: n = 0
-    if w.buttonPressed[KeyEnd]: n = acts.high
-    n = clamp(n, 0, acts.high)
-    if n != cur:
+    if w.buttonPressed[KeyEnd]: n = sels.high
+    n = clamp(n, 0, max(sels.high, 0))
+    if sels.len > 0 and n != cur:
       cur = n
-      d.keySel = rows[acts[n]].act
+      d.select(rows[sels[n]])
       ui.navVisible = true
-      # Bring the group header into view with the first command.
-      d.reveal(if n == 0: 0 else: acts[n])
-    if cur >= 0:
-      if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or w.buttonPressed[KeySpace]:
+      # Bring the header into view with the first row.
+      d.reveal(if n == 0: 0 else: sels[n])
+    let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or w.buttonPressed[KeySpace]
+    let delete = w.buttonPressed[KeyDelete] or w.buttonPressed[KeyBackspace]
+    if w.heldMods != {}: discard  # Shift+Delete and the like are no list keys
+    elif w.buttonPressed[KeyInsert]:
+      d.addRow(ui, c)
+    elif cur >= 0 and d.selAdded >= 0:
+      let i = d.selAdded
+      if enter:
         ui.enterUsed = true
-        d.startCapture(ui, d.keySel)
-      elif w.buttonPressed[KeyDelete] or w.buttonPressed[KeyBackspace]:
+        d.startAddedCapture(ui, i)
+      elif w.buttonPressed[KeyF2]: d.openCmd(ui, c, i)
+      elif delete: d.removeAdded(c, i)
+      elif w.buttonPressed[KeyG]: d.toggleGlobal(c, i)
+    elif cur >= 0:
+      if enter:
+        ui.enterUsed = true
+        d.startCapture(ui, d.keySel, if c.builtinCombos(d.keySel).len > 0: 0 else: -1)
+      elif delete:
         d.assignKeys(c, d.keySel, @[])
-      elif w.buttonPressed[KeyG] and w.heldMods == {}:
-        d.toggleGlobal(c, d.keySel)
+  # Those keys may have added or removed a row: drawn as they are now.
+  (rows, sels) = d.buildRows(c)
+  cur = d.selected(rows, sels)
+  let clashes = c.keyClashes
+  if d.keyReveal and cur >= 0:
+    d.keyReveal = false
+    d.reveal(sels[cur])
+  let maxScroll = max(0'f32, rows.len.float32 * rowH - inner.h)
   if ui.hover(inner) and ui.scroll() != 0:
     d.keyScroll += ui.scroll() * rowH / 3
     ui.scrollConsumed = true
@@ -889,109 +1131,172 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
   let outerClip = ui.hitClip
   ui.hitClip = inner
   ui.sk.pushClipRect(inner)
-  for i, row in rows:
-    let r = rect(inner.x, inner.y + i.float32 * rowH - d.keyScroll, inner.w, rowH)
+  var cmdDrawn = false
+  for ri, row in rows:
+    let r = rect(inner.x, inner.y + ri.float32 * rowH - d.keyScroll, inner.w, rowH)
     if r.y + rowH < inner.y or r.y > inner.y + inner.h: continue
     let gr = rect(r.x + r.w - keyW - 6 - globalW, r.y, globalW, rowH)
-    if row.header:
-      ui.textIn($row.group, rect(r.x + 8, r.y, r.w - 16, rowH), colAccent, FontSmall)
-      ui.textIn("Global", gr, colTextDim, FontSmall, h = CenterAlign)
-      if ui.hover(gr): ui.tip(gr, "Global keys work while other programs have the keyboard")
+    case row.kind
+    of rkHeader, rkAddedHeader:
+      let added = row.kind == rkAddedHeader
+      ui.textIn(if added: "Added keys" else: $row.group, rect(r.x + 8, r.y, r.w - 16, rowH),
+        colAccent, FontSmall)
       ui.rect(rect(r.x + 8, r.y + rowH - 3, r.w - 16, 1), colBorder)
       continue
-    let act = row.act
-    let sel = act == d.keySel and cur >= 0
+    of rkCmd, rkAdded: discard
+    let added = row.kind == rkAdded
+    let sel = d.isSel(row) and cur >= 0
     let capturing = sel and d.capturing
-    let clash = act in clashes
+    let editing = added and row.i == d.cmdEdit
+    let clash = if added: c.addedClash(row.i) else: row.act in clashes
     let hov = ui.hover(r)
     # Yellow doesn't read on the accent color.
-    let accent = sel and (listFocused or capturing) and not clash
+    let accent = sel and (listFocused or capturing or editing) and not clash
     if sel: ui.rect(r, if accent: colAccent else: colPanelRaised)
     elif hov: ui.rect(r, colHover)
     let fg = if clash: colWarning elif accent: colOnAccent else: colText
-    let changed = not c.isDefault(act)
-    ui.textIn(ui.ellipsize(Actions[act].label, r.w - keyW - 40 - globalW),
-      rect(r.x + 20, r.y, r.w - keyW - 28 - globalW, rowH), fg)
-    # Global: a box to tick, yellow when the desktop or another program
-    # stands in its way.
-    let global = c.isGlobal(act)
-    let (gwarn, gtext) = d.globalStatus(c, act)
-    let gbox = rect(gr.x + (globalW - 16) / 2, r.y + (rowH - 16) / 2, 16, 16)
-    let ghov = ui.hover(gr)
-    ui.rect(gbox,
-      if global and gwarn: colWarning
-      elif global: (if accent: colOnAccent else: colAccent)
-      else: colPanelRaised)
-    ui.border(gbox, if ghov: (if accent: colOnAccent else: colAccent) else: colBorder)
-    if global:
-      ui.icon("check16", gbox.xy + gbox.wh / 2,
-        if accent and not gwarn: colAccent else: colOnAccent)
-    if ghov:
-      ui.tip(gr, if global: gtext & " Click (or G) to make it work only here."
-                 else: "Click (or G) to make it global: working while other programs have the keyboard.")
     let kr = rect(r.x + r.w - keyW - 6, r.y + 2, keyW, rowH - 4)
-    let keys = c.combos(act)
-    var picked = -1             # the key under the pointer
+    let labelW = r.w - keyW - 28 - (if added: globalW else: 0)
+    let cell = rect(r.x + 14, r.y + 1, labelW + 6, rowH - 2)
+    var picked = -1             # the command's own key under the pointer
+    if editing:
+      # Its command being picked: typed here, from the list under it.
+      cmdDrawn = true
+      d.cmdAt = cell
+      let x = c.addedKeys[row.i]
+      let (ok, act) = findAction(x.action)
+      let ev = ui.textField(CmdFocus, cell, d.cmdQuery,
+        if ok: Actions[act].label else: "Type the command's name")
+      if eeChanged in ev:
+        d.cmdHi = 0
+        d.cmdTop = 0
+      if d.cmdEdit == row.i and (eeCommitted in ev or ui.focusId != CmdFocus):
+        let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or w.buttonPressed[KeyTab]
+        let m = d.cmdMatches(c)
+        if enter and not w.buttonPressed[KeyEscape] and d.cmdHi in 0 ..< m.len:
+          d.pickCmd(ui, c, m[d.cmdHi])
+        else: d.endCmd(ui)      # Esc, or a click elsewhere
+        d.keyTaken = true       # a Tab doesn't go on to the next control
+    elif added:
+      let x = c.addedKeys[row.i]
+      let (ok, _) = findAction(x.action)
+      ui.textIn(ui.ellipsize(c.addedLabel(row.i), labelW - 12), rect(r.x + 20, r.y, labelW, rowH),
+        if ok: fg elif accent: colOnAccent else: colTextDisabled)
+      if ui.hover(cell): ui.tip(cell, "Double-click (or F2) to pick another command")
+    else:
+      ui.textIn(ui.ellipsize(Actions[row.act].label, labelW - 12), rect(r.x + 20, r.y, labelW, rowH), fg)
+    # Global, for added keys: a box to tick, yellow when the desktop or
+    # another program stands in its way.
+    let ghov = added and ui.hover(gr)
+    if added:
+      let global = c.addedKeys[row.i].global
+      let (gwarn, gtext) = d.globalStatus(c, row.i)
+      let gbox = rect(gr.x + (globalW - 16) / 2, r.y + (rowH - 16) / 2, 16, 16)
+      ui.rect(gbox,
+        if global and gwarn: colWarning
+        elif global: (if accent: colOnAccent else: colAccent)
+        else: colPanelRaised)
+      ui.border(gbox, if ghov: (if accent: colOnAccent else: colAccent) else: colBorder)
+      if global:
+        ui.icon("check16", gbox.xy + gbox.wh / 2,
+          if accent and not gwarn: colAccent else: colOnAccent)
+      if ghov:
+        ui.tip(gr, if global: gtext & " Click (or G) to make it work only in the player."
+                   else: "Click (or G) to make it global: working while other programs have the keyboard.")
+    # The key cell.
     if capturing:
       ui.rect(kr, colBackground)
       ui.border(kr, colAccent)
       ui.textIn("Press a key...", rect(kr.x + 8, kr.y, kr.w - 16, kr.h), colTextDim, FontSmall)
+    elif added:
+      let k = parseCombo(c.addedKeys[row.i].key)
+      let none = k.key == ButtonUnknown
+      ui.textIn(if none: "None" else: $k, rect(kr.x + 8, kr.y, kr.w - 16, kr.h),
+        if clash: colWarning elif accent: colOnAccent elif none: colTextDisabled else: colText,
+        FontSmall)
+      if ui.hover(kr): ui.tip(kr, "Click to change the key")
     else:
+      let act = row.act
+      let own = c.builtinCombos(act)
+      let more = c.addedCombos(act).filterIt(it notin own)
+      let changed = not c.isDefault(act)
       let kcol =
         if clash: colWarning
         elif accent: colOnAccent
-        elif keys.len == 0: colTextDisabled
+        elif own.len == 0: colTextDisabled
         elif changed: colAccent
         else: colTextDim
       var x = kr.x + 8
-      proc put(s: string) =
-        ui.textIn(s, rect(x, kr.y, kr.x + kr.w - x, kr.h), kcol, FontSmall)
+      proc put(s: string, col = kcol) =
+        ui.textIn(s, rect(x, kr.y, kr.x + kr.w - x, kr.h), col, FontSmall)
         x += ui.textSize(s, FontSmall).x
       if changed: put("• ")
-      if keys.len == 0: put("None")
-      for i, k in keys:
+      if own.len == 0: put("None")
+      for i, k in own:
         if i > 0: put(" / ")
         let chip = rect(x - 3, kr.y, ui.textSize($k, FontSmall).x + 6, kr.h)
         if ui.hover(chip):
           picked = i
           ui.rect(chip, if accent: colAccentHover else: colPressed)
         put($k)
+      # Its added keys after them, dim: they're changed above.
+      for k in more: put(" + " & $k, if accent: colOnAccent else: colTextDisabled)
       if ui.hover(kr):
-        ui.tip(kr, if picked >= 0: "Click to change, right-click to remove" else: "Click to add a key")
-    if hov and ui.pressed():
+        ui.tip(kr,
+          if picked >= 0: "Click to change, right-click to remove"
+          elif own.len == 0: "Click to give it a key"
+          elif more.len > 0: "Its keys added with Add are changed in Added keys, at the top"
+          else: "Add gives it another key")
+    if hov and ui.pressed() and not (editing and ui.hover(cell)):
       ui.consumeClick()
       ui.navId = "o-keys-list"
-      ui.focusId = ""
-      # Clicking a key changes it; clicking beside it or double-clicking the
-      # row adds one.
-      if ghov: d.toggleGlobal(c, act)
-      elif ui.hover(kr) or (sel and w.buttonPressed[DoubleClick]): d.startCapture(ui, act, picked)
-      else: d.keySel = act
-    elif picked >= 0 and w.buttonPressed[MouseRight] and not wasCapturing:
-      d.keySel = act
-      d.noteFor = act
-      c.removeCombo(act, keys[picked])
-      d.keyNote = Actions[act].label & ": " & $keys[picked] & " removed"
+      if ui.focusId != CmdFocus: ui.focusId = ""
+      let dbl = sel and w.buttonPressed[DoubleClick]
+      if added:
+        if ghov: d.toggleGlobal(c, row.i)
+        elif ui.hover(kr): d.startAddedCapture(ui, row.i)
+        elif dbl: d.openCmd(ui, c, row.i)
+        else: d.select(row)
+      else:
+        # Clicking a key changes it; clicking beside a command that has
+        # none, or double-clicking the row, asks for one.
+        let own = c.builtinCombos(row.act)
+        if ui.hover(kr) and (picked >= 0 or own.len == 0): d.startCapture(ui, row.act, picked)
+        elif dbl: d.startCapture(ui, row.act, if own.len > 0: 0 else: -1)
+        else: d.select(row)
+    elif not added and picked >= 0 and w.buttonPressed[MouseRight] and not wasCapturing:
+      let k = c.builtinCombos(row.act)[picked]
+      d.select(row)
+      c.removeCombo(row.act, k)
+      d.noteFor = row.act
+      d.noteAdded = -1
+      d.keyNote = Actions[row.act].label & ": " & $k & " removed"
   if rows.len == 0:
     ui.textIn("No matching commands", inner, colTextDim, FontSmall, h = CenterAlign)
   ui.sk.popClipRect()
   ui.hitClip = outerClip
+  # The cell being typed in went out of view: no command picked.
+  if d.cmdEdit >= 0 and not cmdDrawn: d.endCmd(ui)
   p.y = list.y + list.h + 8
 
-  let has = cur >= 0
+  let isAdded = cur >= 0 and d.selAdded >= 0
+  let isCmd = cur >= 0 and d.selAdded < 0
   const bw = 110'f32
   let by = p.y
   proc at(i: int): Rect = rect(list.x + i.float32 * (bw + 8), by, bw, 28)
-  if ui.button("o-keyset", "Add...", at(0), has): d.startCapture(ui, d.keySel)
-  if ui.button("o-keyclear", "Clear", at(1), has and c.combos(d.keySel).len > 0):
-    d.assignKeys(c, d.keySel, @[])
-  if ui.button("o-keyreset", "Default", at(2), has and not c.isDefault(d.keySel)):
+  if ui.button("o-keyadd", "Add", at(0), true): d.addRow(ui, c)
+  if ui.hover(at(0)): ui.tip(at(0), "A key of your own for any command, which can be global (Insert)")
+  if ui.button("o-keyremove", "Remove", at(1),
+      isAdded or isCmd and c.builtinCombos(d.keySel).len > 0):
+    if d.selAdded in 0 ..< c.addedKeys.len: d.removeAdded(c, d.selAdded)
+    elif d.selAdded < 0: d.assignKeys(c, d.keySel, @[])
+  if ui.button("o-keyreset", "Default", at(2), isCmd and not c.isDefault(d.keySel)):
     d.assignKeys(c, d.keySel, d.keySel.defaults)
   let allR = rect(p.x + p.w - 150, p.y, 150, 28)
   # The desktop's own settings for the global keys, where one it gave no key
   # gets one (KDE asks only once).
   let deskR = rect(at(3).x, by, 130, 28)
-  if d.canConfigureGlobal and c.globalKeys.len > 0 and deskR.x + deskR.w + 8 <= allR.x:
+  if d.canConfigureGlobal and c.addedKeys.anyIt(it.global) and deskR.x + deskR.w + 8 <= allR.x:
     if ui.textButton("o-keydesk", deskR, "Desktop keys..."):
       d.request = prDesktopKeys
     if ui.hover(deskR): ui.tip(deskR, "The desktop's settings for the global keys")
@@ -999,22 +1304,36 @@ proc keysPage(d: OptionsDialog, ui: Ui, c: var Config, p: var Pane, bottom: floa
     if ui.textButton("o-keyresetall", allR, "Reset all keys"):
       c.keys.clear()
       d.noteFor = d.keySel
-      d.keyNote = "All keys are back to their defaults."
+      d.noteAdded = -1
+      d.keyNote = "Every command's own keys are back to their defaults; the added ones stay."
+    if ui.hover(allR): ui.tip(allR, "The commands' own keys back to their defaults; added keys stay")
   else:
     ui.rect(allR, colPanelRaised)
     ui.border(allR, colBorder)
     ui.textIn("Reset all keys", allR, colTextDisabled, h = CenterAlign)
   p.y += 34
-  let (gwarn, gtext) = if has: d.globalStatus(c, d.keySel) else: (false, "")
+  # The rows or the buttons may have changed the selection since (Remove
+  # took the last added key, a click asked for a command's key...).
+  let onAdded = d.selAdded in 0 ..< c.addedKeys.len and
+    (isAdded or d.capturing or d.cmdEdit >= 0)
+  let (gwarn, gtext) = if onAdded: d.globalStatus(c, d.selAdded) else: (false, "")
+  let noteHere = d.keyNote.len > 0 and
+    (if onAdded: d.noteAdded == d.selAdded else: d.noteAdded < 0 and d.noteFor == d.keySel)
   let note =
-    if d.capturing: "Press a key for \"" & Actions[d.keySel].label & "\"; Esc cancels."
+    if d.capturing:
+      let name = if onAdded: c.addedLabel(d.selAdded) else: Actions[d.keySel].label
+      if onAdded and not findAction(c.addedKeys[d.selAdded].action).ok: "Press the key; Esc cancels."
+      else: "Press a key for \"" & name & "\"; Esc cancels."
+    elif d.cmdEdit >= 0: "Type to find the command; Enter, Tab or a click picks it, Esc cancels."
     elif clashes.card > 0: "The yellow commands share a key: change one of them to save."
-    elif d.keyNote.len > 0 and d.noteFor == d.keySel: d.keyNote
+    elif noteHere: d.keyNote
     elif gtext.len > 0: gtext
-    else: "Click a key to change it, right-click to remove it. Add... gives a command another key."
-  let warn = not d.capturing and (clashes.card > 0 or (note == gtext and gwarn))
+    elif onAdded: "Tick Global to make it work while other programs have the keyboard. F2 picks another command."
+    else: "Click a key to change it, right-click to remove it. Add gives a command another key."
+  let warn = not d.capturing and d.cmdEdit < 0 and
+    (clashes.card > 0 or (note == gtext and gwarn))
   ui.textIn(ui.ellipsize(note, p.w - 8, FontSmall), rect(p.x + 8, p.y, p.w - 8, 18),
-    if d.capturing: colAccent elif warn: colWarning else: colTextDim, FontSmall)
+    if d.capturing or d.cmdEdit >= 0: colAccent elif warn: colWarning else: colTextDim, FontSmall)
   p.y += 18
 
 proc playbackPage(ui: Ui, c: var Config, p: var Pane) =
@@ -2133,6 +2452,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
   let enter = keys and (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter])
   d.pickerInput(ui, c)
   d.fontInput(ui, c)
+  d.cmdInput(ui, c)
 
   # The search bar spans both columns. Esc in it, or with nothing focused,
   # empties it first.
@@ -2145,6 +2465,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
     d.findScroll = 0
     d.picker = ""
     d.fontOpen = false
+    d.endCmd(ui)
   let searching = d.find.strip.len > 0
 
   let body = rect(r.x + 16, findR.y + findR.h + 10, r.w - 32, r.h - 16 - 58 - findR.h - 10)
@@ -2257,6 +2578,7 @@ proc draw*(d: OptionsDialog, ui: Ui, c: var Config, before: Config, r: Rect): Op
   if result == oaNone and enter and not ui.enterUsed and not clashing: result = oaOk
   d.drawPicker(ui, c)
   d.drawFonts(ui, c)
+  d.drawCmds(ui, c)
   if result != oaNone:
     ui.focusId = ""
     return

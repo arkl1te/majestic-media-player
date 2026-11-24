@@ -317,9 +317,9 @@ it held, to commit.
   `colAccent` outline on the row the arrows move from. `panelsdump` (MMP_SCRIPT) prints the state.
   Typing there jumps to a name (`typeAhead`, after the panels' own keys): while `typingStop` names a
   list or column shown (the arrows' holder, else the entries or files of the panel clicked last), keys
-  of `TypingKeys` without a modifier, and Space once typing has begun, add their runes (from
-  `typedPending`, control characters dropped; a rune with no button pressed counts too, one with a
-  numpad key doesn't) to `typeText`, lowercase, started over after `TypePause` (1 s) or another
+  of `TypingKeys` without a modifier (the numpad's digits included: with Num Lock off they bring no
+  rune, so they do nothing), and Space once typing has begun, add their runes (from `typedPending`,
+  control characters dropped; a rune with no button pressed counts too) to `typeText`, lowercase, started over after `TypePause` (1 s) or another
   place. `typeJump` matches the start of the name shown (`rowName`, the playlist's name, the
   column's label, `displayName`): one letter from the row after the selected one, more from the
   selected one on, round the end; a letter repeated that nothing begins with goes on through the
@@ -404,7 +404,8 @@ it held, to commit.
 - The side column (playlist/library) and the video frame share a window resize Majestic didn't
   ask for (`flexPanel` each frame, telling the edges apart by the window's left edge on screen,
   `flexX`). Dragging the right edge resizes the side column, the left edge the video frame
-  (`edgeFlexedPanel`); narrowing, once that one is at its narrowest (`PlaylistMinWidth`, or half of
+  (`edgeFlexedPanel`); with Shift held (`shiftHeld`, read each frame, so it can change mid-drag) the
+  other way around; narrowing, once that one is at its narrowest (`PlaylistMinWidth`, or half of
   `MinWindow` for the video frame, as the column's grip leaves it), the other narrows. Any other
   resize (both edges moving: maximizing, tiling, and the half second after restoring) goes by
   `flexedPanel`: a wider window's room goes to whichever is wider (the video frame on a tie); on a
@@ -420,9 +421,10 @@ it held, to commit.
   column's right edge resizes it (`playlistSideWidth`), it scrolls when the playlists overflow
   (`tabScroll`, the shown one kept in view through `tabSeen`), and the toggle widens or narrows the
   panel by its width so the entries keep their room. The column (the Playlist Manager) collapses
-  (`playlistSideCollapsed`, `setSideCollapsed`) from the tab menu's Collapse Playlist Manager or by
-  dragging its edge to under half its narrowest (back out in the same drag, it stays); it keeps its
-  width, the entries take its room and the panel keeps its own. Collapsed, the panel's left border
+  (`playlistSideCollapsed`, `setSideCollapsed`) from the tab menu's Collapse Playlist Manager,
+  a double-click on the panel's header or left edge, or by dragging its edge to under half its
+  narrowest (back out in the same drag, it stays); it keeps its width, the entries take its room
+  and the panel keeps its own. Collapsed, the panel's left border
   is 2 px, lit while hovered, with an arrow in its middle (`plRestoreRect`, drawn over the rows by
   `restoreArrow` after `playlistPanel` took its press); the arrow, a double-click on that edge or
   the header, and Restore Playlist Manager (contextual, on top of the panel's and column header's
@@ -479,8 +481,14 @@ it held, to commit.
   `VK_VOLUME_*` to buttons. A focused window only gets them when the desktop
   doesn't take them first; Plasma's Media Controller does, and sends them over
   MPRIS instead.
-- `src/globalkeys.nim` holds the keys of the commands marked Global in Options ▸
-  Keys while other programs have the keyboard, applied when Options closes. One
+- Options ▸ Keys lists the commands' own keys (`Config.keys`, only those
+  changed) under the keys added with Add (`Config.addedKeys`: a command id, a
+  key, global or not), each picked in its row: the command typed in its cell
+  with a list under it (`cmdEdit`, `cmdInput`, `drawCmds`), then the key
+  pressed. `keymap.combos` gives both; `builtinCombos` the command's own.
+  Only added keys can be global.
+- `src/globalkeys.nim` holds the added keys marked Global in Options ▸ Keys
+  while other programs have the keyboard, applied when Options closes. One
   running player holds them (a lock next to the instance socket; the others
   retry every 2 s). Wayland: the portal's GlobalShortcuts (after
   `host.portal.Registry.Register`, so the desktop knows the app). KDE keeps the

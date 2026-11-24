@@ -11,13 +11,13 @@
 ##   of its own, so the main window never gets those keys too.
 ## - Windows: RegisterHotKey; WM_HOTKEY comes through the main window's hook.
 
-import std/[strutils, times]
+import std/[strutils, times, sequtils]
 import windy
 import config, keymap, xwin
 when defined(windows):
   import win32api
 else:
-  import std/[os, posix, sequtils]
+  import std/[os, posix]
   import portal
 
 type
@@ -130,17 +130,18 @@ proc globalId*(a: KeyAction, k: KeyCombo): string =
   $a & ":" & k.trigger.toLowerAscii
 
 proc wantedKeys*(c: Config): seq[GlobalKey] =
-  ## The global commands' keys, as the config has them.
-  for a in KeyAction:
-    if c.isGlobal(a):
-      for k in c.combos(a):
-        if k.trigger.len > 0:
-          result.add GlobalKey(id: globalId(a, k), label: Actions[a].label, combo: k)
+  ## The added keys marked global, as the config has them.
+  for x in c.addedKeys:
+    if not x.global: continue
+    let (ok, a) = findAction(x.action)
+    let k = parseCombo(x.key)
+    if not ok or k.trigger.len == 0: continue
+    let id = globalId(a, k)
+    if result.anyIt(it.id == id): continue
+    result.add GlobalKey(id: id, label: Actions[a].label, combo: k)
 
 proc actionOf*(id: string): tuple[ok: bool, action: KeyAction] =
-  let name = id.split(':')[0]
-  for a in KeyAction:
-    if $a == name: return (true, a)
+  findAction(id.split(':')[0])
 
 proc setAll(g: GlobalKeys, s: GlobalKeyState) =
   for x in g.states.mitems:
